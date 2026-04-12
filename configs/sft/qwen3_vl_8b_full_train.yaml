@@ -1,0 +1,41 @@
+run_name: qwen3_vl_8b_full_sft_ds8
+output_dir: artifacts/sft/qwen3_vl_8b_full
+
+model_config: configs/model/qwen3_vl_8b_full.yaml
+attention_config: configs/model/attention_fa3_only.yaml
+deepspeed_config: configs/deepspeed/zero3_full_model.json
+
+data:
+  prepared_data_path: /abs/path/to/sft_train.compact_trace_v2.jsonl
+  include_splits: train
+  num_workers: 8
+  dataloader_prefetch_factor: 2
+  dataloader_persistent_workers: true
+
+optimization:
+  epochs: 3
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  keep_recent_text_messages: 20
+  keep_recent_tool_image_messages: 0
+
+logging:
+  log_every_n_steps: 10
+  save_every_n_steps: 500
+  save_total_limit: 2
+  report_to:
+    - wandb
+  log_dir: artifacts/sft/qwen3_vl_8b_full/logs
+  rollout_eval_output_dir: artifacts/sft/qwen3_vl_8b_full/rollout_eval
+
+distributed:
+  seed: 42
+  nnodes: 1
+  nproc_per_node: 8
+  ddp_find_unused_parameters: false
+  bf16: true

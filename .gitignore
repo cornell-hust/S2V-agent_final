@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environments
+.venv/
+.env
+.env.*
+conda-meta/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editors
+.idea/
+.vscode/
+
+# Training and inference artifacts
+artifacts/
+checkpoints/
+logs/
+runs/
+wandb/
+data_utils/
+
+# Data and cache mounts
+.cache/
+hf_home/
+
+# OS files
+.DS_Store

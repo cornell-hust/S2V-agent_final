@@ -1,0 +1,37 @@
+run_name: qwen3_vl_8b_grpo_ds8
+output_dir: artifacts/rl/qwen3_vl_8b_grpo
+
+model_config: configs/model/qwen3_vl_8b_full.yaml
+attention_config: configs/model/attention_fa3_only.yaml
+deepspeed_config: configs/deepspeed/zero3_full_model.json
+
+policy_init_from: /abs/path/to/sft_checkpoint
+reference_model: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+rollout_backend: vllm
+rollout_config: configs/rollout_eval/vllm_qwen3_vl_8b.yaml
+
+data:
+  train_manifest: /abs/path/to/rl_train.jsonl
+  eval_manifest: /abs/path/to/rl_eval.jsonl
+
+optimization:
+  num_iterations: 1000
+  learning_rate: 5.0e-7
+  per_device_batch_size: 1
+  num_train_epochs: 1.0
+  rollout_count: 16
+  num_generations: 8
+  rollout_max_turns: 14
+  gradient_accumulation_steps: 8
+
+distributed:
+  seed: 42
+  nnodes: 1
+  nproc_per_node: 8
+  bf16: true
+
+rewards:
+  reward_version: timesearch_v2
+  accuracy_reward_weight: 1.0
+  fecv_evidence_faithfulness_reward_weight: 0.35
+  protocol_finalize_reward_weight: 0.1

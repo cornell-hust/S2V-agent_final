@@ -1,0 +1,9 @@
+io:
+  input_data_path: /abs/path/to/raw_saver_agent_train.jsonl
+  output_path: /abs/path/to/sft_train.compact_trace_v2.jsonl
+  data_root: /abs/path/to/videos
+  include_splits: train
+
+preview:
+  num_preview_frames: 8
+  preview_sampling_fps: null

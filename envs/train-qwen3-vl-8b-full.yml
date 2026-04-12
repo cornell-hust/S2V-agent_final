@@ -1,0 +1,27 @@
+name: idea2-v3-train
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch>=2.4
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - ninja
+  - git
+  - pip:
+      - accelerate>=1.0
+      - datasets>=2.20
+      - deepspeed>=0.15
+      - packaging>=24.0
+      - pyyaml>=6.0
+      - qwen-vl-utils>=0.0.14
+      - rich>=13.9
+      - safetensors>=0.4
+      - sentencepiece>=0.2
+      - transformers>=4.57.0
+      - trl>=0.11
+      - wandb>=0.19

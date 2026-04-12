@@ -1,0 +1,27 @@
+model_name: qwen3_vl_8b_full
+base_model: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+tokenizer_name: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+processor_name: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+trust_remote_code: true
+
+train_mode: full
+torch_dtype: bfloat16
+attn_implementation: flash_attention_3
+gradient_checkpointing: true
+compile_model: false
+
+freeze:
+  language_model: false
+  vision_tower: false
+  multimodal_projector: false
+
+vision:
+  max_images_per_sample: 16
+  min_pixels: 200704
+  max_pixels: 1003520
+
+sequence:
+  max_length: 8192
+  truncation: right
+
+attention_policy_config: configs/model/attention_fa3_only.yaml

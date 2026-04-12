@@ -1,0 +1,20 @@
+policy_name: fa3_only
+resolution_order:
+  - fa3
+
+hardware:
+  fa3_min_compute_capability_major: 9
+  preferred_cuda_major_min: 12
+
+env_overrides:
+  forced_backend_var: SAVER_V3_ATTN_BACKEND
+  require_fa3_var: SAVER_V3_REQUIRE_FA3
+  disable_fa3_var: SAVER_V3_DISABLE_FA3
+
+transformers_mapping:
+  fa3_attn_implementation: flash_attention_3
+
+notes:
+  - This layer assumes Hopper-class FlashAttention-3 kernels only.
+  - No FA2 fallback is declared in this config.
+  - No SDPA fallback is declared in this config.

@@ -1,0 +1,19 @@
+name: idea2-v3-infer
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch>=2.4
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - pip:
+      - fastapi>=0.115
+      - pyyaml>=6.0
+      - qwen-vl-utils>=0.0.14
+      - transformers>=4.57.0
+      - uvicorn>=0.30
+      - vllm>=0.11.0

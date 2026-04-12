@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idea2-v3"
+version = "0.1.0"
+description = "Qwen3-VL-8B full-model training and local-rank vLLM evaluation for SAVER v3."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+  "pyyaml>=6.0",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+train = [
+  "accelerate>=1.0",
+  "datasets>=2.20",
+  "deepspeed>=0.15",
+  "packaging>=24.0",
+  "qwen-vl-utils>=0.0.14",
+  "rich>=13.9",
+  "safetensors>=0.4",
+  "sentencepiece>=0.2",
+  "transformers>=4.57.0",
+  "trl>=0.11",
+  "wandb>=0.19",
+]
+infer = [
+  "fastapi>=0.115",
+  "qwen-vl-utils>=0.0.14",
+  "transformers>=4.57.0",
+  "uvicorn>=0.30",
+  "vllm>=0.11.0",
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["saver_v3*", "saver_agent*", "data_utils*", "third_party_ports*"]
+exclude = ["tests*", "artifacts*", "ckpt*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
