@@ -23,7 +23,7 @@ from saver_v3.core.self_verification import (
 )
 
 
-MAX_NUM_KEY_FRAMES = 16
+MAX_NUM_KEY_FRAMES = 8
 SELF_VERIFICATION_VERDICT_KEYS = (
     "verification_decision",
     "primary_status",
