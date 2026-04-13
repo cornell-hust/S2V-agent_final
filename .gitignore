@@ -38,3 +38,4 @@ hf_home/
 # OS files
 .DS_Store
 tests/
+wandb/
