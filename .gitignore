@@ -20,6 +20,10 @@ conda-meta/
 
 # Training and inference artifacts
 artifacts/
+*.bin
+*.pth
+*.safetensors
+*.pt
 checkpoints/
 logs/
 runs/
