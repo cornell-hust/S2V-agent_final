@@ -172,10 +172,16 @@ class SaverRolloutRunner:
             ), "search_after_finalize_recommendation"
         signature = _canonical_search_signature(tool_name, arguments)
         if signature and signature == self._latest_search_signature(turns):
-            return self._guardrail_tool_message(
-                "repeated_search_signature",
-                tool_name=tool_name,
-            ), "repeated_search_signature"
+            return {
+                "role": "tool",
+                "name": "parse_error",
+                "content": [{"type": "text", "text": (
+                    "Blocked: you already searched with the same query and window. "
+                    "Do not repeat the same search. Either use a DIFFERENT query/window, "
+                    "or call verify_hypothesis to check sufficiency, "
+                    "or call finalize_case to submit your final decision now."
+                )}],
+            }, "repeated_search_signature"
         return None, None
 
     def _append_budget_reminder(

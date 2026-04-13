@@ -395,6 +395,15 @@ def _resolve_selected_window_ids(
     selection_requested = bool(
         requested_selected_window_ids or selected_evidence_ids or selected_evidence_moment_ids or candidate_window_ids
     )
+    # Fallback: when nothing resolves but evidence exists in ledger, auto-select all evidence windows
+    if not resolved and valid_window_ids:
+        for fallback_window_id in sorted(valid_window_ids):
+            if fallback_window_id not in seen:
+                seen.add(fallback_window_id)
+                resolved.append(fallback_window_id)
+        if resolved:
+            resolution_sources.append("auto_fallback_from_ledger")
+
     if resolution_sources:
         selection_resolution_source = "+".join(resolution_sources)
     elif selection_requested:

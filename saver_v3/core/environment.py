@@ -11,7 +11,7 @@ from saver_v3.core.tool_registry import execute_tool_call
 INVALID_TOOL_CALL_PROMPT = (
     "The previous response is invalid. Retry immediately with exactly one of these formats: "
     '<tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0}}</tool_call> '
-    'or <tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"final_check","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"verification_decision":"insufficient","recommended_action":"continue_search","sufficiency_score":0.2,"necessity_score":0.1,"finalize_readiness_score":0.0,"counterfactual_faithfulness":0.3}}</tool_call> '
+    'or <tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"final_check","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"verification_decision":"sufficient","recommended_action":"finalize","sufficiency_score":0.8,"necessity_score":0.8,"finalize_readiness_score":0.8,"counterfactual_faithfulness":0.5}}</tool_call> '
     "Do not output the terminal answer unless the latest observation explicitly requested it. "
     "Do not describe the intended tool call in plain English. Do not output bare tool names."
 )
@@ -61,12 +61,12 @@ def _verify_retry_prompt(state: SaverEnvironmentState | None = None) -> str:
     example_arguments = {
         "verification_mode": "final_check",
         "selected_window_ids": selected_window_ids,
-        "verification_decision": "insufficient",
-        "recommended_action": "continue_search",
-        "sufficiency_score": 0.2,
-        "necessity_score": 0.1,
-        "finalize_readiness_score": 0.0,
-        "counterfactual_faithfulness": 0.3,
+        "verification_decision": "sufficient",
+        "recommended_action": "finalize",
+        "sufficiency_score": 0.8,
+        "necessity_score": 0.8,
+        "finalize_readiness_score": 0.8,
+        "counterfactual_faithfulness": 0.5,
     }
     return (
         "The previous verify_hypothesis call was invalid. Retry immediately with exactly one "
