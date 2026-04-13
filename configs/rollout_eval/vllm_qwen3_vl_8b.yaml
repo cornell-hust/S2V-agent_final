@@ -50,7 +50,7 @@ verifier:
   attach_reference_diagnostics: false
 
 semantic_metrics:
-  enabled: true
+  enabled: false
   metrics:
     - qa_accuracy
     - bertscore
