@@ -23,8 +23,8 @@ client:
 io:
   data_path: /abs/path/to/raw_saver_agent_eval.jsonl
   output_dir: artifacts/rollout_eval/qwen3_vl_8b
-  data_root: /abs/path/to/videos
-  include_splits: val
+  data_root: /abs/path/to/data_root
+  include_splits: test
   max_records: 0
 
 evaluation:

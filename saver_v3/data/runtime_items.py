@@ -30,10 +30,13 @@ def _clean_allowed_tools(tool_io: dict[str, Any]) -> list[str]:
 def _build_tool_io(row: dict[str, Any]) -> dict[str, Any]:
     tool_io = copy.deepcopy(row.get("tool_io") or {})
     allowed_tools = _clean_allowed_tools(tool_io)
-    tool_schemas = get_tool_schemas(
-        finalize_case_schema=copy.deepcopy(tool_io.get("finalize_case_schema") or {}),
-        allowed_tools=allowed_tools,
-    )
+    tool_schemas = [
+        schema
+        for schema in get_tool_schemas(
+            finalize_case_schema=copy.deepcopy(tool_io.get("finalize_case_schema") or {})
+        )
+        if str(((schema.get("function") or {}).get("name") or "")).strip() in allowed_tools
+    ]
     function_schemas = [copy.deepcopy(tool.get("function") or {}) for tool in tool_schemas]
 
     augmented_finalize_schema = copy.deepcopy(tool_io.get("finalize_case_schema") or {})

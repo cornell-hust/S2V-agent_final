@@ -22,7 +22,12 @@ from saver_v3.model.qwen_policy import (
     _trim_to_first_structured_block,
     load_generation_processor_for_checkpoint,
 )
-from saver_v3.common.runtime import distributed_runtime_from_env, resolve_inference_device_map, runtime_log
+from saver_v3.common.runtime import (
+    distributed_runtime_from_env,
+    init_torch_distributed,
+    resolve_inference_device_map,
+    runtime_log,
+)
 from saver_v3.rl.trl_compat import patch_vllm_guided_decoding_params
 from saver_v3.model.vllm_transport import encode_transport_payload
 
@@ -343,13 +348,16 @@ def _resolve_single_rank_external_launcher_env(runtime: Any) -> Dict[str, str]:
     return {
         "RANK": "0",
         "WORLD_SIZE": "1",
-        "LOCAL_RANK": str(local_rank),
+        "LOCAL_RANK": "0",
         "LOCAL_WORLD_SIZE": "1",
         "GROUP_RANK": "0",
         "ROLE_RANK": "0",
         "ROLE_WORLD_SIZE": "1",
         "MASTER_ADDR": "127.0.0.1",
         "MASTER_PORT": str(isolated_port),
+        "CUDA_VISIBLE_DEVICES": str(local_rank),
+        "VLLM_HOST_IP": "127.0.0.1",
+        "VLLM_LOOPBACK_IP": "127.0.0.1",
     }
 
 
@@ -713,6 +721,12 @@ class _VllmColocateRuntime:
         if disable_v1_multiprocessing:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         try:
+            runtime_log(
+                "using colocated vLLM runtime"
+                + f": local_rank={int(getattr(self.runtime, 'local_rank', 0) or 0)} tp_size={tp_size}",
+                runtime=self.runtime,
+                main_process_only=True,
+            )
             with _temporary_single_rank_external_launcher_env(self.runtime, tp_size=tp_size):
                 return LLM(**llm_kwargs)
         finally:
@@ -858,6 +872,7 @@ class _VllmExternalLauncherRuntime:
                 "Direct external-launcher SFT rollout eval currently requires vllm_tensor_parallel_size=1."
             )
         if _runtime_is_distributed(self.runtime):
+            init_torch_distributed(self.runtime)
             if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
                 raise RuntimeError(
                     "Direct external-launcher SFT rollout eval requires torch.distributed to be initialized under torchrun."
@@ -902,6 +917,15 @@ class _VllmExternalLauncherRuntime:
         os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
         os.environ.setdefault("VLLM_LOOPBACK_IP", "127.0.0.1")
         try:
+            runtime_log(
+                (
+                    "using per-rank external-launcher vLLM runtime"
+                    f": local_rank={int(getattr(self.runtime, 'local_rank', 0) or 0)} "
+                    f"world_size={int(getattr(self.runtime, 'world_size', 1) or 1)}"
+                ),
+                runtime=self.runtime,
+                main_process_only=True,
+            )
             return LLM(**llm_kwargs)
         finally:
             if previous_v1_multiprocessing is None:
@@ -1006,6 +1030,7 @@ class _VllmServerRuntime:
         self._managed_server_log_handle: Any = None
         self._managed_server_log_path: Optional[Path] = None
         self._per_rank_local_server = bool(self.settings.get("vllm_server_per_rank", False))
+        self._client_communicator_initialized = False
         if not self.enabled:
             return
         if self.settings["vllm_mode"] != "server":
@@ -1025,9 +1050,14 @@ class _VllmServerRuntime:
                 group_port=min(65535, int(self.settings["vllm_server_port"]) + 1000),
                 connection_timeout=float(self.settings["vllm_server_timeout"]),
             )
-            self.client.init_communicator(device_index=int(getattr(self.runtime, "local_rank", 0) or 0))
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+    def _ensure_client_communicator(self) -> None:
+        if self.client is None or self._client_communicator_initialized:
+            return
+        self.client.init_communicator(device_index=int(getattr(self.runtime, "local_rank", 0) or 0))
+        self._client_communicator_initialized = True
 
     def _maybe_launch_managed_server(self) -> None:
         host = str(self.settings["vllm_server_host"])
@@ -1108,6 +1138,7 @@ class _VllmServerRuntime:
         if self._last_loaded_step == step_value:
             return
         if self.client is not None:
+            self._ensure_client_communicator()
             for name, weights in _iter_named_weights_for_vllm(source_model):
                 self.client.update_named_param(name, weights)
             self.reset_prefix_cache()
@@ -1206,19 +1237,43 @@ class _VllmServerRuntime:
             self._stop_managed_server()
 
 
+def _should_use_static_external_launcher_runtime(
+    *,
+    args: Any,
+    runtime: Any,
+    prefer_direct_local_rank_runtime: bool,
+) -> bool:
+    if not bool(prefer_direct_local_rank_runtime):
+        return False
+    settings = build_vllm_runtime_settings(args)
+    return (
+        str(settings["vllm_mode"]) == "colocate"
+        and int(settings["vllm_tensor_parallel_size"]) <= 1
+        and _runtime_is_distributed(runtime)
+    )
+
+
 def create_vllm_runtime(
     *,
     args: Any,
     runtime: Any,
     model_path: str | Path,
+    prefer_direct_local_rank_runtime: bool = False,
 ) -> Any:
-    settings = build_vllm_runtime_settings(args)
+    effective_args = args
+    settings = build_vllm_runtime_settings(effective_args)
     if not bool(settings["use_vllm"]):
         return None
+    if _should_use_static_external_launcher_runtime(
+        args=effective_args,
+        runtime=runtime,
+        prefer_direct_local_rank_runtime=prefer_direct_local_rank_runtime,
+    ):
+        return _VllmExternalLauncherRuntime(args=effective_args, runtime=runtime, model_path=model_path)
     if settings["vllm_mode"] == "server":
-        return _VllmServerRuntime(args=args, runtime=runtime, model_path=model_path)
+        return _VllmServerRuntime(args=effective_args, runtime=runtime, model_path=model_path)
     if settings["vllm_mode"] == "colocate":
-        return _VllmColocateRuntime(args=args, runtime=runtime, model_path=model_path)
+        return _VllmColocateRuntime(args=effective_args, runtime=runtime, model_path=model_path)
     raise ValueError(f"Unsupported vLLM mode: {settings['vllm_mode']}")
 
 
@@ -1453,14 +1508,20 @@ def build_vllm_policy_from_model_path(
     top_k: Optional[int],
     repetition_penalty: Optional[float],
     use_generation_cache: bool = True,
+    prefer_direct_local_rank_runtime: bool = False,
     step_resolver: Optional[Callable[[], int]] = None,
     policy_class: Optional[type[VllmQwenGenerationPolicy]] = None,
     processor_loader: Optional[Callable[[str | Path], Any]] = None,
     hf_policy_class: Optional[type[QwenGenerationPolicy]] = None,
 ) -> VllmQwenGenerationPolicy:
     runtime_settings = build_vllm_runtime_settings(args)
+    use_static_external_launcher_runtime = _should_use_static_external_launcher_runtime(
+        args=args,
+        runtime=runtime,
+        prefer_direct_local_rank_runtime=prefer_direct_local_rank_runtime,
+    )
     remote_lora_request = None
-    if str(runtime_settings.get("vllm_mode", "")) == "server":
+    if str(runtime_settings.get("vllm_mode", "")) == "server" or use_static_external_launcher_runtime:
         remote_lora_request = build_remote_vllm_lora_request(model_path)
     if remote_lora_request is not None:
         source_model = None
@@ -1485,10 +1546,16 @@ def build_vllm_policy_from_model_path(
             top_k=top_k,
             repetition_penalty=repetition_penalty,
         )
+    runtime_model_path = (
+        _resolve_vllm_base_model_path(model_path)
+        if use_static_external_launcher_runtime and remote_lora_request is not None
+        else model_path
+    )
     runtime_impl = create_vllm_runtime(
         args=args,
         runtime=runtime,
-        model_path=model_path,
+        model_path=runtime_model_path,
+        prefer_direct_local_rank_runtime=prefer_direct_local_rank_runtime,
     )
     if runtime_impl is None:
         raise RuntimeError("Requested a vLLM policy, but use_vllm=false disabled runtime construction.")
@@ -1817,10 +1884,20 @@ def build_recovery_vllm_policy_factory(
             if attn_implementation is not None
             else getattr(args, "attn_implementation", None),
         )
-        effective_args = _resolve_sft_vllm_runtime_args(args=effective_args, runtime=runtime)
+        use_static_external_launcher_runtime = (
+            resolved_runtime_builder is create_vllm_runtime
+            and _should_use_static_external_launcher_runtime(
+                args=effective_args,
+                runtime=runtime,
+                prefer_direct_local_rank_runtime=True,
+            )
+        )
         source_model = None
         remote_lora_request = None
-        if str(getattr(effective_args, "vllm_mode", "colocate") or "colocate").strip().lower() == "server":
+        if (
+            str(getattr(effective_args, "vllm_mode", "colocate") or "colocate").strip().lower() == "server"
+            or use_static_external_launcher_runtime
+        ):
             processor = _load_processor_or_placeholder(
                 model_path=checkpoint_path,
                 processor_loader=processor_loader,
@@ -1879,10 +1956,16 @@ def build_recovery_vllm_policy_factory(
                 top_k=None,
                 repetition_penalty=None,
             )
+        runtime_model_path = (
+            _resolve_vllm_base_model_path(checkpoint_path)
+            if use_static_external_launcher_runtime and remote_lora_request is not None
+            else checkpoint_path
+        )
         vllm_runtime = resolved_runtime_builder(
             args=effective_args,
             runtime=runtime,
-            model_path=checkpoint_path,
+            model_path=runtime_model_path,
+            prefer_direct_local_rank_runtime=True,
         )
         if vllm_runtime is None:
             raise RuntimeError("vLLM recovery policy factory requires use_vllm=true and an initialized runtime.")

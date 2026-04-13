@@ -6,6 +6,7 @@ import importlib
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from saver_v3.common.fa3_guard import resolve_attention_backend
+from saver_v3.model.qwen_policy import load_auto_processor_with_compat
 
 
 DEFAULT_QWEN3_VL_8B_INSTRUCT_MODEL = "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct"
@@ -84,11 +85,8 @@ def load_qwen3vl_processor(
     trust_remote_code: bool = True,
     **kwargs: Any,
 ) -> Any:
-    transformers_module = _require_transformers()
-    auto_processor = getattr(transformers_module, "AutoProcessor", None)
-    if auto_processor is None:
-        raise ImportError("The installed transformers build does not expose AutoProcessor.")
-    processor = auto_processor.from_pretrained(
+    _require_transformers()
+    processor = load_auto_processor_with_compat(
         str(model_name_or_path),
         trust_remote_code=bool(trust_remote_code),
         **kwargs,

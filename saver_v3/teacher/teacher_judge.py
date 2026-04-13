@@ -12,7 +12,12 @@ import torch
 
 from saver_v3.core.environment import parse_actions_and_contents
 from saver_v3.model.model_loading import build_hf_model_init_kwargs, ensure_flash_attention_supported_dtype
-from saver_v3.model.qwen_policy import _build_generation_kwargs, _configure_qwen_processor, _to_pil_image
+from saver_v3.model.qwen_policy import (
+    _build_generation_kwargs,
+    _configure_qwen_processor,
+    _to_pil_image,
+    load_auto_processor_with_compat,
+)
 from saver_v3.core.self_verification import PRIMARY_STATUS_TO_DECISION, SELF_VERIFICATION_DECISIONS, parse_self_verification_payload
 
 
@@ -1106,7 +1111,7 @@ class QwenTeacherJudge:
         log_fn: Optional[Callable[[str], None]] = None,
     ) -> "QwenTeacherJudge":
         try:
-            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+            from transformers import Qwen3VLForConditionalGeneration
         except Exception as exc:
             raise ImportError(
                 "QwenTeacherJudge requires a recent transformers build with Qwen3-VL support. "
@@ -1125,7 +1130,7 @@ class QwenTeacherJudge:
             attn_implementation=attn_implementation,
         )
         model.eval()
-        processor = _configure_qwen_processor(AutoProcessor.from_pretrained(str(model_path)))
+        processor = _configure_qwen_processor(load_auto_processor_with_compat(str(model_path)))
         return cls(
             model=model,
             processor=processor,

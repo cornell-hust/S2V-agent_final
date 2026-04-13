@@ -14,6 +14,7 @@ from saver_v3.model.qwen_policy import (
     _build_generation_kwargs,
     _configure_qwen_processor,
     _to_pil_image,
+    load_auto_processor_with_compat,
 )
 
 
@@ -148,7 +149,7 @@ class QwenSelfVerifier:
         max_images_per_view: int = 6,
     ) -> "QwenSelfVerifier":
         try:
-            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+            from transformers import Qwen3VLForConditionalGeneration
         except Exception as exc:
             raise ImportError(
                 "QwenSelfVerifier requires a recent transformers build with Qwen3-VL support. "
@@ -167,7 +168,7 @@ class QwenSelfVerifier:
             attn_implementation=attn_implementation,
         )
         model.eval()
-        processor = _configure_qwen_processor(AutoProcessor.from_pretrained(str(model_path)))
+        processor = _configure_qwen_processor(load_auto_processor_with_compat(str(model_path)))
         return cls(
             model=model,
             processor=processor,

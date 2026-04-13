@@ -1,7 +1,9 @@
+saver_config_source: configs/sft/qwen3_vl_8b_full_train.yaml
+
 io:
-  input_data_path: /abs/path/to/raw_saver_agent_train.jsonl
-  output_path: /abs/path/to/sft_train.compact_trace_v2.jsonl
-  data_root: /abs/path/to/videos
+  input_data_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl
+  output_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v2.jsonl
+  data_root: /mnt/shared-storage-user/mineru2-shared/zengweijun
   include_splits: train
 
 preview:

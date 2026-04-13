@@ -1640,6 +1640,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for record in input_records
     )
     write_jsonl(output_path, converted_rows)
+    print("finished\n--------------------------------\n")
     return 0
 
 

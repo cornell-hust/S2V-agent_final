@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from convert_to_saver_agent import convert_record, iter_jsonl, write_jsonl
 from saver_v3.data.config import PromptConfig, PreviewConfig, RolloutTraceConfig, SaverAgentConfig
-from saver_v3.data.prepared_metadata import write_prepared_sft_metadata
+from saver_v3.data.prepared_metadata import build_jsonl_provenance, write_prepared_sft_metadata
 from saver_v3.core.proposal import SiglipFeatureEncoder
 from saver_v3.common.runtime import distributed_runtime_from_env, runtime_log
 from saver_v3.sft.training import validate_prepared_examples
@@ -256,7 +256,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         validation_summary = _run_sft_validation(args, sft_rows)
         _write_jsonl(args.sft_train_output, sft_rows)
-        write_prepared_sft_metadata(args.sft_train_output, config=config)
+        write_prepared_sft_metadata(
+            args.sft_train_output,
+            config=config,
+            extra_fields={
+                "num_records": int(len(sft_rows)),
+                "include_splits": sorted(parse_include_splits(args.train_splits) or []),
+                "source_runtime": build_jsonl_provenance(args.runtime_train_output, include_splits=args.train_splits),
+            },
+        )
         summary.update(
             {
                 "sft_train_output": str(args.sft_train_output),

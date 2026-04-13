@@ -24,7 +24,7 @@ from saver_v3.core.semantic_answer import (
 )
 
 
-DEFAULT_RL_REWARD_VERSION = "timesearch_v2"
+DEFAULT_RL_REWARD_VERSION = "timesearch_v3"
 DEFAULT_COMPONENT_WEIGHTS = {
     "fecv_decision_sufficiency_reward": 1.0,
     "fecv_specificity_reward": 1.0,
@@ -43,6 +43,11 @@ TIMESARCH_V2_COMPONENT_WEIGHTS = {
     "accuracy_reward": 1.0,
     "fecv_evidence_faithfulness_reward": 0.35,
     "protocol_finalize_reward": 0.1,
+}
+TIMESARCH_V3_COMPONENT_WEIGHTS = {
+    "accuracy_reward": 1.0,
+    "fecv_evidence_faithfulness_reward": 0.35,
+    "protocol_finalize_reward": 0.05,
 }
 LEGACY_COMPONENT_ALIASES = {
     "evidence_support_reward": "fecv_decision_sufficiency_reward",
@@ -78,6 +83,12 @@ _OPEN_ENDED_QUESTION_TYPES = (
     "rationale",
 ) + tuple(f"event_chain_summary.{stage}" for stage in SEMANTIC_EVENT_CHAIN_STAGES)
 
+# V3: metric-aligned subset — removed normal_reason and rationale (no primary metric)
+_OPEN_ENDED_QUESTION_TYPES_V3 = (
+    "trigger_evidence",
+    "summary",
+) + tuple(f"event_chain_summary.{stage}" for stage in SEMANTIC_EVENT_CHAIN_STAGES)
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -88,7 +99,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _normalize_reward_version(value: Any) -> str:
     normalized = str(value or "legacy").strip().lower()
-    if normalized in {"legacy", "timesearch_v1", "timesearch_v2"}:
+    if normalized in {"legacy", "timesearch_v1", "timesearch_v2", "timesearch_v3"}:
         return normalized
     raise ValueError(f"Unsupported reward version: {value!r}")
 
@@ -99,8 +110,10 @@ def _normalize_component_weights(
     reward_version: str = "legacy",
 ) -> Dict[str, float]:
     normalized_reward_version = _normalize_reward_version(reward_version)
-    if normalized_reward_version in {"timesearch_v1", "timesearch_v2"}:
-        if normalized_reward_version == "timesearch_v2":
+    if normalized_reward_version in {"timesearch_v1", "timesearch_v2", "timesearch_v3"}:
+        if normalized_reward_version == "timesearch_v3":
+            merged = dict(TIMESARCH_V3_COMPONENT_WEIGHTS)
+        elif normalized_reward_version == "timesearch_v2":
             merged = dict(TIMESARCH_V2_COMPONENT_WEIGHTS)
         else:
             merged = dict(TIMESARCH_V1_COMPONENT_WEIGHTS)
@@ -149,12 +162,13 @@ def build_timesearch_reward_funcs(
     *,
     reward_config: Optional[Dict[str, Any]] = None,
     llm_judge: Optional[OpenAICompatibleLlmJudge] = None,
+    reward_version: str = "timesearch_v3",
 ) -> List[Any]:
     judge = llm_judge or build_open_ended_reward_judge(reward_config=reward_config)
 
     def accuracy_reward(*, rollout_traces: Sequence[Dict[str, Any]], **_: Any) -> List[float]:
         return [
-            float(_compute_accuracy_breakdown(rollout_trace, llm_judge=judge)["accuracy_reward"])
+            float(_compute_accuracy_breakdown(rollout_trace, llm_judge=judge, reward_version=reward_version)["accuracy_reward"])
             for rollout_trace in list(rollout_traces or [])
         ]
 
@@ -739,6 +753,7 @@ def _compute_accuracy_breakdown(
     rollout_trace: Dict[str, Any],
     *,
     llm_judge: Optional[OpenAICompatibleLlmJudge] = None,
+    reward_version: str = "timesearch_v3",
 ) -> Dict[str, Any]:
     structured_target = _infer_target(rollout_trace)
     semantic_payload = _infer_semantic_payload(rollout_trace)
@@ -755,13 +770,15 @@ def _compute_accuracy_breakdown(
         "open_ended": [],
     }
     type_scores: Dict[str, float] = {}
+    _is_v3 = reward_version == "timesearch_v3"
 
     if structured_target:
         prediction_existence = _normalize_existence(final_prediction.get("existence"))
         target_existence = _normalize_existence(structured_target.get("existence"))
         existence_score = 1.0 if prediction_existence == target_existence else 0.0
-        family_scores["multiple_choice"].append(existence_score)
-        type_scores["existence"] = existence_score
+        if not _is_v3:  # v3: category subsumes existence
+            family_scores["multiple_choice"].append(existence_score)
+        type_scores["existence"] = existence_score  # always compute for metrics
 
         target_category = canonicalize_saver_category(structured_target.get("category"), existence=target_existence)
         if target_category:
@@ -772,14 +789,16 @@ def _compute_accuracy_breakdown(
 
         if structured_target.get("severity") is not None:
             severity_score = 1.0 if _normalize_severity(final_prediction.get("severity")) == _normalize_severity(structured_target.get("severity")) else 0.0
-            family_scores["multiple_choice"].append(severity_score)
+            if not _is_v3:  # v3: no primary metric for severity
+                family_scores["multiple_choice"].append(severity_score)
             type_scores["severity"] = severity_score
 
         target_counterfactual_type = _normalize_counterfactual_type(structured_target.get("counterfactual_type"))
         if target_counterfactual_type != "none":
             prediction_counterfactual_type = _normalize_counterfactual_type(final_prediction.get("counterfactual_type"))
             counterfactual_score = 1.0 if prediction_counterfactual_type == target_counterfactual_type else 0.0
-            family_scores["multiple_choice"].append(counterfactual_score)
+            if not _is_v3:  # v3: no primary metric for counterfactual_type
+                family_scores["multiple_choice"].append(counterfactual_score)
             type_scores["counterfactual"] = counterfactual_score
 
         target_anomaly_interval = structured_target.get("anomaly_interval_sec")
@@ -803,7 +822,8 @@ def _compute_accuracy_breakdown(
                 fps=fps,
             )
             precursor_score = _interval_iou(prediction_precursor_interval, target_precursor_interval)
-            family_scores["grounding"].append(precursor_score)
+            if not _is_v3:  # v3: no primary metric for precursor temporal
+                family_scores["grounding"].append(precursor_score)
             type_scores["precursor_temporal"] = precursor_score
 
     judge = llm_judge or OpenAICompatibleLlmJudge()
@@ -813,7 +833,8 @@ def _compute_accuracy_breakdown(
         evidence_moments=evidence_moments,
     )
     open_predictions = _open_ended_prediction_map(semantic_payload)
-    for qa_type in _OPEN_ENDED_QUESTION_TYPES:
+    _open_ended_types = _OPEN_ENDED_QUESTION_TYPES_V3 if _is_v3 else _OPEN_ENDED_QUESTION_TYPES
+    for qa_type in _open_ended_types:
         target_entry = open_targets.get(qa_type)
         if target_entry is None:
             continue
@@ -843,7 +864,7 @@ def _compute_accuracy_breakdown(
             qa_type: round(float(score), 6)
             for qa_type, score in type_scores.items()
         },
-        "accuracy_question_count": int(len(flattened_scores)),
+        "accuracy_question_count": sum(len(scores) for scores in family_scores.values()),
     }
 
 
@@ -951,6 +972,7 @@ def _score_rollout_trace_timesearch(
     accuracy = _compute_accuracy_breakdown(
         rollout_trace,
         llm_judge=llm_judge or build_open_ended_reward_judge(reward_config=reward_config),
+        reward_version=normalized_reward_version,
     )
 
     final_decision_correct = 1.0 if _decision_matches(final_prediction, target) else 0.0
@@ -1018,7 +1040,7 @@ def score_rollout_trace(
     if isinstance(reward_config, dict) and str(reward_config.get("reward_version") or "").strip():
         resolved_reward_version = str(reward_config.get("reward_version"))
     resolved_reward_version = _normalize_reward_version(resolved_reward_version)
-    if resolved_reward_version in {"timesearch_v1", "timesearch_v2"}:
+    if resolved_reward_version in {"timesearch_v1", "timesearch_v2", "timesearch_v3"}:
         return _score_rollout_trace_timesearch(
             rollout_trace,
             reward_version=resolved_reward_version,

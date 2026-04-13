@@ -13,6 +13,11 @@ import torch
 
 from saver_v3.core.counterfactual_verification import run_counterfactual_verification
 from saver_v3.data.dataset import SaverAgentDataset
+from saver_v3.data.materialized_cache import (
+    MATERIALIZED_RUNTIME_ITEMS_FORMAT,
+    MaterializedRuntimeItemDataset,
+    ensure_materialized_cache_metadata,
+)
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp, write_json
 from saver_v3.model.qwen_policy import QwenGenerationPolicy
 from saver_v3.core.reward import DEFAULT_RL_REWARD_VERSION, build_open_ended_reward_judge, score_rollout_trace
@@ -2368,14 +2373,38 @@ def run_trainer_native_grpo(
     )
     rollout_eval_output_root.mkdir(parents=True, exist_ok=True)
     resolved_log_dir = Path(str(log_dir).strip()) if str(log_dir or "").strip() else output_dir / "logs"
-    raw_records = [
-        json.loads(line)
-        for line in Path(args.data).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    if getattr(args, "include_splits", ""):
-        allowed = set(str(value).strip() for value in str(args.include_splits).split(",") if str(value).strip())
-        raw_records = [record for record in raw_records if str(record.get("split") or "").strip() in allowed]
+    materialized_train_items_path = str(getattr(args, "materialized_train_items_path", "") or "").strip()
+    include_splits_value = getattr(args, "include_splits", "")
+    if materialized_train_items_path:
+        ensure_materialized_cache_metadata(
+            materialized_train_items_path,
+            expected_format=MATERIALIZED_RUNTIME_ITEMS_FORMAT,
+            expected_source_path=args.data,
+            expected_include_splits=include_splits_value,
+            require_source=True,
+        )
+        dataset = MaterializedRuntimeItemDataset(
+            materialized_train_items_path,
+            include_splits=include_splits_value,
+            require_frame_cache=True,
+            require_feature_cache=True,
+            proposal_runtime=proposal_runtime,
+            strict_feature_guided_proposal=strict_feature_guided_proposal,
+        )
+        raw_records = [dict(record) for record in list(getattr(dataset, "records", []) or [])]
+    else:
+        if bool(getattr(args, "require_materialized_runtime_cache", False)):
+            raise ValueError(
+                "Trainer-native RL requires --materialized-train-items-path when --require-materialized-runtime-cache=true."
+            )
+        raw_records = [
+            json.loads(line)
+            for line in Path(args.data).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if include_splits_value:
+            allowed = set(str(value).strip() for value in str(include_splits_value).split(",") if str(value).strip())
+            raw_records = [record for record in raw_records if str(record.get("split") or "").strip() in allowed]
     strict_feature_guided_proposal = _raw_records_require_feature_guided_proposal(raw_records)
     if strict_feature_guided_proposal and not str(getattr(args, "proposal_model_path", "") or "").strip():
         raise ValueError(
@@ -2391,16 +2420,27 @@ def run_trainer_native_grpo(
         if strict_feature_guided_proposal
         else None
     )
-    dataset = SaverAgentDataset(
-        args.data,
-        data_root=args.data_root,
-        config=config_builder(args),
-        include_splits=getattr(args, "include_splits", ""),
-        require_frame_cache=True,
-        require_feature_cache=True,
-        proposal_runtime=proposal_runtime,
-        strict_feature_guided_proposal=strict_feature_guided_proposal,
-    )
+    if materialized_train_items_path and strict_feature_guided_proposal:
+        if int(getattr(args, "dataloader_num_workers", 0) or 0) > 0:
+            runtime_log(
+                "trainer-native RL forcing dataloader_num_workers=0 because materialized runtime items still attach CUDA proposal_runtime during item loading.",
+                runtime=runtime,
+                main_process_only=True,
+            )
+            args.dataloader_num_workers = 0
+            args.dataloader_prefetch_factor = 0
+            args.dataloader_persistent_workers = False
+    if not materialized_train_items_path:
+        dataset = SaverAgentDataset(
+            args.data,
+            data_root=args.data_root,
+            config=config_builder(args),
+            include_splits=include_splits_value,
+            require_frame_cache=True,
+            require_feature_cache=True,
+            proposal_runtime=proposal_runtime,
+            strict_feature_guided_proposal=strict_feature_guided_proposal,
+        )
     current_model_path = str(args.model_path)
     latest_checkpoint = current_model_path
     reference_model_path = reference_model_resolver(args.model_path, args.reference_model_path)

@@ -7,6 +7,7 @@ from saver_v3.data.compact_trace import compact_trace_row_to_runtime_record, rep
 from saver_v3.data.compact_trace_loader import load_compact_trace_rows
 from saver_v3.data.prepared_loader import load_prepared_rows
 from saver_v3.data.prepared_schema import PreparedDataError, validate_prepared_row
+from saver_v3.sft.training import _load_prepared_jsonl_rows
 
 
 def _sample_row() -> dict:
@@ -66,6 +67,16 @@ class PreparedDataTests(unittest.TestCase):
 
             self.assertEqual(len(rows), 1)
             self.assertTrue(rows[0]["video_path"].endswith("video-001.mp4"))
+
+    def test_sft_loader_fails_fast_on_invalid_row_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            prepared_path = Path(tmp_dir) / "prepared.jsonl"
+            row = _sample_row()
+            row["oracle_trajectory"][0]["arguments"] = ["not", "a", "dict"]
+            prepared_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaises(PreparedDataError):
+                _load_prepared_jsonl_rows(prepared_path)
 
     def test_load_compact_trace_rows_returns_normalized_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

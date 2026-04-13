@@ -12,6 +12,41 @@ data:
   dataloader_prefetch_factor: 2
   dataloader_persistent_workers: true
 
+proposal:
+  model_path: /abs/path/to/proposal_model
+  torch_dtype: auto
+  device: ""
+
+preview:
+  num_preview_frames: 8
+  preview_sampling_fps: null
+  max_preview_frames: 8
+
+prompt:
+  initial_user_template: |
+    Case ID: {public_case_id}
+    Scene: {scene}
+    Duration (sec): {duration}
+    Task: {task_prompt}
+    Success Criteria:
+    {criteria_text}
+  preview_instruction: |
+    You are given temporally ordered preview frames from the video. Use these preview frames to decide the next best action. If they are insufficient, call a tool to inspect more evidence.
+  tool_response_template: |
+    Selected frames: {timestamps}.
+    Choose exactly one next step.
+    Usually call seek_evidence for another stage or verify_hypothesis to judge sufficiency.
+    Call finalize_case only when the gathered evidence is already sufficient.
+    When finalizing, prioritize a compact finalize_case that closes cleanly.
+    If optional summary, rationale, event_chain_summary, or qa_focus_answers would make the tool call too long, omit them.
+    Do not answer before finalize_case returns.
+
+rollout_trace:
+  record_observation_content: false
+  record_state_deltas: true
+  record_counterfactual_trace: true
+  record_message_history: true
+
 optimization:
   epochs: 3
   learning_rate: 1.0e-5
@@ -23,6 +58,7 @@ optimization:
   max_grad_norm: 1.0
   keep_recent_text_messages: 20
   keep_recent_tool_image_messages: 0
+  use_sample_weights: true
 
 logging:
   log_every_n_steps: 10

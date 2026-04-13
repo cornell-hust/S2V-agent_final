@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 import train_saver_rl_trl as legacy_train_saver_rl_trl
 
@@ -13,8 +13,9 @@ from saver_v3.core.reward import (
     TIMESARCH_COMPONENT_ALIASES,
     TIMESARCH_V1_COMPONENT_WEIGHTS,
     TIMESARCH_V2_COMPONENT_WEIGHTS,
+    TIMESARCH_V3_COMPONENT_WEIGHTS,
 )
-from saver_v3.cli.common import load_yaml_mapping, resolve_path, write_json
+from saver_v3.cli.common import apply_config_overrides, load_yaml_mapping, resolve_path, write_json
 from saver_v3.common import ensure_fa3_training_ready
 
 
@@ -51,6 +52,8 @@ def _supported_reward_weight_keys(reward_version: str) -> set[str]:
     normalized = str(reward_version or "timesearch_v2").strip().lower()
     if normalized == "timesearch_v1":
         return set(TIMESARCH_V1_COMPONENT_WEIGHTS) | set(TIMESARCH_COMPONENT_ALIASES)
+    if normalized == "timesearch_v3":
+        return set(TIMESARCH_V3_COMPONENT_WEIGHTS) | set(TIMESARCH_COMPONENT_ALIASES)
     if normalized == "timesearch_v2":
         return set(TIMESARCH_V2_COMPONENT_WEIGHTS) | set(TIMESARCH_COMPONENT_ALIASES)
     if normalized == "legacy":
@@ -100,6 +103,20 @@ class RLJobConfig:
     rollout_backend: str
     rollout_config: str
     deepspeed_config_path: str | None
+    materialized_train_items_path: str = ""
+    materialized_eval_items_path: str = ""
+    require_materialized_runtime_cache: bool = False
+    include_splits: str
+    eval_include_splits: str
+    policy_init_from: str
+    reference_model: str
+    base_model: str
+    torch_dtype: str
+    attn_implementation: str
+    gradient_checkpointing: bool
+    rollout_backend: str
+    rollout_config: str
+    deepspeed_config_path: str | None
     reward_version: str = "timesearch_v2"
     reward_config: Dict[str, Any] = field(default_factory=dict)
     num_iterations: int = 1
@@ -122,6 +139,12 @@ class RLJobConfig:
     keep_recent_text_messages: int = 20
     keep_recent_tool_image_messages: int = 0
     num_preview_frames: int = 8
+    proposal_model_path: str = ""
+    proposal_torch_dtype: str = "auto"
+    proposal_device: str = ""
+    eval_proposal_model_path: str = ""
+    eval_proposal_torch_dtype: str = "auto"
+    eval_proposal_device: str = ""
     vllm_mode: str = "colocate"
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.35
@@ -138,10 +161,11 @@ class RLJobConfig:
         model_config_path: str,
         attention_config_path: str,
         deepspeed_config_path: str | None = None,
+        config_overrides: Sequence[str] | None = None,
     ) -> "RLJobConfig":
         resolved_config_path = resolve_path(config_path)
         config_anchor = (resolved_config_path or Path(config_path).expanduser()).resolve().parent
-        config = load_yaml_mapping(config_path)
+        config = apply_config_overrides(load_yaml_mapping(config_path), config_overrides)
         model_config = load_yaml_mapping(model_config_path)
         attention_config = load_yaml_mapping(attention_config_path)
         rollout_config_path = str(config.get("rollout_config") or "").strip()
@@ -152,6 +176,7 @@ class RLJobConfig:
         distributed = dict(config.get("distributed") or {})
         logging_cfg = dict(config.get("logging") or {})
         rewards = dict(config.get("rewards") or {})
+        proposal_cfg = dict(config.get("proposal") or {})
         rollout_engine = str(rollout_config.get("engine") or "").strip()
         server_cfg = dict(rollout_config.get("server") or {})
         client_cfg = dict(rollout_config.get("client") or {})
@@ -189,6 +214,9 @@ class RLJobConfig:
             output_dir=str(config.get("output_dir") or "artifacts/rl/qwen3_vl_8b_grpo"),
             train_manifest=str((data.get("train_manifest") or "")).strip(),
             eval_manifest=str((data.get("eval_manifest") or "")).strip() or None,
+            materialized_train_items_path=str((data.get("materialized_train_items_path") or "")).strip(),
+            materialized_eval_items_path=str((data.get("materialized_eval_items_path") or "")).strip(),
+            require_materialized_runtime_cache=bool(data.get("require_materialized_runtime_cache", False)),
             data_root=str((data.get("data_root") or "")).strip(),
             eval_data_root=str((data.get("eval_data_root") or data.get("data_root") or "")).strip(),
             include_splits=str((data.get("include_splits") or "")).strip(),
@@ -224,6 +252,12 @@ class RLJobConfig:
             keep_recent_text_messages=int(optimization.get("keep_recent_text_messages", 20) or 20),
             keep_recent_tool_image_messages=int(optimization.get("keep_recent_tool_image_messages", 0) or 0),
             num_preview_frames=int(optimization.get("num_preview_frames", 8) or 8),
+            proposal_model_path=str(proposal_cfg.get("model_path") or "").strip(),
+            proposal_torch_dtype=str(proposal_cfg.get("torch_dtype") or "auto"),
+            proposal_device=str(proposal_cfg.get("device") or "").strip(),
+            eval_proposal_model_path=str(proposal_cfg.get("eval_model_path") or proposal_cfg.get("model_path") or "").strip(),
+            eval_proposal_torch_dtype=str(proposal_cfg.get("eval_torch_dtype") or proposal_cfg.get("torch_dtype") or "auto"),
+            eval_proposal_device=str(proposal_cfg.get("eval_device") or proposal_cfg.get("device") or "").strip(),
             vllm_mode=normalized_vllm_mode,
             vllm_tensor_parallel_size=int(server_cfg.get("tensor_parallel_size", 1) or 1),
             vllm_gpu_memory_utilization=float(server_cfg.get("gpu_memory_utilization", 0.9) or 0.9),
@@ -299,6 +333,15 @@ def build_legacy_rl_trl_argv(job: RLJobConfig) -> list[str]:
     _append_flag(argv, "--eval-data", job.eval_manifest)
     _append_flag(argv, "--eval-data-root", job.eval_data_root)
     _append_flag(argv, "--eval-include-splits", job.eval_include_splits)
+    _append_flag(argv, "--proposal-model-path", job.proposal_model_path)
+    _append_flag(argv, "--proposal-torch-dtype", job.proposal_torch_dtype)
+    _append_flag(argv, "--proposal-device", job.proposal_device)
+    _append_flag(argv, "--materialized-train-items-path", job.materialized_train_items_path)
+    _append_flag(argv, "--materialized-eval-items-path", job.materialized_eval_items_path)
+    _append_flag(argv, "--require-materialized-runtime-cache", "true" if job.require_materialized_runtime_cache else "false")
+    _append_flag(argv, "--eval-proposal-model-path", job.eval_proposal_model_path)
+    _append_flag(argv, "--eval-proposal-torch-dtype", job.eval_proposal_torch_dtype)
+    _append_flag(argv, "--eval-proposal-device", job.eval_proposal_device)
     _append_flag(argv, "--deepspeed", job.deepspeed_config_path)
     _append_flag(argv, "--vllm-guided-decoding-regex", job.vllm_guided_decoding_regex)
     return argv

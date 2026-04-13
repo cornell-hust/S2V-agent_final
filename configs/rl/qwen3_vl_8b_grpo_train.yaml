@@ -13,6 +13,18 @@ rollout_config: configs/rollout_eval/vllm_qwen3_vl_8b.yaml
 data:
   train_manifest: /abs/path/to/rl_train.jsonl
   eval_manifest: /abs/path/to/rl_eval.jsonl
+  data_root: /abs/path/to/data_root
+  eval_data_root: /abs/path/to/data_root
+  include_splits: train
+  eval_include_splits: test
+
+proposal:
+  model_path: /abs/path/to/proposal_model
+  torch_dtype: auto
+  device: ""
+  eval_model_path: /abs/path/to/proposal_model
+  eval_torch_dtype: auto
+  eval_device: ""
 
 optimization:
   num_iterations: 1000
@@ -31,7 +43,7 @@ distributed:
   bf16: true
 
 rewards:
-  reward_version: timesearch_v2
+  reward_version: timesearch_v3
   accuracy_reward_weight: 1.0
   fecv_evidence_faithfulness_reward_weight: 0.35
-  protocol_finalize_reward_weight: 0.1
+  protocol_finalize_reward_weight: 0.05

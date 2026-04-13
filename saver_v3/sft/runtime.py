@@ -2,15 +2,26 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from saver_v3.sft.training import run_standard_sft
-from saver_v3.cli.common import load_yaml_mapping, write_json
+from saver_v3.cli.common import apply_config_overrides, load_yaml_mapping, write_json
 from saver_v3.common import distributed_runtime_from_env, ensure_fa3_training_ready, runtime_log
+from saver_v3.data.config import SaverAgentConfig, saver_config_from_mapping
+from saver_v3.data.prepared_metadata import ensure_prepared_sft_metadata
+from saver_v3.data.materialized_cache import MATERIALIZED_SFT_MESSAGES_FORMAT, ensure_materialized_cache_metadata
 
 
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return value or {}
+
+
+def _saver_config_from_mapping(mapping: Mapping[str, Any]) -> SaverAgentConfig:
+    return saver_config_from_mapping(mapping)
+
+
+def _saver_config_from_dict(payload: Mapping[str, Any] | None) -> SaverAgentConfig:
+    return _saver_config_from_mapping(payload or {})
 
 
 @dataclass
@@ -50,10 +61,17 @@ class SFTJobConfig:
     keep_recent_tool_image_messages: int
     trust_remote_code: bool
     train_mode: str
+    proposal_model_path: str = ""
+    proposal_torch_dtype: str = "auto"
+    proposal_device: str = ""
     deepspeed_config_path: str | None = None
     log_dir: str = ""
     rollout_eval_output_dir: str = ""
     resume_from_checkpoint: str = ""
+    use_sample_weights: bool = False
+    materialized_messages_path: str = ""
+    require_materialized_cache: bool = False
+    saver_config: Dict[str, Any] = field(default_factory=lambda: SaverAgentConfig().to_dict())
 
     @classmethod
     def from_files(
@@ -63,8 +81,9 @@ class SFTJobConfig:
         model_config_path: str,
         attention_config_path: str,
         deepspeed_config_path: str | None = None,
+        config_overrides: Sequence[str] | None = None,
     ) -> "SFTJobConfig":
-        config = load_yaml_mapping(config_path)
+        config = apply_config_overrides(load_yaml_mapping(config_path), config_overrides)
         model_config = load_yaml_mapping(model_config_path)
         attention_config = load_yaml_mapping(attention_config_path)
         if str(attention_config.get("policy_name") or "").strip() != "fa3_only":
@@ -78,8 +97,10 @@ class SFTJobConfig:
         optimization = dict(_mapping(config.get("optimization")))
         logging_cfg = dict(_mapping(config.get("logging")))
         distributed = dict(_mapping(config.get("distributed")))
+        proposal = dict(_mapping(config.get("proposal")))
         sequence_cfg = dict(_mapping(model_config.get("sequence")))
         vision_cfg = dict(_mapping(model_config.get("vision")))
+        saver_config = _saver_config_from_mapping(config)
 
         prepared_data_path = str(data.get("prepared_data_path") or "").strip()
         if not prepared_data_path:
@@ -92,6 +113,8 @@ class SFTJobConfig:
             run_name=str(config.get("run_name") or "qwen3_vl_8b_full_sft_ds8"),
             output_dir=str(config.get("output_dir") or "artifacts/sft/qwen3_vl_8b_full"),
             prepared_data_path=prepared_data_path,
+            materialized_messages_path=str(data.get("materialized_messages_path") or "").strip(),
+            require_materialized_cache=bool(data.get("require_materialized_cache", False)),
             include_splits=str(data.get("include_splits") or "train").strip(),
             num_workers=int(data.get("num_workers", 0) or 0),
             dataloader_prefetch_factor=int(data.get("dataloader_prefetch_factor", 0) or 0),
@@ -114,7 +137,7 @@ class SFTJobConfig:
             ),
             bf16=bool(distributed.get("bf16", True)),
             fp16=bool(distributed.get("fp16", False)),
-            model_path=str(model_config.get("base_model") or "").strip(),
+            model_path=str(config.get("base_model") or model_config.get("base_model") or "").strip(),
             torch_dtype=str(model_config.get("torch_dtype") or "bfloat16"),
             gradient_checkpointing=bool(model_config.get("gradient_checkpointing", True)),
             attn_implementation=str(model_config.get("attn_implementation") or "flash_attention_3"),
@@ -126,10 +149,15 @@ class SFTJobConfig:
             keep_recent_tool_image_messages=int(optimization.get("keep_recent_tool_image_messages", 0) or 0),
             trust_remote_code=bool(model_config.get("trust_remote_code", True)),
             train_mode=str(model_config.get("train_mode") or "full"),
+            proposal_model_path=str(proposal.get("model_path") or "").strip(),
+            proposal_torch_dtype=str(proposal.get("torch_dtype") or "auto"),
+            proposal_device=str(proposal.get("device") or "").strip(),
             deepspeed_config_path=deepspeed_config_path or str(config.get("deepspeed_config") or "").strip() or None,
             log_dir=str(logging_cfg.get("log_dir") or "").strip(),
             rollout_eval_output_dir=str(logging_cfg.get("rollout_eval_output_dir") or "").strip(),
             resume_from_checkpoint=str(config.get("resume_from_checkpoint") or "").strip(),
+            use_sample_weights=bool(optimization.get("use_sample_weights", False)),
+            saver_config=saver_config.to_dict(),
         )
 
 
@@ -151,6 +179,20 @@ class SFTTrainingResult:
 def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
     if not job.prepared_data_path:
         raise ValueError("SFT prepared_data_path is required")
+    saver_config = _saver_config_from_dict(job.saver_config)
+    ensure_prepared_sft_metadata(
+        job.prepared_data_path,
+        config=saver_config,
+        require_config_match=True,
+    )
+    if job.materialized_messages_path:
+        ensure_materialized_cache_metadata(
+            job.materialized_messages_path,
+            expected_format=MATERIALIZED_SFT_MESSAGES_FORMAT,
+            expected_source_path=job.prepared_data_path,
+            expected_include_splits=job.include_splits or None,
+            require_source=True,
+        )
     ensure_fa3_training_ready(require_gpu=True)
     runtime = distributed_runtime_from_env()
     output_dir = Path(job.output_dir).expanduser().resolve()
@@ -159,6 +201,7 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
         (
             "delegating v3 SFT to saver_agent.run_standard_sft: "
             f"prepared_data={job.prepared_data_path} include_splits={job.include_splits or 'all'} "
+            f"materialized_messages={job.materialized_messages_path or '(none)'} "
             f"model_path={job.model_path} deepspeed={job.deepspeed_config_path or '(none)'}"
         ),
         runtime=runtime,
@@ -174,6 +217,8 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
     standard_result = dict(
         run_standard_sft(
             prepared_data_path=job.prepared_data_path,
+            materialized_messages_path=job.materialized_messages_path,
+            require_materialized_cache=job.require_materialized_cache,
             include_splits=job.include_splits or None,
             model_path=job.model_path,
             output_dir=str(output_dir),
@@ -210,6 +255,11 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
             seed=job.seed,
             ddp_find_unused_parameters=job.ddp_find_unused_parameters,
             deepspeed=job.deepspeed_config_path or "",
+            saver_config=saver_config,
+            use_sample_weights=job.use_sample_weights,
+            proposal_model_path=job.proposal_model_path,
+            proposal_torch_dtype=job.proposal_torch_dtype,
+            proposal_device=job.proposal_device,
         )
         or {}
     )
@@ -234,6 +284,7 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
         notes=[
             "SFT now delegates to saver_agent.run_standard_sft.",
             f"prepared_data_path={job.prepared_data_path}",
+            f"materialized_messages_path={job.materialized_messages_path or '(none)'}",
             f"include_splits={job.include_splits or 'all'}",
         ],
     )

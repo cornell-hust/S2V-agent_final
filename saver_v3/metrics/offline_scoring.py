@@ -465,7 +465,7 @@ def score_rollout_records(
                     counterfactual_branch_profile=requested_counterfactual_profile,
                     counterfactual_max_images=int(counterfactual_max_images),
                 )[0]
-            augmented["reward_summary"] = score_rollout_trace(augmented, reward_version="timesearch_v2")
+            augmented["reward_summary"] = score_rollout_trace(augmented, reward_version="timesearch_v3")
             augmented["scoring_metadata"] = {
                 "verifier_backend": verifier_backend,
                 "force_reverify": bool(force_reverify),
@@ -492,7 +492,7 @@ def score_rollout_records(
                     f"video_id={augmented.get('video_id', '')}",
                     refresh=False,
                 )
-            if should_log_progress(completed, total_records, int(progress_every)):
+            if int(progress_every) > 0 and should_log_progress(completed, total_records, int(progress_every)):
                 runtime_log(
                     f"{progress_label}: {completed}/{total_records} video_id={augmented.get('video_id', '')}",
                     runtime=runtime,

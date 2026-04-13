@@ -35,6 +35,8 @@ class StepRolloutEvalConfig:
     data_path: str
     output_dir: str
     data_root: str = ""
+    materialized_items_path: str = ""
+    require_materialized_cache: bool = False
     include_splits: str = ""
     max_records: int = 0
     epoch_index: int = 0
@@ -105,6 +107,8 @@ class StepRolloutEvalConfig:
             data_path=data_path,
             output_dir=str(io_cfg.get("output_dir") or "").strip(),
             data_root=str(io_cfg.get("data_root") or "").strip(),
+            materialized_items_path=str(io_cfg.get("materialized_items_path") or "").strip(),
+            require_materialized_cache=_bool(io_cfg.get("require_materialized_cache"), False),
             include_splits=str(io_cfg.get("include_splits") or "").strip(),
             max_records=int(io_cfg.get("max_records", 0) or 0),
             epoch_index=int(evaluation.get("epoch_index", 0) or 0),
@@ -213,6 +217,8 @@ def run_step_rollout_eval_job(config: StepRolloutEvalConfig) -> Dict[str, Any]:
     eval_config = RolloutEvaluationConfig(
         data_path=config.data_path,
         data_root=config.data_root,
+        materialized_items_path=config.materialized_items_path,
+        require_materialized_cache=config.require_materialized_cache,
         include_splits=config.include_splits or None,
         max_records=config.max_records,
         rollout_max_turns=config.max_turns,
@@ -249,6 +255,7 @@ def run_step_rollout_eval_job(config: StepRolloutEvalConfig) -> Dict[str, Any]:
         args=_build_vllm_args(config),
         runtime=runtime,
         model_path=config.base_model,
+        prefer_direct_local_rank_runtime=True,
         max_new_tokens=config.policy_max_new_tokens,
         max_total_images=config.max_total_images,
         max_seq_length=config.max_seq_length,

@@ -56,6 +56,10 @@ def _build_vllm_parser() -> argparse.ArgumentParser:
         default=8000,
         help="Optional vLLM server port when --vllm-mode server is used.",
     )
+    parser.add_argument("--materialized-train-items-path", default="", help="Optional materialized runtime-items cache for RL training.")
+    parser.add_argument("--materialized-eval-items-path", default="", help="Optional materialized runtime-items cache for RL eval/reference flows.")
+    parser.add_argument("--require-materialized-runtime-cache", type=legacy_train_saver_rl._parse_bool_flag, default=False)
+
     parser.add_argument(
         "--vllm-server-timeout",
         type=float,
@@ -116,6 +120,9 @@ def _write_run_config(
             "script_entrypoint": "train_saver_rl_trl.py",
             "data": args.data,
             "data_root": args.data_root,
+            "materialized_train_items_path": str(getattr(args, "materialized_train_items_path", "") or ""),
+            "materialized_eval_items_path": str(getattr(args, "materialized_eval_items_path", "") or ""),
+            "require_materialized_runtime_cache": bool(getattr(args, "require_materialized_runtime_cache", False)),
             "include_splits": legacy_train_saver_rl.parse_include_splits(args.include_splits) or [],
             "output_dir": args.output_dir,
             "log_dir": str(log_dir),

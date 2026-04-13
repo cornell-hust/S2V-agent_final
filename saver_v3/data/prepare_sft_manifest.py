@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from data_utils.jsonl import iter_jsonl, write_jsonl
 from split_utils import parse_include_splits
 
-from saver_v3.data.config import PreviewConfig, SaverAgentConfig
+from saver_v3.data.config import SaverAgentConfig, saver_config_from_mapping
 from saver_v3.data.dataset import SaverRecordItemBuilder
-from saver_v3.data.prepared_metadata import write_prepared_sft_metadata
+from saver_v3.data.prepared_metadata import build_jsonl_provenance, write_prepared_sft_metadata
 from saver_v3.data.training_data import build_compact_trace_sft_record
 from saver_v3.cli.common import load_yaml_mapping, write_json
 from saver_v3.common import distributed_runtime_from_env, runtime_log
@@ -25,29 +25,38 @@ class PrepareSFTManifestConfig:
     output_path: str
     data_root: str = ""
     include_splits: str = ""
-    num_preview_frames: int = 8
-    preview_sampling_fps: float | None = None
+    saver_config_source: str = ""
+    saver_config: Dict[str, Any] = field(default_factory=lambda: SaverAgentConfig().to_dict())
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, Any]) -> "PrepareSFTManifestConfig":
+    def from_mapping(
+        cls,
+        mapping: Mapping[str, Any],
+        *,
+        source_anchor: str | Path | None = None,
+    ) -> "PrepareSFTManifestConfig":
         io_cfg = dict(_mapping(mapping.get("io")))
-        preview_cfg = dict(_mapping(mapping.get("preview")))
+        saver_config_source = str(mapping.get("saver_config_source") or "").strip()
+        saver_config = saver_config_from_mapping(
+            mapping,
+            saver_config_source=saver_config_source or None,
+            source_anchor=source_anchor,
+        )
         return cls(
             input_data_path=str(io_cfg.get("input_data_path") or "").strip(),
             output_path=str(io_cfg.get("output_path") or "").strip(),
             data_root=str(io_cfg.get("data_root") or "").strip(),
             include_splits=str(io_cfg.get("include_splits") or "").strip(),
-            num_preview_frames=int(preview_cfg.get("num_preview_frames", 8) or 8),
-            preview_sampling_fps=(
-                None
-                if preview_cfg.get("preview_sampling_fps") is None
-                else float(preview_cfg.get("preview_sampling_fps") or 0.0)
-            ),
+            saver_config_source=saver_config_source,
+            saver_config=saver_config.to_dict(),
         )
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "PrepareSFTManifestConfig":
-        return cls.from_mapping(load_yaml_mapping(path))
+        return cls.from_mapping(load_yaml_mapping(path), source_anchor=path)
+
+    def to_saver_config(self) -> SaverAgentConfig:
+        return saver_config_from_mapping(self.saver_config)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -60,13 +69,7 @@ def run_prepare_sft_manifest_job(config: PrepareSFTManifestConfig) -> Dict[str, 
         raise ValueError("prepare_sft_manifest requires output_path")
 
     runtime = distributed_runtime_from_env()
-    saver_config = SaverAgentConfig(
-        preview=PreviewConfig(
-            num_preview_frames=int(config.num_preview_frames),
-            preview_sampling_fps=config.preview_sampling_fps,
-            max_preview_frames=int(config.num_preview_frames),
-        )
-    )
+    saver_config = config.to_saver_config()
     record_builder = SaverRecordItemBuilder(
         data_root=config.data_root,
         config=saver_config,
@@ -104,6 +107,7 @@ def run_prepare_sft_manifest_job(config: PrepareSFTManifestConfig) -> Dict[str, 
             "input_data_path": str(config.input_data_path),
             "num_records": int(len(prepared_rows)),
             "include_splits": sorted(include_splits),
+            "source_runtime": build_jsonl_provenance(config.input_data_path, include_splits=sorted(include_splits)),
         },
     )
     summary = {

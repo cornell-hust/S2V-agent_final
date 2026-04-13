@@ -9,6 +9,7 @@ from saver_v3.model.qwen3vl import (
     load_qwen3vl_model,
     load_qwen3vl_processor,
 )
+from saver_v3.model.qwen_policy import load_auto_processor_with_compat
 
 
 class DummyProcessor:
@@ -31,11 +32,13 @@ class DummyProcessor:
 class Qwen3VLTests(unittest.TestCase):
     def test_load_qwen3vl_processor_sets_left_padding(self) -> None:
         processor = DummyProcessor()
+        captured = {}
 
         class AutoProcessor:
             @staticmethod
             def from_pretrained(model_name, **kwargs):
                 self.assertEqual(model_name, "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct")
+                captured["kwargs"] = dict(kwargs)
                 return processor
 
         with mock.patch.dict(sys.modules, {"transformers": types.SimpleNamespace(AutoProcessor=AutoProcessor)}):
@@ -44,6 +47,31 @@ class Qwen3VLTests(unittest.TestCase):
         self.assertIs(loaded, processor)
         self.assertEqual(loaded.padding_side, "left")
         self.assertEqual(loaded.tokenizer.padding_side, "left")
+        self.assertTrue(captured["kwargs"]["fix_mistral_regex"])
+
+    def test_load_auto_processor_with_compat_falls_back_when_fix_mistral_regex_is_unsupported(self) -> None:
+        processor = DummyProcessor()
+        calls = []
+
+        class AutoProcessor:
+            @staticmethod
+            def from_pretrained(model_name, **kwargs):
+                calls.append(dict(kwargs))
+                if "fix_mistral_regex" in kwargs:
+                    raise TypeError("from_pretrained() got an unexpected keyword argument 'fix_mistral_regex'")
+                return processor
+
+        with mock.patch.dict(sys.modules, {"transformers": types.SimpleNamespace(AutoProcessor=AutoProcessor)}):
+            loaded = load_auto_processor_with_compat(
+                "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct",
+                trust_remote_code=True,
+            )
+
+        self.assertIs(loaded, processor)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("fix_mistral_regex", calls[0])
+        self.assertNotIn("fix_mistral_regex", calls[1])
+        self.assertTrue(calls[1]["trust_remote_code"])
 
     def test_load_qwen3vl_model_locks_fa3(self) -> None:
         captured = {}
@@ -94,7 +122,6 @@ class Qwen3VLTests(unittest.TestCase):
         self.assertEqual(batch["videos"], [["frame-1", "frame-2"]])
 
     def test_missing_transformers_raises_clear_error(self) -> None:
-        with mock.patch.dict(sys.modules, {}, clear=False):
-            sys.modules.pop("transformers", None)
+        with mock.patch("importlib.import_module", side_effect=ImportError("missing transformers")):
             with self.assertRaises(ImportError):
                 load_qwen3vl_processor("/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct")

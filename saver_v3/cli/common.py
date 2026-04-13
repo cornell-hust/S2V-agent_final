@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -49,6 +50,39 @@ def load_yaml_mapping(path: str | Path) -> dict[str, Any]:
     return dict(ensure_mapping(payload, path=resolved))
 
 
+def _parse_override_value(raw_value: str) -> Any:
+    text = str(raw_value)
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def apply_config_overrides(mapping: Mapping[str, Any], overrides: Sequence[str] | None) -> dict[str, Any]:
+    resolved = copy.deepcopy(dict(mapping))
+    for raw_item in list(overrides or []):
+        item = str(raw_item or "").strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid --override item {item!r}: expected dotted.key=value")
+        dotted_key, raw_value = item.split("=", 1)
+        path = [segment.strip() for segment in dotted_key.split(".") if segment.strip()]
+        if not path:
+            raise ValueError(f"Invalid --override item {item!r}: empty override path")
+        cursor: dict[str, Any] = resolved
+        for segment in path[:-1]:
+            next_value = cursor.get(segment)
+            if not isinstance(next_value, Mapping):
+                next_value = {}
+                cursor[segment] = next_value
+            cursor = cursor[segment]
+        cursor[path[-1]] = _parse_override_value(raw_value)
+    return resolved
+
+
 def load_json_mapping(path: str | Path) -> dict[str, Any]:
     resolved = resolve_path(path)
     if resolved is None or not resolved.exists():
@@ -73,4 +107,3 @@ def write_json(payload: Any, path: str | Path) -> Path:
     with resolved.open("w", encoding="utf-8") as handle:
         handle.write(json_dumps(payload) + "\n")
     return resolved
-

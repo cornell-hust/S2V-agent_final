@@ -3,12 +3,12 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import importlib
 import inspect
 import json
 import math
 import random
 import re
-import sys
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -26,12 +26,14 @@ from saver_v3.core.adapter import TimeSearchRolloutAdapter
 from saver_v3.data.dataset import SaverRecordItemBuilder
 from saver_v3.core.environment import SaverEnvironmentState
 from saver_v3.common.experiment_logging import append_jsonl, write_json
+from saver_v3.data.prepared_loader import load_prepared_rows
 from saver_v3.metrics.evaluation import RolloutEvaluationConfig, run_rollout_evaluation
 from saver_v3.common.message_budget import apply_message_budget, drop_oldest_history_turn
 from saver_v3.model.model_loading import build_hf_model_init_kwargs, ensure_flash_attention_supported_dtype
-from saver_v3.data.prepared_metadata import PREPARED_SFT_FORMAT
+from saver_v3.data.prepared_metadata import PREPARED_SFT_FORMAT, ensure_prepared_sft_metadata
+from saver_v3.data.materialized_cache import MATERIALIZED_SFT_MESSAGES_FORMAT, ensure_materialized_cache_metadata
 from saver_v3.core.proposal import SiglipFeatureEncoder
-from saver_v3.model.qwen_policy import _resize_image_for_budget, _to_pil_image
+from saver_v3.model.qwen_policy import _resize_image_for_budget, _to_pil_image, load_auto_processor_with_compat
 from saver_v3.common.runtime import (
     distributed_barrier,
     distributed_runtime_from_env,
@@ -62,6 +64,7 @@ SFT_TENSOR_CACHE_SCHEMA_VERSION = "saver_agent.sft_tensor_cache.v3"
 STRICT_SFT_PRETOKENIZED_SCHEMA_VERSION = 1
 SFT_EPOCH_RESUME_DIRNAME = "epoch_resume"
 _TIMESTAMP_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)?s\s*$")
+_TRAINER_CHECKPOINT_DIR_RE = re.compile(r"^checkpoint-(\d+)$")
 
 
 @dataclass
@@ -355,11 +358,7 @@ def build_processor_signature(processor: Any) -> str:
 
 
 def load_processor_signature_from_model_path(model_path: str | Path) -> str:
-    try:
-        from transformers import AutoProcessor
-    except Exception as exc:
-        raise ImportError("Computing processor signatures requires the `transformers` package.") from exc
-    processor = AutoProcessor.from_pretrained(str(model_path))
+    processor = load_auto_processor_with_compat(str(model_path))
     return build_processor_signature(processor)
 
 
@@ -528,6 +527,38 @@ def sft_tensor_cache_entry_path(cache_dir: str | Path, cache_key: str) -> Path:
 
 def _unwrap_model(model: Any) -> Any:
     return getattr(model, "module", model)
+
+
+def _is_valid_hf_checkpoint_dir(path: str | Path) -> bool:
+    checkpoint_dir = Path(path)
+    if not checkpoint_dir.is_dir():
+        return False
+    if not (checkpoint_dir / "config.json").exists():
+        return False
+    return any(
+        (checkpoint_dir / filename).exists()
+        for filename in (
+            "preprocessor_config.json",
+            "processor_config.json",
+            "tokenizer_config.json",
+        )
+    )
+
+
+def _resolve_latest_trainer_checkpoint(output_dir: str | Path) -> Optional[Path]:
+    output_dir = Path(output_dir)
+    candidates: list[tuple[int, Path]] = []
+    for candidate in output_dir.glob("checkpoint-*"):
+        match = _TRAINER_CHECKPOINT_DIR_RE.fullmatch(candidate.name)
+        if match is None:
+            continue
+        if not _is_valid_hf_checkpoint_dir(candidate):
+            continue
+        candidates.append((int(match.group(1)), candidate.resolve()))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], str(item[1])))
+    return candidates[-1][1]
 
 
 def _resize_image_for_training(
@@ -1131,16 +1162,10 @@ def _load_prepared_jsonl_rows(
 ) -> List[Dict[str, Any]]:
     include_split_set = set(parse_include_splits(include_splits) or [])
     rows: List[Dict[str, Any]] = []
-    with Path(path).open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                raise ValueError(f"Invalid prepared SFT row in {path}: expected dict")
-            if include_split_set and str(row.get("split") or "") not in include_split_set:
-                continue
-            rows.append(row)
+    for row in load_prepared_rows(path):
+        if include_split_set and str(row.get("split") or "") not in include_split_set:
+            continue
+        rows.append(row)
     return rows
 
 def materialize_example_for_training(
@@ -2396,8 +2421,12 @@ class LazyVideoSFTDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.examples[idx]
         messages = self._replay_messages(row)
+        steps = list(row.get("oracle_trajectory") or [])
+        step_weights = [float(s.get("sample_weight", 1.0)) for s in steps if s.get("sample_weight") is not None]
+        episode_weight = sum(step_weights) / len(step_weights) if step_weights else 1.0
         return {
             "messages": messages,
+            "sample_weight": episode_weight,
             "video_id": row.get("video_id"),
             "split": row.get("split"),
         }
@@ -2479,6 +2508,11 @@ class BatchEpisodeSFTCollator:
             if isinstance(value, torch.Tensor)
         }
         result["labels"] = labels
+        sample_weights = torch.tensor(
+            [float(ex.get("sample_weight", 1.0)) for ex in features],
+            dtype=torch.float32,
+        )
+        result["sample_weight"] = sample_weights
         return result
 
 
@@ -3488,7 +3522,7 @@ def load_qwen_model_and_processor(
     lora_target_modules: Optional[Sequence[str]] = None,
 ) -> Tuple[Any, Any]:
     try:
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        from transformers import Qwen3VLForConditionalGeneration
     except Exception as exc:
         raise ImportError(
             "Training requires a recent transformers build with Qwen3-VL support. "
@@ -3526,7 +3560,7 @@ def load_qwen_model_and_processor(
         attn_implementation=attn_implementation,
     )
 
-    processor = AutoProcessor.from_pretrained(processor_path)
+    processor = load_auto_processor_with_compat(processor_path)
     if hasattr(model.config, "use_cache"):
         # KV cache is useful for autoregressive decoding, not for teacher-forced SFT.
         model.config.use_cache = False
@@ -3883,7 +3917,7 @@ def create_trainer(
         "fp16": bool(fp16),
         "remove_unused_columns": False,
         "report_to": list(report_to or []),
-        "disable_tqdm": True,
+        "disable_tqdm": False,
         "dataloader_num_workers": max(0, int(dataloader_num_workers)),
         "dataloader_persistent_workers": bool(dataloader_persistent_workers) and int(dataloader_num_workers) > 0,
     }
@@ -3910,147 +3944,8 @@ def create_trainer(
         kl_beta=kl_beta,
         callbacks=list(callbacks or []),
     )
-    trainer.add_callback(_build_epoch_progress_callback(trainer=trainer))
     return trainer
 
-
-def _build_epoch_progress_callback(*, trainer: Any):
-    try:
-        from transformers import TrainerCallback
-    except Exception as exc:
-        raise ImportError("Epoch progress callbacks require the `transformers` package.") from exc
-    try:
-        from tqdm.auto import tqdm
-    except Exception as exc:
-        raise ImportError("Epoch progress callbacks require `tqdm` to be installed.") from exc
-
-    class EpochProgressCallback(TrainerCallback):
-        def __init__(self):
-            self.trainer = trainer
-            self.runtime = distributed_runtime_from_env()
-            self.progress_bar = None
-            self.current_epoch_index = 0
-            self.epoch_start_global_step = 0
-            self.last_epoch_step = 0
-            self.steps_per_epoch = 0
-            self.display_total_epochs = 0
-            self.current_epoch_total = 0
-            self.use_live_tqdm = False
-            self.progress_log_every = 1
-            self.last_logged_epoch_step = 0
-
-        def _supports_live_tqdm(self) -> bool:
-            stderr = getattr(sys, "stderr", None)
-            isatty = getattr(stderr, "isatty", None)
-            if not callable(isatty):
-                return False
-            try:
-                return bool(isatty())
-            except Exception:
-                return False
-
-        def _log_epoch_progress(self, *, epoch_step: int, epoch_total: int, force: bool = False) -> None:
-            epoch_step = max(0, int(epoch_step))
-            epoch_total = max(1, int(epoch_total))
-            if epoch_step <= self.last_logged_epoch_step and not force:
-                return
-            if not force and not should_log_progress(epoch_step, epoch_total, int(self.progress_log_every)):
-                return
-            percent = 100.0 * float(epoch_step) / float(epoch_total)
-            runtime_log(
-                (
-                    f"SFT epoch progress: epoch={self.current_epoch_index}/{self.display_total_epochs} "
-                    f"step={epoch_step}/{epoch_total} progress={percent:.1f}%"
-                ),
-                runtime=self.runtime,
-                main_process_only=True,
-            )
-            self.last_logged_epoch_step = epoch_step
-
-        def _close_progress_bar(self) -> None:
-            if self.progress_bar is None:
-                return
-            # Force-clear the tqdm line before later eval logs start printing.
-            self.progress_bar.clear()
-            self.progress_bar.close()
-            self.progress_bar = None
-            print("", flush=True)
-
-        def on_train_begin(self, args, state, control, **kwargs):
-            if not self.runtime.is_main_process:
-                return control
-            train_dataloader = self.trainer.get_train_dataloader()
-            dataloader_steps = len(train_dataloader) if hasattr(train_dataloader, "__len__") else 0
-            accumulation = max(1, int(args.gradient_accumulation_steps))
-            self.steps_per_epoch = max(1, int(math.ceil(float(dataloader_steps) / float(accumulation))))
-            self.display_total_epochs = max(1, int(math.ceil(float(args.num_train_epochs))))
-            self.use_live_tqdm = self._supports_live_tqdm()
-            self.progress_log_every = max(1, int(math.ceil(float(self.steps_per_epoch) / 100.0)))
-            return control
-
-        def on_epoch_begin(self, args, state, control, **kwargs):
-            if not self.runtime.is_main_process:
-                return control
-            self.current_epoch_index += 1
-            self.epoch_start_global_step = int(state.global_step or 0)
-            self.last_epoch_step = 0
-            self.last_logged_epoch_step = 0
-            remaining_steps = max(0, int(state.max_steps or 0) - self.epoch_start_global_step)
-            epoch_total = max(1, min(int(self.steps_per_epoch or 1), remaining_steps or int(self.steps_per_epoch or 1)))
-            self.current_epoch_total = int(epoch_total)
-            if self.use_live_tqdm:
-                if self.progress_bar is not None:
-                    self._close_progress_bar()
-                self.progress_bar = tqdm(
-                    total=epoch_total,
-                    desc=f"Epoch {self.current_epoch_index}/{self.display_total_epochs}",
-                    leave=False,
-                    dynamic_ncols=True,
-                )
-            else:
-                runtime_log(
-                    (
-                        f"SFT epoch progress start: epoch={self.current_epoch_index}/{self.display_total_epochs} "
-                        f"steps={epoch_total}"
-                    ),
-                    runtime=self.runtime,
-                    main_process_only=True,
-                )
-            return control
-
-        def on_step_end(self, args, state, control, **kwargs):
-            if not self.runtime.is_main_process:
-                return control
-            current_epoch_step = max(0, int(state.global_step or 0) - self.epoch_start_global_step)
-            delta = current_epoch_step - self.last_epoch_step
-            if delta > 0:
-                if self.progress_bar is not None:
-                    remaining = max(0, int(self.progress_bar.total or 0) - int(self.progress_bar.n or 0))
-                    self.progress_bar.update(min(delta, remaining))
-                else:
-                    epoch_total = max(1, int(self.current_epoch_total or self.steps_per_epoch or 1))
-                    self._log_epoch_progress(epoch_step=current_epoch_step, epoch_total=epoch_total)
-                self.last_epoch_step = current_epoch_step
-            return control
-
-        def on_epoch_end(self, args, state, control, **kwargs):
-            if not self.runtime.is_main_process:
-                return control
-            epoch_total = max(1, int(self.current_epoch_total or self.steps_per_epoch or 1))
-            if self.progress_bar is not None:
-                remaining = max(0, int(self.progress_bar.total or 0) - int(self.progress_bar.n or 0))
-                if remaining > 0:
-                    self.progress_bar.update(remaining)
-                self._close_progress_bar()
-            else:
-                self._log_epoch_progress(epoch_step=epoch_total, epoch_total=epoch_total, force=True)
-            return control
-
-        def on_train_end(self, args, state, control, **kwargs):
-            self._close_progress_bar()
-            return control
-
-    return EpochProgressCallback()
 
 
 def _build_rollout_eval_callback(
@@ -4220,6 +4115,117 @@ def _prepared_rows_require_feature_guided_proposal(rows: Sequence[Dict[str, Any]
     return False
 
 
+def _instantiate_materialized_messages_dataset(
+    dataset_cls: Any,
+    *,
+    materialized_messages_path: str | Path,
+    include_splits: Optional[str | Sequence[str]] = None,
+    config: Any = None,
+) -> Any:
+    try:
+        signature = inspect.signature(dataset_cls)
+    except (TypeError, ValueError):
+        return dataset_cls(str(materialized_messages_path))
+
+    parameters = signature.parameters
+    accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+    kwargs: Dict[str, Any] = {}
+
+    path_key = ""
+    for candidate in ("materialized_messages_path", "messages_path", "path", "cache_path"):
+        if accepts_kwargs or candidate in parameters:
+            path_key = candidate
+            break
+    if path_key:
+        kwargs[path_key] = str(materialized_messages_path)
+
+    for key, value in (
+        ("include_splits", include_splits),
+        ("config", config),
+        ("saver_config", config),
+    ):
+        if value is not None and (accepts_kwargs or key in parameters):
+            kwargs[key] = value
+
+    if path_key:
+        return dataset_cls(**kwargs)
+    return dataset_cls(str(materialized_messages_path), **kwargs)
+
+
+def _load_materialized_messages_sft_dataset(
+    *,
+    materialized_messages_path: str | Path,
+    include_splits: Optional[str | Sequence[str]] = None,
+    config: Any = None,
+    require_materialized_cache: bool = False,
+    runtime: Any,
+) -> Any | None:
+    ensure_materialized_cache_metadata(
+        materialized_messages_path,
+        expected_format=MATERIALIZED_SFT_MESSAGES_FORMAT,
+        require_source=False,
+    )
+    try:
+        materialized_cache = importlib.import_module("saver_v3.data.materialized_cache")
+    except ModuleNotFoundError as exc:
+        if exc.name != "saver_v3.data.materialized_cache":
+            raise
+        message = "saver_v3.data.materialized_cache is not available for materialized SFT messages"
+        if require_materialized_cache:
+            raise ImportError(message) from exc
+        runtime_log(
+            f"WARNING: {message}; falling back to legacy compact_trace replay.",
+            runtime=runtime,
+            main_process_only=True,
+        )
+        return None
+
+    dataset_cls = getattr(materialized_cache, "MaterializedMessagesSFTDataset", None)
+    if dataset_cls is None:
+        message = "saver_v3.data.materialized_cache does not expose MaterializedMessagesSFTDataset"
+        if require_materialized_cache:
+            raise ImportError(message)
+        runtime_log(
+            f"WARNING: {message}; falling back to legacy compact_trace replay.",
+            runtime=runtime,
+            main_process_only=True,
+        )
+        return None
+
+    try:
+        dataset = _instantiate_materialized_messages_dataset(
+            dataset_cls,
+            materialized_messages_path=materialized_messages_path,
+            include_splits=include_splits,
+            config=config,
+        )
+    except Exception as exc:
+        if require_materialized_cache:
+            raise
+        runtime_log(
+            f"WARNING: failed to load materialized SFT messages from {materialized_messages_path}: {exc}; "
+            "falling back to legacy compact_trace replay.",
+            runtime=runtime,
+            main_process_only=True,
+        )
+        return None
+
+    try:
+        num_examples = len(dataset)
+    except Exception:
+        num_examples = "unknown"
+    runtime_log(
+        f"using materialized SFT messages cache: path={materialized_messages_path} examples={num_examples}",
+        runtime=runtime,
+        main_process_only=True,
+    )
+    return dataset
+
+
+def _is_cuda_device_name(device_name: str | Path | None) -> bool:
+    return str(device_name or "").strip().lower().startswith("cuda")
+
+
 def sft_epoch_resume_dir(output_dir: str | Path, epoch_index: int) -> Path:
     return Path(output_dir) / SFT_EPOCH_RESUME_DIRNAME / f"epoch_{int(epoch_index):03d}"
 
@@ -4386,6 +4392,29 @@ def save_sft_epoch_resume_checkpoint(
     runtime: Any = None,
 ) -> Path:
     runtime = runtime or distributed_runtime_from_env()
+    latest_checkpoint = _resolve_latest_trainer_checkpoint(output_dir)
+    if latest_checkpoint is not None:
+        runtime_log(
+            (
+                "reusing latest trainer checkpoint for epoch-end rollout-eval recovery "
+                f"instead of saving duplicate epoch_resume weights: {latest_checkpoint}"
+            ),
+            runtime=runtime,
+            main_process_only=True,
+        )
+        runtime_log(
+            f"entering SFT epoch-save barrier at {latest_checkpoint}",
+            runtime=runtime,
+            main_process_only=False,
+        )
+        distributed_barrier(runtime)
+        runtime_log(
+            f"passed SFT epoch-save barrier at {latest_checkpoint}",
+            runtime=runtime,
+            main_process_only=False,
+        )
+        return latest_checkpoint
+
     checkpoint_dir = sft_epoch_resume_dir(output_dir, epoch_index)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4415,19 +4444,19 @@ def save_sft_epoch_resume_checkpoint(
     runtime_log(
         (
             f"epoch-resume checkpoint ready at {checkpoint_dir}; "
-            "waiting for all distributed ranks to finish the RL epoch save"
+            "waiting for all distributed ranks to finish the SFT epoch save"
         ),
         runtime=runtime,
         main_process_only=True,
     )
     runtime_log(
-        f"entering RL epoch-save barrier at {checkpoint_dir}",
+        f"entering SFT epoch-save barrier at {checkpoint_dir}",
         runtime=runtime,
         main_process_only=False,
     )
     distributed_barrier(runtime)
     runtime_log(
-        f"passed RL epoch-save barrier at {checkpoint_dir}",
+        f"passed SFT epoch-save barrier at {checkpoint_dir}",
         runtime=runtime,
         main_process_only=False,
     )
@@ -4521,6 +4550,8 @@ def run_rollout_eval_from_checkpoint(
 def run_standard_sft(
     *,
     prepared_data_path: str | Path,
+    materialized_messages_path: str | Path = "",
+    require_materialized_cache: bool = False,
     include_splits: Optional[str | Sequence[str]] = None,
     model_path: str | Path,
     output_dir: str | Path,
@@ -4567,11 +4598,30 @@ def run_standard_sft(
     proposal_model_path: str | Path = "",
     proposal_torch_dtype: str = "auto",
     proposal_device: str = "",
+    use_sample_weights: bool = False,
 ) -> Dict[str, Any]:
     try:
         from trl import SFTConfig, SFTTrainer
     except Exception as exc:
         raise ImportError("Standard SFT training requires the `trl` package.") from exc
+
+    class WeightedSFTTrainer(SFTTrainer):
+        """SFTTrainer subclass that supports per-example sample_weight."""
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            sample_weight = inputs.pop("sample_weight", None)
+
+            if sample_weight is None:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+            outputs = model(**inputs)
+            loss = compute_signed_weighted_masked_response_loss(
+                logits=outputs.logits,
+                labels=inputs["labels"],
+                sample_weights=sample_weight.to(outputs.logits.device),
+            )
+
+            return (loss, outputs) if return_outputs else loss
 
     runtime = distributed_runtime_from_env()
     output_dir = Path(output_dir)
@@ -4586,6 +4636,7 @@ def run_standard_sft(
     runtime_log(
         (
             f"SFT setup: prepared_data={prepared_data_path} "
+            f"materialized_messages={materialized_messages_path or '(none)'} "
             f"output_dir={output_dir} model_path={model_path}"
         ),
         runtime=runtime,
@@ -4604,16 +4655,6 @@ def run_standard_sft(
         runtime=runtime,
         main_process_only=True,
     )
-    runtime_log(
-        (
-            "SFT dataloader controls: "
-            f"num_workers={max(0, int(dataloader_num_workers))} "
-            f"prefetch_factor={int(dataloader_prefetch_factor) if int(dataloader_num_workers) > 0 and int(dataloader_prefetch_factor) > 0 else 'off'} "
-            f"persistent_workers={bool(dataloader_persistent_workers) and int(dataloader_num_workers) > 0}"
-        ),
-        runtime=runtime,
-        main_process_only=True,
-    )
     runtime_log(f"loading policy model from {model_path}", runtime=runtime, main_process_only=True)
     model, processor = load_qwen_model_and_processor(
         model_path,
@@ -4626,59 +4667,109 @@ def run_standard_sft(
         lora_dropout=lora_dropout,
         lora_target_modules=lora_target_modules,
     )
-    examples = _load_prepared_jsonl_rows(
-        prepared_data_path,
-        include_splits=include_splits,
-    )
-    if not examples:
-        raise ValueError(f"No prepared SFT examples were loaded from {prepared_data_path}")
-    if not all(_is_compact_trace_sft_row(example) for example in examples):
-        raise ValueError(
-            "Prepared SFT training now only accepts compact_trace_v2 rows. "
-            "Regenerate the prepared JSONL with the new lazy video-level format instead of legacy step/episode rows."
-        )
-    frame_cache_summary = summarize_example_frame_cache_status(examples)
-    feature_cache_summary = summarize_example_feature_cache_status(examples)
-    runtime_log(
-        format_example_frame_cache_status(frame_cache_summary, prefix="training frame cache"),
-        runtime=runtime,
-        main_process_only=True,
-    )
-    runtime_log(
-        format_example_feature_cache_status(feature_cache_summary, prefix="training feature cache"),
-        runtime=runtime,
-        main_process_only=True,
-    )
-    if int(frame_cache_summary.get("num_missing_frame_cache", 0)) > 0:
-        raise ValueError(
-            "Prepared SFT training requires frame_cache for every referenced video. "
-            f"{format_example_frame_cache_status(frame_cache_summary)}"
-        )
-    if int(feature_cache_summary.get("num_missing_feature_cache", 0)) > 0:
-        raise ValueError(
-            "Prepared SFT training requires feature_cache for every referenced video. "
-            f"{format_example_feature_cache_status(feature_cache_summary)}"
-        )
-    strict_feature_guided_proposal = _prepared_rows_require_feature_guided_proposal(examples)
-    if strict_feature_guided_proposal and not str(proposal_model_path or "").strip():
-        raise ValueError(
-            "Prepared SFT training requires proposal_model_path because compact_trace replay includes seek_evidence."
-        )
-    proposal_runtime = (
-        _load_training_proposal_runtime(
-            proposal_model_path=proposal_model_path,
-            proposal_torch_dtype=proposal_torch_dtype,
-            proposal_device=proposal_device,
+    effective_dataloader_num_workers = max(0, int(dataloader_num_workers))
+    effective_dataloader_prefetch_factor = int(dataloader_prefetch_factor)
+    effective_dataloader_persistent_workers = bool(dataloader_persistent_workers)
+    train_dataset = None
+    strict_feature_guided_proposal = False
+    if str(materialized_messages_path or "").strip():
+        train_dataset = _load_materialized_messages_sft_dataset(
+            materialized_messages_path=materialized_messages_path,
+            include_splits=include_splits,
+            config=saver_config,
+            require_materialized_cache=require_materialized_cache,
             runtime=runtime,
         )
-        if strict_feature_guided_proposal
-        else None
-    )
-    train_dataset = LazyVideoSFTDataset(
-        examples,
-        config=saver_config,
-        proposal_runtime=proposal_runtime,
-        strict_feature_guided_proposal=strict_feature_guided_proposal,
+    if train_dataset is None:
+        examples = _load_prepared_jsonl_rows(
+            prepared_data_path,
+            include_splits=include_splits,
+        )
+        if not examples:
+            raise ValueError(f"No prepared SFT examples were loaded from {prepared_data_path}")
+        if not all(_is_compact_trace_sft_row(example) for example in examples):
+            raise ValueError(
+                "Prepared SFT training now only accepts compact_trace_v2 rows. "
+                "Regenerate the prepared JSONL with the new lazy video-level format instead of legacy step/episode rows."
+            )
+        frame_cache_summary = summarize_example_frame_cache_status(examples)
+        feature_cache_summary = summarize_example_feature_cache_status(examples)
+        runtime_log(
+            format_example_frame_cache_status(frame_cache_summary, prefix="training frame cache"),
+            runtime=runtime,
+            main_process_only=True,
+        )
+        runtime_log(
+            format_example_feature_cache_status(feature_cache_summary, prefix="training feature cache"),
+            runtime=runtime,
+            main_process_only=True,
+        )
+        if int(frame_cache_summary.get("num_missing_frame_cache", 0)) > 0:
+            raise ValueError(
+                "Prepared SFT training requires frame_cache for every referenced video. "
+                f"{format_example_frame_cache_status(frame_cache_summary)}"
+            )
+        if int(feature_cache_summary.get("num_missing_feature_cache", 0)) > 0:
+            raise ValueError(
+                "Prepared SFT training requires feature_cache for every referenced video. "
+                f"{format_example_feature_cache_status(feature_cache_summary)}"
+            )
+        strict_feature_guided_proposal = _prepared_rows_require_feature_guided_proposal(examples)
+        if strict_feature_guided_proposal and not str(proposal_model_path or "").strip():
+            raise ValueError(
+                "Prepared SFT training requires proposal_model_path because compact_trace replay includes seek_evidence."
+            )
+        proposal_runtime_device = (
+            _resolve_training_proposal_device(proposal_device, runtime=runtime)
+            if strict_feature_guided_proposal
+            else ""
+        )
+        proposal_runtime = (
+            _load_training_proposal_runtime(
+                proposal_model_path=proposal_model_path,
+                proposal_torch_dtype=proposal_torch_dtype,
+                proposal_device=proposal_runtime_device,
+                runtime=runtime,
+            )
+            if strict_feature_guided_proposal
+            else None
+        )
+        if strict_feature_guided_proposal and _is_cuda_device_name(proposal_runtime_device):
+            if (
+                effective_dataloader_num_workers > 0
+                or effective_dataloader_prefetch_factor > 0
+                or effective_dataloader_persistent_workers
+            ):
+                runtime_log(
+                    (
+                        "WARNING: forcing SFT dataloader workers off because legacy compact_trace replay "
+                        f"uses CUDA proposal_runtime on {proposal_runtime_device}; requested "
+                        f"num_workers={effective_dataloader_num_workers} "
+                        f"prefetch_factor={effective_dataloader_prefetch_factor} "
+                        f"persistent_workers={effective_dataloader_persistent_workers}."
+                    ),
+                    runtime=runtime,
+                    main_process_only=True,
+                )
+            effective_dataloader_num_workers = 0
+            effective_dataloader_prefetch_factor = 0
+            effective_dataloader_persistent_workers = False
+        train_dataset = LazyVideoSFTDataset(
+            examples,
+            config=saver_config,
+            proposal_runtime=proposal_runtime,
+            strict_feature_guided_proposal=strict_feature_guided_proposal,
+        )
+
+    runtime_log(
+        (
+            "SFT dataloader controls: "
+            f"num_workers={effective_dataloader_num_workers} "
+            f"prefetch_factor={effective_dataloader_prefetch_factor if effective_dataloader_num_workers > 0 and effective_dataloader_prefetch_factor > 0 else 'off'} "
+            f"persistent_workers={effective_dataloader_persistent_workers and effective_dataloader_num_workers > 0}"
+        ),
+        runtime=runtime,
+        main_process_only=True,
     )
     data_collator: Any = BatchEpisodeSFTCollator(
         processor,
@@ -4718,23 +4809,24 @@ def run_standard_sft(
         "fp16": bool(fp16),
         "remove_unused_columns": False,
         "report_to": list(report_to or []),
-        "disable_tqdm": True,
+        "disable_tqdm": False,
         "dataset_kwargs": {"skip_prepare_dataset": True},
         "max_length": int(max_seq_length) if int(max_seq_length) > 0 else None,
         "packing": False,
-        "dataloader_num_workers": max(0, int(dataloader_num_workers)),
-        "dataloader_persistent_workers": bool(dataloader_persistent_workers) and int(dataloader_num_workers) > 0,
+        "dataloader_num_workers": int(effective_dataloader_num_workers),
+        "dataloader_persistent_workers": bool(effective_dataloader_persistent_workers) and int(effective_dataloader_num_workers) > 0,
         "ddp_find_unused_parameters": (False if ddp_find_unused_parameters is None else bool(ddp_find_unused_parameters)),
         "gradient_checkpointing": bool(gradient_checkpointing),
     }
-    if int(dataloader_num_workers) > 0 and int(dataloader_prefetch_factor) > 0:
-        config_kwargs["dataloader_prefetch_factor"] = int(dataloader_prefetch_factor)
+    if int(effective_dataloader_num_workers) > 0 and int(effective_dataloader_prefetch_factor) > 0:
+        config_kwargs["dataloader_prefetch_factor"] = int(effective_dataloader_prefetch_factor)
     if str(deepspeed or "").strip():
         config_kwargs["deepspeed"] = str(deepspeed)
     if bool(gradient_checkpointing):
         config_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
     args = SFTConfig(**config_kwargs)
-    trainer = SFTTrainer(
+    trainer_cls = WeightedSFTTrainer if use_sample_weights else SFTTrainer
+    trainer = trainer_cls(
         model=model,
         args=args,
         train_dataset=train_dataset,
@@ -4742,13 +4834,14 @@ def run_standard_sft(
         processing_class=processor,
         callbacks=list(callbacks or []),
     )
-    trainer.add_callback(_build_epoch_progress_callback(trainer=trainer))
 
     if runtime.is_main_process:
         write_json(
             resolved_log_dir / "run_standard_sft_config.json",
             {
                 "prepared_data_path": str(prepared_data_path),
+                "materialized_messages_path": str(materialized_messages_path or ""),
+                "require_materialized_cache": bool(require_materialized_cache),
                 "include_splits": list(parse_include_splits(include_splits) or []),
                 "model_path": str(model_path),
                 "output_dir": str(output_dir),
@@ -4768,9 +4861,9 @@ def run_standard_sft(
                 "max_total_images": int(max_total_images),
                 "max_seq_length": int(max_seq_length),
                 "keep_recent_text_messages": int(keep_recent_text_messages),
-                "dataloader_num_workers": int(dataloader_num_workers),
-                "dataloader_prefetch_factor": int(dataloader_prefetch_factor),
-                "dataloader_persistent_workers": bool(dataloader_persistent_workers),
+                "dataloader_num_workers": int(effective_dataloader_num_workers),
+                "dataloader_prefetch_factor": int(effective_dataloader_prefetch_factor),
+                "dataloader_persistent_workers": bool(effective_dataloader_persistent_workers),
                 "lr_scheduler_type": str(lr_scheduler_type),
                 "report_to": list(report_to or []),
                 "seed": int(seed),
@@ -4789,14 +4882,40 @@ def run_standard_sft(
         )
     runtime_log("starting SFTTrainer.train()", runtime=runtime, main_process_only=True)
     train_result = trainer.train(resume_from_checkpoint=resolved_resume_from_checkpoint)
+    latest_checkpoint = _resolve_latest_trainer_checkpoint(output_dir)
+    runtime_log(
+        f"SFTTrainer.train() returned; latest_checkpoint={latest_checkpoint or '(none)'}",
+        runtime=runtime,
+        main_process_only=True,
+    )
 
     if trainer.is_world_process_zero():
         trainer_model = getattr(trainer, "model", model)
-        with _temporary_model_use_cache(trainer_model, enabled=True):
-            trainer.save_model(str(output_dir))
-        _set_model_use_cache(trainer_model, True)
-        if hasattr(processor, "save_pretrained"):
-            processor.save_pretrained(str(output_dir))
+        if latest_checkpoint is not None:
+            runtime_log(
+                (
+                    "reusing latest SFT checkpoint instead of saving duplicate top-level full model: "
+                    f"{latest_checkpoint}"
+                ),
+                runtime=runtime,
+                main_process_only=True,
+            )
+        else:
+            runtime_log(
+                f"saving final SFT model to {output_dir}",
+                runtime=runtime,
+                main_process_only=True,
+            )
+            with _temporary_model_use_cache(trainer_model, enabled=True):
+                trainer.save_model(str(output_dir))
+            _set_model_use_cache(trainer_model, True)
+            if hasattr(processor, "save_pretrained"):
+                processor.save_pretrained(str(output_dir))
+            runtime_log(
+                f"final SFT model save complete: {output_dir}",
+                runtime=runtime,
+                main_process_only=True,
+            )
         write_json(
             resolved_log_dir / "trainer_log_history.json",
             {
@@ -4807,14 +4926,22 @@ def run_standard_sft(
                 "num_train_epochs": int(getattr(trainer.state, "num_train_epochs", 0) or 0),
             },
         )
+    runtime_log("entering final SFT distributed barrier", runtime=runtime, main_process_only=True)
     distributed_barrier(runtime)
+    runtime_log("passed final SFT distributed barrier", runtime=runtime, main_process_only=True)
+    authoritative_model_path = _resolve_latest_trainer_checkpoint(output_dir)
+    if authoritative_model_path is None and _is_valid_hf_checkpoint_dir(output_dir):
+        authoritative_model_path = output_dir.resolve()
     result = {
         "prepared_data_path": str(prepared_data_path),
+        "materialized_messages_path": str(materialized_messages_path or ""),
         "num_examples": len(train_dataset),
         "output_dir": str(output_dir),
         "log_dir": str(resolved_log_dir),
         "rollout_eval_output_dir": str(resolved_rollout_eval_output_dir),
         "train_loss": float(getattr(train_result, "training_loss", 0.0)),
+        "latest_checkpoint": str(latest_checkpoint) if latest_checkpoint is not None else "",
+        "authoritative_model_path": str(authoritative_model_path) if authoritative_model_path is not None else "",
     }
     if trainer.is_world_process_zero():
         write_json(resolved_log_dir / "run_standard_sft_result.json", result)

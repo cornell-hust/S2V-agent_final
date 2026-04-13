@@ -14,6 +14,7 @@ from split_utils import parse_include_splits
 import torch.distributed as dist
 
 from saver_v3.data.prepared_metadata import (
+    build_jsonl_provenance,
     config_from_prepared_sft_metadata,
     ensure_prepared_sft_metadata,
     prepared_sft_metadata_path,
@@ -842,6 +843,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     output_path = sharded_output_path(args.output, num_shards=shard_spec.num_shards, shard_index=shard_spec.shard_index)
     input_path = Path(args.input)
     input_metadata = ensure_prepared_sft_metadata(input_path)
+    effective_source_prepared_splits = parse_include_splits(args.include_splits) or list(input_metadata.get("include_splits") or [])
     raw_rows = _load_jsonl(
         input_path,
         skip_invalid_lines=args.skip_invalid_jsonl_lines,
@@ -1007,6 +1009,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         if not shard_spec.is_sharded:
             metadata_path = prepared_sft_metadata_path(output_path)
             metadata = dict(input_metadata)
+            metadata["num_records"] = int(len(local_output_rows))
+            metadata["include_splits"] = sorted({str(item).strip() for item in effective_source_prepared_splits if str(item).strip()})
+            metadata["source_prepared"] = build_jsonl_provenance(
+                input_path,
+                include_splits=effective_source_prepared_splits,
+            )
             metadata["teacher_annotated"] = True
             metadata["teacher_rollout_primary_materialized"] = True
             metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1042,6 +1050,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                     runtime=runtime,
                 )
                 merged_metadata = dict(input_metadata)
+                merged_metadata["num_records"] = int(len(merged_rows))
+                merged_metadata["include_splits"] = sorted(
+                    {str(item).strip() for item in effective_source_prepared_splits if str(item).strip()}
+                )
+                merged_metadata["source_prepared"] = build_jsonl_provenance(
+                    input_path,
+                    include_splits=effective_source_prepared_splits,
+                )
                 merged_metadata["teacher_annotated"] = True
                 merged_metadata["teacher_rollout_primary_materialized"] = True
                 prepared_sft_metadata_path(merged_output_path).write_text(

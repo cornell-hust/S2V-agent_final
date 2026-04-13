@@ -339,6 +339,7 @@ def _build_qwen_policy(args: argparse.Namespace, *, runtime: Any) -> QwenGenerat
             args=args,
             runtime=runtime,
             model_path=args.model_path,
+            prefer_direct_local_rank_runtime=True,
             max_new_tokens=args.max_new_tokens,
             max_total_images=_resolve_max_total_images(args),
             max_seq_length=args.max_seq_length,

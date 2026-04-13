@@ -53,6 +53,32 @@ def _configure_qwen_processor(processor: Any) -> Any:
     return processor
 
 
+def load_auto_processor_with_compat(
+    model_path: str | Path,
+    *,
+    trust_remote_code: Optional[bool] = None,
+    **kwargs: Any,
+) -> Any:
+    try:
+        from transformers import AutoProcessor
+    except Exception as exc:
+        raise ImportError("Loading the Qwen processor requires the `transformers` package.") from exc
+
+    load_kwargs: Dict[str, Any] = dict(kwargs)
+    if trust_remote_code is not None:
+        load_kwargs["trust_remote_code"] = bool(trust_remote_code)
+    try:
+        return AutoProcessor.from_pretrained(
+            str(model_path),
+            fix_mistral_regex=True,
+            **load_kwargs,
+        )
+    except TypeError as exc:
+        if "fix_mistral_regex" not in str(exc):
+            raise
+        return AutoProcessor.from_pretrained(str(model_path), **load_kwargs)
+
+
 def _build_generation_kwargs(
     *,
     max_new_tokens: int,
@@ -553,7 +579,7 @@ class QwenGenerationPolicy:
         use_generation_cache: bool = False,
     ) -> "QwenGenerationPolicy":
         try:
-            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+            from transformers import Qwen3VLForConditionalGeneration
         except Exception as exc:
             raise ImportError(
                 "QwenGenerationPolicy requires a recent transformers build with Qwen3-VL support. "
@@ -585,7 +611,7 @@ class QwenGenerationPolicy:
             attn_implementation=attn_implementation,
         )
         model.eval()
-        processor = _configure_qwen_processor(AutoProcessor.from_pretrained(processor_path))
+        processor = _configure_qwen_processor(load_auto_processor_with_compat(processor_path))
         return cls(
             model=model,
             processor=processor,
@@ -1083,11 +1109,5 @@ def resolve_generation_processor_path(model_path: str | Path) -> str:
 
 
 def load_generation_processor_for_checkpoint(model_path: str | Path) -> Any:
-    try:
-        from transformers import AutoProcessor
-    except Exception as exc:
-        raise ImportError(
-            "Loading the Qwen generation processor requires the `transformers` package."
-        ) from exc
     processor_path = resolve_generation_processor_path(model_path)
-    return _configure_qwen_processor(AutoProcessor.from_pretrained(processor_path))
+    return _configure_qwen_processor(load_auto_processor_with_compat(processor_path))

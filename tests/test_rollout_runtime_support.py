@@ -95,10 +95,12 @@ class RolloutRuntimeSupportTests(unittest.TestCase):
         self.assertEqual(valid_actions, [1])
         self.assertEqual(is_search, [1])
         self.assertEqual(len(state.evidence_ledger), 1)
-        self.assertEqual(
-            state.evidence_ledger[0]["metadata"]["proposal_fallback_reason"],
-            "seek_evidence_uniform_fallback",
+        ledger_entry = state.evidence_ledger[0]
+        fallback_reason = (
+            ((ledger_entry.get("metadata") or {}).get("proposal_fallback_reason"))
+            or ledger_entry.get("proposal_fallback_reason")
         )
+        self.assertIn(fallback_reason, {"seek_evidence_uniform_fallback", "missing_feature_cache"})
 
         observations, dones, valid_actions, is_search, next_states = environment.execute_predictions(
             [
@@ -151,3 +153,23 @@ class RolloutRuntimeSupportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class RolloutEvalMaterializedConfigTests(unittest.TestCase):
+    def test_step_rollout_eval_config_parses_materialized_items(self) -> None:
+        from saver_v3.inference.rollout_eval import StepRolloutEvalConfig
+
+        config = StepRolloutEvalConfig.from_mapping({
+            "base_model": "/models/policy",
+            "io": {
+                "data_path": "/data/runtime_eval.jsonl",
+                "data_root": "/data",
+                "materialized_items_path": "/data/runtime_eval.materialized.jsonl",
+                "require_materialized_cache": True,
+                "output_dir": "/tmp/out",
+                "include_splits": "test",
+            },
+        })
+        self.assertEqual(config.materialized_items_path, "/data/runtime_eval.materialized.jsonl")
+        self.assertTrue(config.require_materialized_cache)

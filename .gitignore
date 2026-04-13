@@ -19,12 +19,13 @@ conda-meta/
 .vscode/
 
 # Training and inference artifacts
-artifacts/
+artifacts/*
 checkpoints/
 logs/
 runs/
 wandb/
-data_utils/
+data_utils/*.jsonl
+data_utils/*.json
 
 # Data and cache mounts
 .cache/

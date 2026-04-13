@@ -1,0 +1,42 @@
+base_model: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+torch_dtype: bfloat16
+attn_implementation: flash_attention_3
+
+server:
+  # Deprecated for this path: fixed baseline now uses direct HF inference under torchrun.
+  mode: colocate
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+
+client:
+  batch_size: 1
+  max_tokens: 768
+  max_total_images: 28
+  max_seq_length: 16384
+  max_image_side: 640
+  max_image_pixels: 0
+  num_preview_frames: 28
+  use_generation_cache: true
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+
+io:
+  data_path: /abs/path/to/runtime_test.jsonl
+  output_dir: artifacts/fixed_baseline_28/qwen3_vl_8b
+  data_root: /abs/path/to/videos
+  include_splits: test
+  max_records: 0
+
+baseline:
+  protocol: fixed_observation_single_shot
+  strict_json: true
+  evidence_top_k: 3
+  use_storyboard: false
+  prompt_version: v1
+
+evaluation:
+  progress_every: 10
+  enable_semantic_metrics: true
+  semantic_metrics:
+    - qa_accuracy

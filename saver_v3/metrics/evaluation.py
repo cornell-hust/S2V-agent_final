@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import os
 import json
 import re
 import time
@@ -14,6 +15,11 @@ from saver_v3.core.adapter import TimeSearchRolloutAdapter
 from saver_v3.data.config import DEFAULT_POLICY_MAX_NEW_TOKENS, SaverAgentConfig
 from saver_v3.core.counterfactual_verification import infer_counterfactual_window_ids
 from saver_v3.data.dataset import SaverAgentDataset
+from saver_v3.data.materialized_cache import (
+    MATERIALIZED_RUNTIME_ITEMS_FORMAT,
+    MaterializedRuntimeItemDataset,
+    ensure_materialized_cache_metadata,
+)
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp
 from saver_v3.metrics.legacy_metrics import summarize_saver_metrics
 from saver_v3.metrics.offline_scoring import (
@@ -59,6 +65,8 @@ _PER_VIDEO_FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 class RolloutEvaluationConfig:
     data_path: str | Path
     data_root: str | Path = ""
+    materialized_items_path: str | Path = ""
+    require_materialized_cache: bool = False
     include_splits: Optional[Sequence[str] | str] = None
     max_records: int = 0
     inline_rollout_eval: bool = False
@@ -302,7 +310,7 @@ def _run_with_generation_cache_oom_fallback(
 
 def _clear_stale_json_shards(shard_dir: Path) -> int:
     removed = 0
-    for pattern in ("*.json", "*.jsonl"):
+    for pattern in ("*.json", "*.jsonl", ".tmp.*.jsonl"):
         for shard_path in shard_dir.glob(pattern):
             if not shard_path.is_file():
                 continue
@@ -1032,15 +1040,34 @@ def run_rollout_evaluation(
         except Exception:
             pass
     strict_feature_guided_proposal = bool(str(eval_config.proposal_model_path or "").strip())
-    dataset = SaverAgentDataset(
-        eval_config.data_path,
-        data_root=eval_config.data_root,
-        config=saver_config,
-        include_splits=eval_config.include_splits,
-        require_frame_cache=True,
-        require_feature_cache=True,
-        strict_feature_guided_proposal=strict_feature_guided_proposal,
-    )
+    if str(eval_config.materialized_items_path or "").strip():
+        ensure_materialized_cache_metadata(
+            eval_config.materialized_items_path,
+            expected_format=MATERIALIZED_RUNTIME_ITEMS_FORMAT,
+            expected_source_path=eval_config.data_path,
+            expected_include_splits=eval_config.include_splits,
+            require_source=True,
+        )
+        dataset = MaterializedRuntimeItemDataset(
+            eval_config.materialized_items_path,
+            include_splits=eval_config.include_splits,
+            require_frame_cache=True,
+            require_feature_cache=True,
+        )
+    else:
+        if bool(eval_config.require_materialized_cache):
+            raise ValueError(
+                "Rollout evaluation requires io.materialized_items_path when require_materialized_cache is enabled."
+            )
+        dataset = SaverAgentDataset(
+            eval_config.data_path,
+            data_root=eval_config.data_root,
+            config=saver_config,
+            include_splits=eval_config.include_splits,
+            require_frame_cache=True,
+            require_feature_cache=True,
+            strict_feature_guided_proposal=strict_feature_guided_proposal,
+        )
     if _records_require_feature_guided_proposal(getattr(dataset, "records", None)) and not strict_feature_guided_proposal:
         raise ValueError(
             "Rollout evaluation requires proposal_model_path because the eval data exposes seek_evidence."
@@ -1271,7 +1298,11 @@ def run_rollout_evaluation(
                         runtime=runtime,
                     )
         local_raw_path = raw_shard_dir / f"part.rank{runtime.rank:02d}-of-{runtime.world_size:02d}.jsonl"
-        save_rollout_records(local_rollouts, local_raw_path, metadata={"input_kind": "jsonl"})
+        _tmp_raw_path = raw_shard_dir / f".tmp.part.rank{runtime.rank:02d}-of-{runtime.world_size:02d}.jsonl"
+        save_rollout_records(local_rollouts, _tmp_raw_path, metadata={"input_kind": "jsonl"})
+        with open(_tmp_raw_path, "rb") as _fh:
+            os.fsync(_fh.fileno())
+        _tmp_raw_path.rename(local_raw_path)
 
         reference_data = ReferenceDataProvider(data_path=eval_config.data_path, data_root=eval_config.data_root)
         score_progress_label = f"epoch {int(epoch_index)} eval score progress"
@@ -1338,7 +1369,11 @@ def run_rollout_evaluation(
                 runtime=runtime,
             )
         local_scored_path = scored_shard_dir / f"part.rank{runtime.rank:02d}-of-{runtime.world_size:02d}.jsonl"
-        save_rollout_records(local_scored_records, local_scored_path, metadata={"input_kind": "jsonl"})
+        _tmp_scored_path = scored_shard_dir / f".tmp.part.rank{runtime.rank:02d}-of-{runtime.world_size:02d}.jsonl"
+        save_rollout_records(local_scored_records, _tmp_scored_path, metadata={"input_kind": "jsonl"})
+        with open(_tmp_scored_path, "rb") as _fh:
+            os.fsync(_fh.fileno())
+        _tmp_scored_path.rename(local_scored_path)
         for scored_record in local_scored_records:
             raw_dataset_index = scored_record.get("dataset_index", -1)
             try:

@@ -320,6 +320,71 @@ class RLRuntimeTests(unittest.TestCase):
                     ]
                 )
 
+    def test_rl_job_config_parses_materialized_runtime_cache_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / "rl.yaml"
+            model_config_path = tmp_path / "model.yaml"
+            attention_config_path = tmp_path / "attn.yaml"
+            rollout_config_path = tmp_path / "rollout.yaml"
+
+            _write_yaml(rollout_config_path, {"server": {"launcher": "external_launcher"}})
+            _write_yaml(model_config_path, {
+                "base_model": "/models/qwen3-vl-8b-Instruct",
+                "attn_implementation": "flash_attention_3",
+            })
+            _write_yaml(attention_config_path, {"policy_name": "fa3_only"})
+            _write_yaml(config_path, {
+                "policy_init_from": "/checkpoints/sft/final_hf_model",
+                "rollout_backend": "vllm",
+                "rollout_config": str(rollout_config_path),
+                "data": {
+                    "train_manifest": "/data/rl_train.jsonl",
+                    "eval_manifest": "/data/rl_eval.jsonl",
+                    "materialized_train_items_path": "/data/rl_train.materialized.jsonl",
+                    "materialized_eval_items_path": "/data/rl_eval.materialized.jsonl",
+                    "require_materialized_runtime_cache": True,
+                },
+            })
+
+            job = RLJobConfig.from_files(
+                config_path=str(config_path),
+                model_config_path=str(model_config_path),
+                attention_config_path=str(attention_config_path),
+            )
+            self.assertEqual(job.materialized_train_items_path, "/data/rl_train.materialized.jsonl")
+            self.assertEqual(job.materialized_eval_items_path, "/data/rl_eval.materialized.jsonl")
+            self.assertTrue(job.require_materialized_runtime_cache)
+
+    def test_build_legacy_rl_trl_argv_includes_materialized_runtime_cache_flags(self) -> None:
+        job = RLJobConfig(
+            run_name="rl-materialized",
+            output_dir="/tmp/out",
+            train_manifest="/tmp/train.jsonl",
+            eval_manifest="/tmp/eval.jsonl",
+            materialized_train_items_path="/tmp/train.materialized.jsonl",
+            materialized_eval_items_path="/tmp/eval.materialized.jsonl",
+            require_materialized_runtime_cache=True,
+            data_root="/tmp/videos",
+            eval_data_root="/tmp/eval_videos",
+            include_splits="train",
+            eval_include_splits="val",
+            policy_init_from="/tmp/policy",
+            reference_model="/tmp/reference",
+            base_model="/tmp/base",
+            torch_dtype="bfloat16",
+            attn_implementation="flash_attention_3",
+            gradient_checkpointing=True,
+            rollout_backend="vllm",
+            rollout_config="/tmp/rollout.yaml",
+            deepspeed_config_path="/tmp/zero3.json",
+        )
+        argv = build_legacy_rl_trl_argv(job)
+        argv_pairs = dict(zip(argv[::2], argv[1::2]))
+        self.assertEqual(argv_pairs["--materialized-train-items-path"], "/tmp/train.materialized.jsonl")
+        self.assertEqual(argv_pairs["--materialized-eval-items-path"], "/tmp/eval.materialized.jsonl")
+        self.assertEqual(argv_pairs["--require-materialized-runtime-cache"], "true")
+
 
 if __name__ == "__main__":
     unittest.main()
