@@ -19,7 +19,7 @@ conda-meta/
 .vscode/
 
 # Training and inference artifacts
-artifacts/*
+artifacts/
 checkpoints/
 logs/
 runs/
