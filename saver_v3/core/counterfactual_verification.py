@@ -268,6 +268,7 @@ def _structured_oracle_profile_entry(
     *,
     rollout: Dict[str, Any],
     reference_record: Dict[str, Any],
+    include_counterfactual_type: bool = True,
 ) -> Dict[str, Any]:
     target = dict(reference_record.get("structured_target") or {})
     evidence_moments = ((reference_record.get("evidence") or {}).get("evidence_moments") or [])
@@ -364,7 +365,6 @@ def _structured_oracle_profile_entry(
         "decision_sufficiency": bool(selected_support >= 0.5),
         "minimal_subset_sufficiency": False,
         "negative_specificity_pass": False,
-        "counterfactual_type_supported": True,
         "stage_necessity": {
             "trigger": (
                 "decision_critical"
@@ -376,6 +376,8 @@ def _structured_oracle_profile_entry(
         "oracle_required_stage_coverage_score": float(required_stage_coverage),
         "oracle_drop_trigger_necessity_score": float(drop_trigger_necessity),
     }
+    if include_counterfactual_type:
+        summary["counterfactual_type_supported"] = True
     return {
         "counterfactual_branches": {},
         "counterfactual_profile": {
@@ -402,11 +404,14 @@ def _structured_oracle_profile_entry(
 
 def _run_structured_oracle_verification_batch(
     batch_inputs: Sequence[Dict[str, Any]],
+    *,
+    include_counterfactual_type: bool = True,
 ) -> List[Dict[str, Any]]:
     return [
         _structured_oracle_profile_entry(
             rollout=dict((batch_input.get("rollout") or {})),
             reference_record=dict((batch_input.get("reference_record") or batch_input.get("item") or {})),
+            include_counterfactual_type=include_counterfactual_type,
         )
         for batch_input in list(batch_inputs or [])
     ]
@@ -1294,13 +1299,17 @@ def run_counterfactual_verification_batch(
     batch_inputs: Sequence[Dict[str, Any]],
     max_images: int = 12,
     branch_profile: str = "full",
+    include_counterfactual_type: bool = True,
 ) -> List[Dict[str, Any]]:
     batch_input_list = list(batch_inputs or [])
     if not batch_input_list:
         return []
     normalized_branch_profile = _normalize_counterfactual_branch_profile(branch_profile)
     if normalized_branch_profile == "structured_oracle_v1":
-        return _run_structured_oracle_verification_batch(batch_input_list)
+        return _run_structured_oracle_verification_batch(
+            batch_input_list,
+            include_counterfactual_type=include_counterfactual_type,
+        )
     if policy is None:
         raise ValueError(
             "run_counterfactual_verification_batch requires a non-null policy unless branch_profile='structured_oracle_v1'."

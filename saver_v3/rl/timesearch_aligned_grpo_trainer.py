@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -37,6 +38,8 @@ from saver_v3.core.reward import (
     build_timesearch_reward_funcs,
     resolve_reward_component_weights,
 )
+from saver_v3.core.prompts import build_system_prompt
+from saver_v3.core.tool_registry import DEFAULT_TOOL_NAMES, get_tool_schemas
 from saver_v3.core.rollout import SaverRolloutRunner
 from saver_v3.common.runtime import distributed_runtime_from_env, runtime_log
 from saver_v3.sft.training import (
@@ -79,6 +82,7 @@ def _iter_chunked(values: Sequence[Any], chunk_size: int) -> List[List[Any]]:
 
 
 _USE_CURRENT_POLICY_LOGPROBS_SENTINEL = "__use_current_policy_logprobs__"
+_RL_UNUSED_DECISION_FIELDS = ("severity", "counterfactual_type")
 
 
 def _distributed_sum_float(local_value: float, *, device: torch.device) -> float:
@@ -90,12 +94,219 @@ def _distributed_sum_float(local_value: float, *, device: torch.device) -> float
     return float(total_tensor.item())
 
 
+class _ActiveRLOptimizerStepProxy:
+    def __init__(self, optimizer: Any, *, trainer: Any):
+        self._optimizer = optimizer
+        self._trainer = trainer
+
+    def step(self, *args, **kwargs):
+        if bool(getattr(self._trainer, "_active_rl_skip_next_optimizer_step", False)):
+            try:
+                setattr(self._trainer.accelerator, "optimizer_step_was_skipped", True)
+            except Exception:
+                pass
+            self._trainer._active_rl_skip_next_optimizer_step = False
+            self._trainer._optimizer_step_skips += 1
+            return None
+        try:
+            setattr(self._trainer.accelerator, "optimizer_step_was_skipped", False)
+        except Exception:
+            pass
+        return self._optimizer.step(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._optimizer, name)
+
+
+def _clean_allowed_tool_names_for_rl(tool_io: Dict[str, Any]) -> List[str]:
+    cleaned: List[str] = []
+    for tool_name in list((tool_io or {}).get("allowed_tools") or list(DEFAULT_TOOL_NAMES)):
+        text = str(tool_name or "").strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned or list(DEFAULT_TOOL_NAMES)
+
+
+def _shrink_rl_finalize_case_schema(schema: Dict[str, Any] | None) -> Dict[str, Any]:
+    normalized_schema = copy.deepcopy(schema or {})
+    properties = dict(normalized_schema.get("properties") or {})
+    for field_name in _RL_UNUSED_DECISION_FIELDS:
+        properties.pop(field_name, None)
+    normalized_schema["properties"] = properties
+    if "required" in normalized_schema:
+        normalized_schema["required"] = [
+            str(field_name)
+            for field_name in list(normalized_schema.get("required") or [])
+            if str(field_name) not in _RL_UNUSED_DECISION_FIELDS
+        ]
+    return normalized_schema
+
+
+def _rewrite_rl_system_message(messages: Sequence[Dict[str, Any]], *, function_schemas: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated_messages = copy.deepcopy(list(messages or []))
+    if not updated_messages:
+        return updated_messages
+    system_prompt = build_system_prompt(function_schemas)
+    for message in updated_messages:
+        if str(message.get("role") or "") != "system":
+            continue
+        message["content"] = [{"type": "text", "text": system_prompt}]
+        break
+    return updated_messages
+
+
+def _strip_rl_unused_decision_fields_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    prepared = copy.deepcopy(dict(item or {}))
+    base_tool_io = dict(
+        prepared.get("tool_io")
+        or ((prepared.get("multimodal_cache") or {}).get("tool_io") or {})
+    )
+    if not base_tool_io:
+        return prepared
+    allowed_tools = _clean_allowed_tool_names_for_rl(base_tool_io)
+    finalize_case_schema = _shrink_rl_finalize_case_schema(base_tool_io.get("finalize_case_schema") or {})
+    tool_schemas = [
+        schema
+        for schema in get_tool_schemas(finalize_case_schema=finalize_case_schema)
+        if str(((schema.get("function") or {}).get("name") or "")).strip() in allowed_tools
+    ]
+    function_schemas = [copy.deepcopy(tool.get("function") or {}) for tool in tool_schemas]
+    shrunk_tool_io = copy.deepcopy(base_tool_io)
+    shrunk_tool_io["allowed_tools"] = list(allowed_tools)
+    shrunk_tool_io["tool_schemas"] = copy.deepcopy(tool_schemas)
+    shrunk_tool_io["function_schemas"] = copy.deepcopy(function_schemas)
+    shrunk_tool_io["finalize_case_schema"] = copy.deepcopy(finalize_case_schema)
+    prepared["tool_io"] = copy.deepcopy(shrunk_tool_io)
+    multimodal_cache = prepared.get("multimodal_cache")
+    if isinstance(multimodal_cache, dict):
+        multimodal_cache = copy.deepcopy(multimodal_cache)
+        multimodal_cache["tool_io"] = copy.deepcopy(shrunk_tool_io)
+        prepared["multimodal_cache"] = multimodal_cache
+    if isinstance(prepared.get("messages"), list):
+        prepared["messages"] = _rewrite_rl_system_message(
+            prepared["messages"],
+            function_schemas=function_schemas,
+        )
+    return prepared
+
+
 def _training_phase_runtime_log(message: str) -> None:
     runtime_log(
         message,
         runtime=distributed_runtime_from_env(),
         main_process_only=True,
     )
+
+
+def _distributed_rank() -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    return int(torch.distributed.get_rank())
+
+
+def _distributed_gather_object(local_object: Any) -> List[Any]:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return [copy.deepcopy(local_object)]
+    gathered_objects: List[Any] = [None for _ in range(max(1, int(_distributed_world_size())))]
+    torch.distributed.all_gather_object(gathered_objects, local_object)
+    return gathered_objects
+
+
+def _episode_input_sample_count_for_debug(episode_input: Dict[str, Any]) -> int:
+    for key in ("completion_ids", "prompt_ids", "completion_mask", "advantages"):
+        value = episode_input.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 1:
+            return max(1, int(value.shape[0]))
+    return 1
+
+
+def _summarize_episode_input_for_rank_debug(episode_input: Dict[str, Any]) -> Dict[str, Any]:
+    prompt_ids = episode_input.get("prompt_ids")
+    completion_ids = episode_input.get("completion_ids")
+    multimodal_inputs = episode_input.get("multimodal_inputs")
+    if isinstance(multimodal_inputs, list):
+        multimodal_keys = sorted({str(key) for sample in multimodal_inputs if isinstance(sample, dict) for key in sample.keys()})
+    elif isinstance(multimodal_inputs, dict):
+        multimodal_keys = sorted(str(key) for key in multimodal_inputs.keys())
+    else:
+        multimodal_keys = []
+    return {
+        "samples": int(_episode_input_sample_count_for_debug(episode_input)),
+        "prompt_tokens": int(prompt_ids.shape[-1]) if isinstance(prompt_ids, torch.Tensor) and prompt_ids.ndim >= 1 else -1,
+        "completion_tokens": int(completion_ids.shape[-1]) if isinstance(completion_ids, torch.Tensor) and completion_ids.ndim >= 1 else -1,
+        "multimodal_keys": multimodal_keys,
+    }
+
+
+def _summarize_microbatch_layout_for_rank_debug(episode_inputs: Sequence[Dict[str, Any]], trainer: Any) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for batch_index, batch in enumerate(list(episode_inputs or []), start=1):
+        microbatches = list(trainer._iter_loss_microbatches(batch))
+        rows.append(
+            {
+                "batch_index": int(batch_index),
+                "batch_summary": _summarize_episode_input_for_rank_debug(batch),
+                "microbatch_count": int(len(microbatches)),
+                "microbatch_sample_counts": [int(trainer._episode_input_sample_count(microbatch)) for microbatch in microbatches],
+            }
+        )
+    return rows
+
+
+def _rollout_group_sample_count(rollout_group: Dict[str, Any]) -> int:
+    sample_count = 0
+    for episode_input in list(rollout_group.get("episode_inputs") or []):
+        if isinstance(episode_input, dict):
+            sample_count += int(_episode_input_sample_count_for_debug(episode_input))
+    return int(sample_count)
+
+
+def _flatten_rollout_groups_to_episode_inputs(rollout_groups: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    episode_inputs: List[Dict[str, Any]] = []
+    for rollout_group in list(rollout_groups or []):
+        for episode_input in list((rollout_group or {}).get("episode_inputs") or []):
+            episode_inputs.append(copy.deepcopy(dict(episode_input or {})))
+    return episode_inputs
+
+
+def _summarize_rollout_group_for_rank_debug(rollout_group: Dict[str, Any]) -> Dict[str, Any]:
+    episode_inputs = list((rollout_group or {}).get("episode_inputs") or [])
+    first_episode_input = dict(episode_inputs[0] or {}) if episode_inputs else {}
+    return {
+        "video_id": str(rollout_group.get("video_id") or ""),
+        "generation_id": int(rollout_group.get("generation_id") if rollout_group.get("generation_id") is not None else -1),
+        "source_rank": int(rollout_group.get("source_rank") if rollout_group.get("source_rank") is not None else -1),
+        "source_item_index": int(
+            rollout_group.get("source_item_index") if rollout_group.get("source_item_index") is not None else -1
+        ),
+        "source_rollout_index": int(
+            rollout_group.get("source_rollout_index") if rollout_group.get("source_rollout_index") is not None else -1
+        ),
+        "episode_input_count": int(len(episode_inputs)),
+        "sample_count": int(_rollout_group_sample_count(rollout_group)),
+        "first_batch_summary": _summarize_episode_input_for_rank_debug(first_episode_input) if first_episode_input else None,
+    }
+
+
+def _stable_balance_rollout_groups_across_ranks(
+    gathered_rollout_groups: Sequence[Sequence[Dict[str, Any]]],
+) -> List[List[Dict[str, Any]]]:
+    rank_count = max(1, len(list(gathered_rollout_groups or [])))
+    assigned_groups: List[List[Dict[str, Any]]] = [[] for _ in range(rank_count)]
+    assigned_sample_counts: List[int] = [0 for _ in range(rank_count)]
+    ordered_groups: List[Dict[str, Any]] = []
+    for source_rank, groups in enumerate(list(gathered_rollout_groups or [])):
+        for source_local_group_index, rollout_group in enumerate(list(groups or [])):
+            normalized_group = copy.deepcopy(dict(rollout_group or {}))
+            normalized_group["source_rank"] = int(source_rank)
+            normalized_group["source_local_group_index"] = int(source_local_group_index)
+            normalized_group["sample_count"] = int(_rollout_group_sample_count(normalized_group))
+            ordered_groups.append(normalized_group)
+    for rollout_group in ordered_groups:
+        target_rank = min(range(rank_count), key=lambda rank: (assigned_sample_counts[rank], rank))
+        assigned_groups[target_rank].append(rollout_group)
+        assigned_sample_counts[target_rank] += int(rollout_group.get("sample_count") or 0)
+    return assigned_groups
 
 
 def _patch_flash_attention_packed_sequence_check_for_active_rl() -> bool:
@@ -610,6 +821,9 @@ class TimesearchAlignedGRPOTrainerMixin:
         self._buffered_generation_batch_key: Optional[Tuple[Any, ...]] = None
         self._recent_nonzero_advantage_payloads: List[Dict[str, Any]] = []
         self._recent_nonzero_advantage_payload_capacity = 8
+        self._zero_advantage_replay_rng: Optional[random.Random] = None
+        self._zero_advantage_replay_last_source_video_ids = ""
+        self._zero_advantage_replay_last_reason = ""
         self.fecv_failure_policy = str(config["fecv_failure_policy"] or "degrade").strip().lower()
         self.log_empty_batch_rank_summary = bool(config["log_empty_batch_rank_summary"])
         self.reward_version = str(config["reward_version"] or DEFAULT_RL_REWARD_VERSION).strip().lower()
@@ -620,6 +834,9 @@ class TimesearchAlignedGRPOTrainerMixin:
             build_timesearch_reward_funcs(
                 reward_config=self.reward_config,
                 llm_judge=self.reward_judge,
+                reward_version=self.reward_version,
+                include_aux_decision_fields=False,
+                include_counterfactual_type_in_fecv=False,
             )
         )
         self.reward_func_names = [str(getattr(func, "__name__", f"reward_{index}")) for index, func in enumerate(self.reward_funcs)]
@@ -641,8 +858,13 @@ class TimesearchAlignedGRPOTrainerMixin:
         self._fecv_degraded_rollout_count = 0
         self._ddp_noop_padded_episode_inputs = 0
         self._skip_empty_training_steps = 0
+        self._all_empty_batch_skips = 0
+        self._optimizer_step_skips = 0
         self._zero_advantage_replay_uses = 0
         self._zero_advantage_replay_misses = 0
+        self._active_rl_skip_next_optimizer_step = False
+        self._active_rl_window_had_trainable_signal = False
+        self._active_rl_last_skip_reason = ""
         self.liger_grpo_loss = None
         self._liger_runtime_probe_completed = False
         self._liger_runtime_disable_reason: Optional[str] = None
@@ -921,7 +1143,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         return rollout
 
     def _prepare_rollout_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        prepared = copy.deepcopy(dict(item or {}))
+        prepared = _strip_rl_unused_decision_fields_from_item(item)
         if not bool(getattr(self, "strict_feature_guided_proposal", False)):
             return prepared
         multimodal_cache = prepared.get("multimodal_cache")
@@ -1016,6 +1238,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                     batch_inputs=fecv_batch_inputs,
                     max_images=self.counterfactual_max_images,
                     branch_profile=fecv_branch_profile,
+                    include_counterfactual_type=False,
                 )
             except Exception as exc:
                 if self.fecv_failure_policy == "fail":
@@ -1093,7 +1316,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         video_id = str(item.get("video_id") or "")
         rollout_metrics = self._new_rollout_metric_lists()
         runtime_stats = self._new_runtime_stats()
-        episode_entries: List[Dict[str, Any]] = []
+        rollout_groups: List[Dict[str, Any]] = []
         num_episode_candidates_before_min_weight = 0
         num_episode_candidates_after_min_weight = 0
         num_invalid_action_turns = 0
@@ -1106,7 +1329,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         missing_feature_traced_valid_turn_count = 0
         missing_feature_invalid_attempt_count = 0
         first_missing_feature_example = ""
-        for rollout in list(scored_rollouts or []):
+        for rollout_index, rollout in enumerate(list(scored_rollouts or [])):
             if bool(rollout.get("fecv_failed")):
                 runtime_stats["local_fecv_failure_count"] += 1
             reward_summary = dict(rollout.get("reward_summary") or {})
@@ -1155,6 +1378,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                     )
             if rollout_advantage < float(self.min_weight):
                 continue
+            rollout_episode_inputs: List[Dict[str, Any]] = []
             for pack in raw_packs:
                 num_episode_candidates_after_min_weight += 1
                 result = self._build_episode_input_from_feature(pack)
@@ -1169,20 +1393,28 @@ class TimesearchAlignedGRPOTrainerMixin:
                         num_truncated_completion_after_budgeting += 1
                     self._zero_response_dropped += 1
                     continue
-                episode_entries.append(
+                rollout_episode_inputs.append(dict(result.batch or {}))
+            if rollout_episode_inputs:
+                rollout_groups.append(
                     {
-                        "episode_input": result.batch,
+                        "video_id": video_id,
+                        "group_id": str(rollout.get("group_id") or video_id),
+                        "generation_id": int(rollout.get("generation_id") if rollout.get("generation_id") is not None else -1),
+                        "source_item_index": None,
+                        "source_rollout_index": int(rollout_index),
+                        "episode_inputs": rollout_episode_inputs,
+                        "sample_count": int(
+                            sum(self._episode_input_sample_count(episode_input) for episode_input in rollout_episode_inputs)
+                        ),
                     }
                 )
-        episode_inputs: List[Dict[str, Any]] = []
-        for entry in episode_entries:
-            episode_input = dict(entry["episode_input"] or {})
-            episode_inputs.append(episode_input)
+        episode_inputs = _flatten_rollout_groups_to_episode_inputs(rollout_groups)
         runtime_stats["raw_local_episode_input_count"] = int(len(episode_inputs))
         runtime_log(
             "rl episode payload built: "
             f"video_id={video_id} "
             f"scored_rollouts={len(scored_rollouts)} "
+            f"num_rollout_groups={len(rollout_groups)} "
             f"num_rollouts_dropped_by_min_weight={num_rollouts_dropped_by_min_weight} "
             f"num_episode_candidates_before_min_weight={num_episode_candidates_before_min_weight} "
             f"num_episode_candidates_after_min_weight={num_episode_candidates_after_min_weight} "
@@ -1207,6 +1439,7 @@ class TimesearchAlignedGRPOTrainerMixin:
             )
         return {
             "video_id": video_id,
+            "rollout_groups": rollout_groups,
             "episode_inputs": episode_inputs,
             "rollout_metric_values": rollout_metrics,
             "runtime_stats": runtime_stats,
@@ -1407,6 +1640,7 @@ class TimesearchAlignedGRPOTrainerMixin:
             "completion_ids": (self._pad_token_id(), "right"),
             "completion_mask": (0, "right"),
             "old_policy_token_log_probs": (0.0, "right"),
+            "reference_token_log_probs": (0.0, "right"),
         }
 
     def _pad_token_id(self) -> int:
@@ -1648,6 +1882,44 @@ class TimesearchAlignedGRPOTrainerMixin:
             )
         return old_policy_token_log_probs.detach().cpu()
 
+    def _zero_reference_token_log_probs_for_episode_input(
+        self,
+        episode_input: Dict[str, Any],
+    ) -> torch.Tensor:
+        completion_ids = episode_input.get("completion_ids")
+        if not isinstance(completion_ids, torch.Tensor):
+            raise RuntimeError("reference_token_log_probs requires tensor completion_ids.")
+        return torch.zeros_like(completion_ids, dtype=torch.float32, device=torch.device("cpu"))
+
+    def _compute_reference_token_log_probs_for_batch(
+        self,
+        model: Any,
+        *,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        completion_ids = batch.get("completion_ids")
+        completion_mask = batch.get("completion_mask")
+        if not isinstance(completion_ids, torch.Tensor) or not isinstance(completion_mask, torch.Tensor):
+            raise RuntimeError("reference_token_log_probs requires tensor completion_ids/completion_mask.")
+        if not bool(torch.any(completion_mask.to(dtype=torch.bool))):
+            return torch.zeros_like(completion_ids, dtype=torch.float32, device=torch.device("cpu"))
+        try:
+            target_device = next(model.parameters()).device
+        except Exception:
+            target_device = self._find_first_tensor_device(batch) or torch.device("cpu")
+        device_batch = self._move_episode_input_to_device(batch, device=target_device)
+        with torch.inference_mode():
+            reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_ids(
+                model=model,
+                prompt_ids=device_batch["prompt_ids"],
+                prompt_mask=device_batch["prompt_mask"],
+                completion_ids=device_batch["completion_ids"],
+                completion_mask=device_batch["completion_mask"],
+                multimodal_inputs=self._episode_input_multimodal_inputs(device_batch),
+                temperature=self.policy_temperature,
+            )
+        return reference_token_log_probs.detach().cpu()
+
     def _populate_old_policy_log_probs(
         self,
         model: Any,
@@ -1799,6 +2071,7 @@ class TimesearchAlignedGRPOTrainerMixin:
             "completion_token_count",
             "advantages",
             "old_policy_token_log_probs",
+            "reference_token_log_probs",
             "sample_loss_multiplier",
             "sample_weight",
             "multimodal_inputs",
@@ -1877,22 +2150,63 @@ class TimesearchAlignedGRPOTrainerMixin:
         self,
         item_payloads: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        episode_inputs: List[Dict[str, Any]] = []
+        local_rollout_groups: List[Dict[str, Any]] = []
         rollout_metric_values = self._new_rollout_metric_lists()
         runtime_stats = self._new_runtime_stats()
         video_ids: List[str] = []
-        for payload in item_payloads:
+        local_rank = int(_distributed_rank())
+        for item_index, payload in enumerate(item_payloads):
             video_ids.append(str(payload.get("video_id") or ""))
-            episode_inputs.extend(list(payload.get("episode_inputs") or []))
+            payload_rollout_groups = list(payload.get("rollout_groups") or [])
+            if not payload_rollout_groups and payload.get("episode_inputs"):
+                payload_rollout_groups = [
+                    {
+                        "video_id": str(payload.get("video_id") or ""),
+                        "group_id": str(payload.get("video_id") or ""),
+                        "generation_id": -1,
+                        "source_item_index": int(item_index),
+                        "source_rollout_index": 0,
+                        "episode_inputs": [dict(episode_input or {}) for episode_input in list(payload.get("episode_inputs") or [])],
+                    }
+                ]
+            for rollout_group in payload_rollout_groups:
+                normalized_group = copy.deepcopy(dict(rollout_group or {}))
+                normalized_group["video_id"] = str(normalized_group.get("video_id") or payload.get("video_id") or "")
+                normalized_group["source_rank"] = int(local_rank)
+                normalized_group["source_item_index"] = int(
+                    normalized_group.get("source_item_index") if normalized_group.get("source_item_index") is not None else item_index
+                )
+                normalized_group["sample_count"] = int(_rollout_group_sample_count(normalized_group))
+                local_rollout_groups.append(normalized_group)
             for key, values in dict(payload.get("rollout_metric_values") or {}).items():
                 rollout_metric_values.setdefault(key, [])
                 rollout_metric_values[key].extend([_safe_float(value) for value in (values or [])])
             for key, value in dict(payload.get("runtime_stats") or {}).items():
                 runtime_stats[key] = int(runtime_stats.get(key, 0)) + int(value or 0)
+        runtime_log(
+            f"rl rank rollout_group summary: rows={[_summarize_rollout_group_for_rank_debug(group) for group in local_rollout_groups]}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        gathered_rollout_groups = _distributed_gather_object(local_rollout_groups)
+        balanced_rollout_groups = _stable_balance_rollout_groups_across_ranks(gathered_rollout_groups)
+        local_assigned_rollout_groups = balanced_rollout_groups[local_rank] if local_rank < len(balanced_rollout_groups) else []
+        runtime_log(
+            "rl global rollout_group slice summary: "
+            f"total_groups={sum(len(groups) for groups in balanced_rollout_groups)} "
+            f"assigned_groups={len(local_assigned_rollout_groups)} "
+            f"assigned_samples={sum(int(group.get('sample_count') or 0) for group in local_assigned_rollout_groups)} "
+            f"rows={[_summarize_rollout_group_for_rank_debug(group) for group in local_assigned_rollout_groups]}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        episode_inputs = _flatten_rollout_groups_to_episode_inputs(local_assigned_rollout_groups)
         aggregated_metrics = {
             key: (sum(values) / float(len(values)) if values else 0.0)
             for key, values in rollout_metric_values.items()
         }
+        runtime_stats["raw_local_rollout_group_count_before_slice"] = int(len(local_rollout_groups))
+        runtime_stats["raw_local_rollout_group_count_after_slice"] = int(len(local_assigned_rollout_groups))
         runtime_stats["raw_local_episode_input_count"] = int(len(episode_inputs))
         runtime_stats["raw_local_episode_input_count_after_aggregate"] = int(len(episode_inputs))
         return {
@@ -1922,6 +2236,12 @@ class TimesearchAlignedGRPOTrainerMixin:
         episode_inputs = list(payload.get("episode_inputs") or [])
         return any(self._episode_input_has_nonzero_advantage(episode_input) for episode_input in episode_inputs)
 
+    def _payload_has_trainable_samples(
+        self,
+        payload: Dict[str, Any],
+    ) -> bool:
+        return int(self._count_local_trainable_samples(list(payload.get("episode_inputs") or []))) > 0
+
     def _clone_generation_step_payload_for_replay(
         self,
         payload: Dict[str, Any],
@@ -1941,19 +2261,95 @@ class TimesearchAlignedGRPOTrainerMixin:
     def _maybe_store_nonzero_advantage_payload(
         self,
         payload: Dict[str, Any],
+        *,
+        model: Any | None = None,
     ) -> None:
-        del payload
+        if not self._payload_has_nonzero_advantage(payload):
+            return None
+        if not self._payload_has_trainable_samples(payload):
+            return None
+        cached_payload = self._clone_generation_step_payload_for_replay(payload)
+        cached_episode_inputs = list(cached_payload.get("episode_inputs") or [])
+        if model is not None and any(
+            episode_input.get("old_policy_token_log_probs") == _USE_CURRENT_POLICY_LOGPROBS_SENTINEL
+            for episode_input in cached_episode_inputs
+        ):
+            cached_payload["episode_inputs"] = self._populate_old_policy_log_probs(model, cached_episode_inputs)
+        self._recent_nonzero_advantage_payloads.append(cached_payload)
+        if len(self._recent_nonzero_advantage_payloads) > int(self._recent_nonzero_advantage_payload_capacity):
+            self._recent_nonzero_advantage_payloads = self._recent_nonzero_advantage_payloads[
+                -int(self._recent_nonzero_advantage_payload_capacity) :
+            ]
         return None
+
+    def _mark_skip_next_optimizer_step(self, *, reason: str, all_empty: bool = False) -> None:
+        self._active_rl_skip_next_optimizer_step = True
+        self._active_rl_last_skip_reason = str(reason or "")
+        if all_empty:
+            self._all_empty_batch_skips += 1
+
+    def _zero_advantage_replay_reason(
+        self,
+        payload: Dict[str, Any],
+    ) -> str:
+        if not list(payload.get("episode_inputs") or []):
+            return "all_empty_episode_inputs"
+        if not self._payload_has_trainable_samples(payload):
+            return "all_empty_trainable_samples"
+        return "all_zero_advantages"
+
+    def _zero_advantage_replay_rng_instance(self) -> random.Random:
+        rng = getattr(self, "_zero_advantage_replay_rng", None)
+        if rng is None:
+            args = getattr(self, "args", None)
+            seed = int(getattr(args, "seed", 0) or 0) + int(_distributed_rank())
+            rng = random.Random(seed)
+            self._zero_advantage_replay_rng = rng
+        return rng
 
     def _maybe_replay_zero_advantage_payload(
         self,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        if not hasattr(self, "_zero_advantage_replay_uses"):
-            self._zero_advantage_replay_uses = 0
-        if not hasattr(self, "_zero_advantage_replay_misses"):
-            self._zero_advantage_replay_misses = 0
+        if self._payload_has_nonzero_advantage(payload) and self._payload_has_trainable_samples(payload):
+            return payload
+        reason = self._zero_advantage_replay_reason(payload)
+        if self._recent_nonzero_advantage_payloads:
+            replay_payload = self._clone_generation_step_payload_for_replay(
+                self._zero_advantage_replay_rng_instance().choice(self._recent_nonzero_advantage_payloads)
+            )
+            replay_source_video_ids = [str(video_id or "") for video_id in list(replay_payload.get("video_ids") or [])]
+            runtime_stats = dict(payload.get("runtime_stats") or {})
+            runtime_stats["zero_advantage_replay_applied"] = 1
+            replayed_payload = dict(payload)
+            replayed_payload["episode_inputs"] = replay_payload.get("episode_inputs") or []
+            replayed_payload["runtime_stats"] = runtime_stats
+            replayed_payload["zero_advantage_replay_source_video_ids"] = list(replay_source_video_ids)
+            self._zero_advantage_replay_uses += 1
+            self._zero_advantage_replay_last_source_video_ids = ",".join(replay_source_video_ids)
+            self._zero_advantage_replay_last_reason = str(reason)
+            runtime_log(
+                "rl zero-advantage replay hit: "
+                f"reason={reason} "
+                f"current_video_ids={list(payload.get('video_ids') or [])} "
+                f"replay_source_video_ids={replay_source_video_ids}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=False,
+            )
+            return replayed_payload
+        runtime_stats = dict(payload.get("runtime_stats") or {})
+        runtime_stats["zero_advantage_replay_missed"] = 1
+        payload["runtime_stats"] = runtime_stats
         self._zero_advantage_replay_misses += 1
+        self._zero_advantage_replay_last_source_video_ids = ""
+        self._zero_advantage_replay_last_reason = str(reason)
+        runtime_log(
+            "rl zero-advantage replay miss: "
+            f"reason={reason} "
+            f"current_video_ids={list(payload.get('video_ids') or [])}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
         return payload
 
     def _build_generation_step_payloads(
@@ -1968,8 +2364,9 @@ class TimesearchAlignedGRPOTrainerMixin:
                 rollout_model,
                 progress=None,
             )
-            for item, item_rollouts in zip(generation_items, grouped_rollouts):
+            for item_index, (item, item_rollouts) in enumerate(zip(generation_items, grouped_rollouts)):
                 payload = self._build_generation_item_payload_from_rollouts(item, item_rollouts)
+                payload["source_item_index"] = int(item_index)
                 item_payloads.append(payload)
                 runtime_stats = dict(payload.get("runtime_stats") or {})
                 self._groups_filtered_by_min_weight += int(runtime_stats.get("groups_filtered_by_min_weight", 0))
@@ -2008,6 +2405,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                         runtime=distributed_runtime_from_env(),
                         main_process_only=True,
                     )
+            self._maybe_store_nonzero_advantage_payload(payload, model=rollout_model)
             step_payloads.append(payload)
         return step_payloads
 
@@ -2074,6 +2472,55 @@ class TimesearchAlignedGRPOTrainerMixin:
                 merged_batches.extend(bucket)
         return merged_batches
 
+    def _plan_balanced_batch_sizes(
+        self,
+        sample_count: int,
+        *,
+        preferred_target: int,
+        max_chunk_size: int,
+    ) -> List[int]:
+        sample_count = max(0, int(sample_count))
+        preferred_target = max(1, int(preferred_target))
+        max_chunk_size = max(preferred_target, int(max_chunk_size))
+        if sample_count <= 0:
+            return []
+        if sample_count <= preferred_target:
+            return [sample_count]
+        chunk_count = max(1, int(math.ceil(float(sample_count) / float(max_chunk_size))))
+        base_size = sample_count // chunk_count
+        remainder = sample_count % chunk_count
+        return [
+            int(base_size + (1 if chunk_index < remainder else 0))
+            for chunk_index in range(chunk_count)
+        ]
+
+    def _iter_sample_ranges_from_sizes(
+        self,
+        batch_sizes: Sequence[int],
+    ) -> List[Tuple[int, int]]:
+        ranges: List[Tuple[int, int]] = []
+        start_index = 0
+        for batch_size in list(batch_sizes or []):
+            batch_size = max(0, int(batch_size))
+            if batch_size <= 0:
+                continue
+            end_index = start_index + batch_size
+            ranges.append((int(start_index), int(end_index)))
+            start_index = end_index
+        return ranges
+
+    def _episode_input_supports_sample_slicing(
+        self,
+        episode_input: Dict[str, Any],
+    ) -> bool:
+        sample_count = self._episode_input_sample_count(episode_input)
+        return all(
+            (not isinstance(value, torch.Tensor))
+            or value.ndim == 0
+            or int(value.shape[0]) == int(sample_count)
+            for value in episode_input.values()
+        )
+
     def _slice_episode_input_sample_range(
         self,
         episode_input: Dict[str, Any],
@@ -2123,21 +2570,87 @@ class TimesearchAlignedGRPOTrainerMixin:
         microbatch_size = max(1, int(self.compute_loss_microbatch_size))
         if sample_count <= microbatch_size:
             return [episode_input]
-        if not all(
-            (not isinstance(value, torch.Tensor))
-            or value.ndim == 0
-            or int(value.shape[0]) == int(sample_count)
-            for value in episode_input.values()
-        ):
+        if not self._episode_input_supports_sample_slicing(episode_input):
             return [episode_input]
+        batch_sizes = self._plan_balanced_batch_sizes(
+            sample_count,
+            preferred_target=microbatch_size,
+            max_chunk_size=microbatch_size + 1,
+        )
         return [
             self._slice_episode_input_sample_range(
                 episode_input,
                 start_index=start_index,
-                end_index=min(sample_count, start_index + microbatch_size),
+                end_index=end_index,
             )
-            for start_index in range(0, sample_count, microbatch_size)
+            for start_index, end_index in self._iter_sample_ranges_from_sizes(batch_sizes)
         ]
+
+    def _iter_reference_prefetch_batches(
+        self,
+        episode_input: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        sample_count = self._episode_input_sample_count(episode_input)
+        reference_prefetch_target = max(4, int(self.compute_loss_microbatch_size))
+        if sample_count <= reference_prefetch_target:
+            return [episode_input]
+        if not self._episode_input_supports_sample_slicing(episode_input):
+            return [episode_input]
+        batch_sizes = self._plan_balanced_batch_sizes(
+            sample_count,
+            preferred_target=reference_prefetch_target,
+            max_chunk_size=reference_prefetch_target,
+        )
+        return [
+            self._slice_episode_input_sample_range(
+                episode_input,
+                start_index=start_index,
+                end_index=end_index,
+            )
+            for start_index, end_index in self._iter_sample_ranges_from_sizes(batch_sizes)
+        ]
+
+    def _prefetch_reference_log_probs_for_episode_inputs(
+        self,
+        model: Any,
+        episode_inputs: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        entries = [dict(episode_input or {}) for episode_input in list(episode_inputs or [])]
+        if not entries:
+            return []
+        if float(getattr(self, "kl_beta", 0.0) or 0.0) <= 0.0:
+            return entries
+        if self.reference_model is None and not bool(getattr(self, "use_lora_reference_disable_adapter", False)):
+            return entries
+
+        pending_indices: List[int] = []
+        for entry_index, entry in enumerate(entries):
+            if not self._has_trainable_weight(entry):
+                entry["reference_token_log_probs"] = self._zero_reference_token_log_probs_for_episode_input(entry)
+                continue
+            pending_indices.append(int(entry_index))
+        if not pending_indices:
+            return entries
+
+        if self.reference_model is not None:
+            reference_model = self.reference_model
+            disable_context = nullcontext()
+        else:
+            disable_context, reference_model = self._disable_adapter_context(model)
+        with disable_context:
+            for entry_index in pending_indices:
+                entry = entries[entry_index]
+                reference_batches = list(self._iter_reference_prefetch_batches(entry))
+                cached_batches = [
+                    self._compute_reference_token_log_probs_for_batch(reference_model, batch=reference_batch)
+                    for reference_batch in reference_batches
+                ]
+                entry["reference_token_log_probs"] = (
+                    cached_batches[0]
+                    if len(cached_batches) == 1
+                    else torch.cat(cached_batches, dim=0)
+                )
+        return entries
 
     def _align_episode_inputs_across_ranks(
         self,
@@ -2209,15 +2722,28 @@ class TimesearchAlignedGRPOTrainerMixin:
     ) -> Optional[torch.Tensor]:
         episode_inputs = list(inputs.get("episode_inputs") or [])
         runtime_stats = dict(inputs.get("runtime_stats") or {})
+        zero_advantage_replay_missed = bool(runtime_stats.get("zero_advantage_replay_missed"))
         try:
             target_device = next(model.parameters()).device
         except StopIteration:
             target_device = torch.device("cpu")
         local_trainable_samples = int(self._count_local_trainable_samples(episode_inputs))
         global_trainable_samples = int(_distributed_sum_int(local_trainable_samples, device=target_device))
-        if global_trainable_samples > 0:
+        step_has_signal_local = global_trainable_samples > 0 and not zero_advantage_replay_missed
+        all_ranks_have_signal, any_rank_has_signal = _distributed_bool_consensus(
+            step_has_signal_local,
+            device=target_device,
+        )
+        if all_ranks_have_signal:
+            self._active_rl_window_had_trainable_signal = True
             return None
-        reason = "all_empty_episode_inputs" if not episode_inputs else "all_empty_trainable_samples"
+        if any_rank_has_signal:
+            reason = "mixed_rank_zero_advantage_replay_state"
+        elif zero_advantage_replay_missed and episode_inputs:
+            reason = "all_zero_advantages"
+        else:
+            reason = "all_empty_episode_inputs" if not episode_inputs else "all_empty_trainable_samples"
+        self._active_rl_last_skip_reason = str(reason or "")
         self._maybe_log_empty_batch_rank_summary(
             reason=reason,
             runtime_stats=runtime_stats,
@@ -2236,14 +2762,25 @@ class TimesearchAlignedGRPOTrainerMixin:
         with cp_context():
             model.train()
             optimizer = getattr(self, "optimizer", None)
+            if optimizer is not None and not isinstance(optimizer, _ActiveRLOptimizerStepProxy):
+                self.optimizer = _ActiveRLOptimizerStepProxy(optimizer, trainer=self)
+                optimizer = self.optimizer
             if optimizer is not None and hasattr(optimizer, "train") and callable(optimizer.train):
                 optimizer.train()
+            is_update_boundary = bool(getattr(getattr(self, "accelerator", None), "sync_gradients", True))
 
             prepare_inputs = getattr(self, "_prepare_inputs", None)
             if callable(prepare_inputs):
                 inputs = prepare_inputs(inputs)
             skipped_loss = self._maybe_skip_empty_training_step(model, inputs)
             if skipped_loss is not None:
+                if is_update_boundary and not bool(getattr(self, "_active_rl_window_had_trainable_signal", False)):
+                    self._mark_skip_next_optimizer_step(
+                        reason=str(getattr(self, "_active_rl_last_skip_reason", "") or "all_empty_trainable_samples"),
+                        all_empty=True,
+                    )
+                if is_update_boundary:
+                    self._active_rl_window_had_trainable_signal = False
                 return skipped_loss.detach()
 
             with self.compute_loss_context_manager():
@@ -2253,6 +2790,15 @@ class TimesearchAlignedGRPOTrainerMixin:
             kwargs: Dict[str, Any] = {}
             args = getattr(self, "args", None)
             if isinstance(loss, torch.Tensor):
+                runtime_log(
+                    "rl backward loss debug: "
+                    f"shape={tuple(int(v) for v in loss.shape)} "
+                    f"numel={int(loss.numel())} "
+                    f"requires_grad={bool(loss.requires_grad)} "
+                    f"grad_fn={type(loss.grad_fn).__name__ if loss.grad_fn is not None else 'none'}",
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=False,
+                )
                 if int(loss.numel()) != 1:
                     _training_phase_runtime_log(
                         "rl loss scalarize debug: "
@@ -2296,6 +2842,11 @@ class TimesearchAlignedGRPOTrainerMixin:
                     "rl backward end: "
                     f"backend={'deepspeed' if is_deepspeed else 'accelerate'}"
                 )
+
+            if is_update_boundary:
+                self._active_rl_skip_next_optimizer_step = False
+                self._active_rl_last_skip_reason = ""
+                self._active_rl_window_had_trainable_signal = False
 
             return loss.detach()
 
@@ -2347,13 +2898,14 @@ class TimesearchAlignedGRPOTrainerMixin:
             f"prompt_tokens={int(batch['prompt_ids'].shape[-1])} "
             f"completion_tokens={int(batch['completion_ids'].shape[-1])}"
         )
+        multimodal_inputs = self._episode_input_multimodal_inputs(batch)
         policy_token_log_probs, response_mask = compute_completion_only_token_log_probs_from_ids(
             model=model,
             prompt_ids=batch["prompt_ids"],
             prompt_mask=batch["prompt_mask"],
             completion_ids=batch["completion_ids"],
             completion_mask=batch["completion_mask"],
-            multimodal_inputs=self._episode_input_multimodal_inputs(batch),
+            multimodal_inputs=multimodal_inputs,
             temperature=self.policy_temperature,
         )
         _training_phase_runtime_log(
@@ -2394,8 +2946,16 @@ class TimesearchAlignedGRPOTrainerMixin:
         per_token_loss_2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.minimum(per_token_loss_1, per_token_loss_2)
         if self.kl_beta > 0.0:
-            reference_token_log_probs = None
-            if self.reference_model is not None:
+            reference_token_log_probs = batch.get("reference_token_log_probs")
+            if isinstance(reference_token_log_probs, torch.Tensor):
+                reference_token_log_probs = reference_token_log_probs.to(
+                    policy_token_log_probs.device,
+                    dtype=torch.float32,
+                )
+                if reference_token_log_probs.ndim == 1:
+                    reference_token_log_probs = reference_token_log_probs.view(1, -1)
+            elif self.reference_model is not None:
+                reference_token_log_probs = None
                 reference_forward_start = time.perf_counter()
                 _training_phase_runtime_log(
                     "rl compute_loss reference kl forward start: "
@@ -2408,7 +2968,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                         prompt_mask=batch["prompt_mask"],
                         completion_ids=batch["completion_ids"],
                         completion_mask=batch["completion_mask"],
-                        multimodal_inputs=self._episode_input_multimodal_inputs(batch),
+                        multimodal_inputs=multimodal_inputs,
                         temperature=self.policy_temperature,
                     )
                 _training_phase_runtime_log(
@@ -2416,6 +2976,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                     f"samples={sample_count} elapsed_sec={time.perf_counter() - reference_forward_start:.3f}"
                 )
             elif self.use_lora_reference_disable_adapter:
+                reference_token_log_probs = None
                 disable_context, reference_model = self._disable_adapter_context(model)
                 reference_forward_start = time.perf_counter()
                 _training_phase_runtime_log(
@@ -2430,7 +2991,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                             prompt_mask=batch["prompt_mask"],
                             completion_ids=batch["completion_ids"],
                             completion_mask=batch["completion_mask"],
-                            multimodal_inputs=self._episode_input_multimodal_inputs(batch),
+                            multimodal_inputs=multimodal_inputs,
                             temperature=self.policy_temperature,
                         )
                 _training_phase_runtime_log(
@@ -2438,6 +2999,11 @@ class TimesearchAlignedGRPOTrainerMixin:
                     f"samples={sample_count} elapsed_sec={time.perf_counter() - reference_forward_start:.3f}"
                 )
             if reference_token_log_probs is not None:
+                if tuple(reference_token_log_probs.shape) != tuple(policy_token_log_probs.shape):
+                    raise ValueError(
+                        "reference_token_log_probs must align with policy_token_log_probs shape: "
+                        f"{tuple(reference_token_log_probs.shape)} vs {tuple(policy_token_log_probs.shape)}"
+                    )
                 delta = reference_token_log_probs.to(policy_token_log_probs.device) - policy_token_log_probs
                 per_token_kl = torch.exp(delta) - delta - 1.0
                 per_token_loss = per_token_loss + per_token_loss.new_tensor(self.kl_beta) * per_token_kl
@@ -2515,27 +3081,41 @@ class TimesearchAlignedGRPOTrainerMixin:
             f"samples={sample_count} elapsed_sec={time.perf_counter() - liger_forward_start:.3f}"
         )
         self._log_liger_runtime_configuration_once()
-        ref_per_token_logps = None
-        if self.kl_beta > 0.0 and self.reference_model is not None:
-            reference_forward_start = time.perf_counter()
-            _training_phase_runtime_log(
-                "rl compute_loss reference kl forward start: "
-                f"samples={sample_count} completion_tokens={int(completion_ids.shape[-1])}"
-            )
-            with torch.inference_mode():
-                ref_per_token_logps, _ = compute_completion_only_token_log_probs_from_ids(
-                    model=self.reference_model,
-                    prompt_ids=batch["prompt_ids"],
-                    prompt_mask=batch["prompt_mask"],
-                    completion_ids=batch["completion_ids"],
-                    completion_mask=batch["completion_mask"],
-                    multimodal_inputs=multimodal_inputs,
-                    temperature=self.policy_temperature,
+        ref_per_token_logps = batch.get("reference_token_log_probs")
+        if isinstance(ref_per_token_logps, torch.Tensor):
+            ref_per_token_logps = ref_per_token_logps.to(dtype=torch.float32)
+        else:
+            ref_per_token_logps = None
+        if self.kl_beta > 0.0 and ref_per_token_logps is None:
+            if self.reference_model is not None:
+                reference_model = self.reference_model
+                disable_context = nullcontext()
+            elif self.use_lora_reference_disable_adapter:
+                disable_context, reference_model = self._disable_adapter_context(unwrapped_model)
+            else:
+                reference_model = None
+                disable_context = nullcontext()
+            if reference_model is not None:
+                reference_forward_start = time.perf_counter()
+                _training_phase_runtime_log(
+                    "rl compute_loss reference kl forward start: "
+                    f"samples={sample_count} completion_tokens={int(completion_ids.shape[-1])}"
                 )
-            _training_phase_runtime_log(
-                "rl compute_loss reference kl forward end: "
-                f"samples={sample_count} elapsed_sec={time.perf_counter() - reference_forward_start:.3f}"
-            )
+                with torch.inference_mode():
+                    with disable_context:
+                        ref_per_token_logps, _ = compute_completion_only_token_log_probs_from_ids(
+                            model=reference_model,
+                            prompt_ids=batch["prompt_ids"],
+                            prompt_mask=batch["prompt_mask"],
+                            completion_ids=batch["completion_ids"],
+                            completion_mask=batch["completion_mask"],
+                            multimodal_inputs=multimodal_inputs,
+                            temperature=self.policy_temperature,
+                        )
+                _training_phase_runtime_log(
+                    "rl compute_loss reference kl forward end: "
+                    f"samples={sample_count} elapsed_sec={time.perf_counter() - reference_forward_start:.3f}"
+                )
         old_policy_token_log_probs = batch.get("old_policy_token_log_probs")
         if old_policy_token_log_probs == _USE_CURRENT_POLICY_LOGPROBS_SENTINEL:
             old_policy_token_log_probs = None
@@ -2561,6 +3141,13 @@ class TimesearchAlignedGRPOTrainerMixin:
             device=last_hidden_state.device,
             dtype=torch.float32,
         )
+        if ref_per_token_logps is not None and ref_per_token_logps.ndim == 1:
+            ref_per_token_logps = ref_per_token_logps.view(1, -1)
+        if ref_per_token_logps is not None and tuple(ref_per_token_logps.shape) != tuple(completion_ids.shape):
+            raise ValueError(
+                "reference_token_log_probs must align with completion_ids shape: "
+                f"{tuple(ref_per_token_logps.shape)} vs {tuple(completion_ids.shape)}"
+            )
         old_policy_token_log_probs = self._materialize_liger_tensor(
             old_policy_token_log_probs,
             device=last_hidden_state.device,
@@ -2699,6 +3286,28 @@ class TimesearchAlignedGRPOTrainerMixin:
                     main_process_only=True,
                 )
             episode_inputs = active_episode_inputs + inactive_episode_inputs
+            if float(getattr(self, "kl_beta", 0.0) or 0.0) > 0.0 and episode_inputs:
+                reference_prefetch_target = max(4, int(self.compute_loss_microbatch_size))
+                reference_prefetch_start = time.perf_counter()
+                runtime_log(
+                    "rl prepare_inputs stage: before prefetch_reference_log_probs "
+                    f"episode_inputs={len(episode_inputs)} "
+                    f"active_episode_inputs={len(active_episode_inputs)} "
+                    f"target_batch={reference_prefetch_target}",
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=True,
+                )
+                episode_inputs = self._prefetch_reference_log_probs_for_episode_inputs(
+                    wrapped_model,
+                    episode_inputs,
+                )
+                runtime_log(
+                    "rl prepare_inputs stage: after prefetch_reference_log_probs "
+                    f"episode_inputs={len(episode_inputs)} "
+                    f"elapsed_sec={time.perf_counter() - reference_prefetch_start:.3f}",
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=True,
+                )
             runtime_stats["raw_local_episode_input_count"] = int(len(episode_inputs))
             runtime_log(
                 "rl materialize end: "
@@ -2708,6 +3317,11 @@ class TimesearchAlignedGRPOTrainerMixin:
                 f"elapsed_sec={time.perf_counter() - materialize_start:.3f}",
                 runtime=distributed_runtime_from_env(),
                 main_process_only=True,
+            )
+            runtime_log(
+                f"rl rank episode summary: rows={[_summarize_episode_input_for_rank_debug(batch) for batch in episode_inputs]}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=False,
             )
             return {
                 "episode_inputs": episode_inputs,
@@ -2747,6 +3361,11 @@ class TimesearchAlignedGRPOTrainerMixin:
             f"liger_disable_reason={str(getattr(self, '_liger_runtime_disable_reason', None) or 'none')} "
             f"loss_microbatch={int(getattr(self, 'compute_loss_microbatch_size', 1) or 1)}"
         )
+        runtime_log(
+            f"rl rank compute_loss summary: rows={_summarize_microbatch_layout_for_rank_debug(episode_inputs, self)}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
         total_loss_sum = None
         total_active_samples = 0
         total_effective_weight = 0.0
@@ -2764,13 +3383,14 @@ class TimesearchAlignedGRPOTrainerMixin:
             )
             batch_start = time.perf_counter()
             for microbatch_index, microbatch in enumerate(microbatches, start=1):
-                if len(microbatches) > 1:
-                    _training_phase_runtime_log(
-                        "rl compute_loss microbatch start: "
-                        f"batch={batch_index}/{len(episode_inputs)} "
-                        f"microbatch={microbatch_index}/{len(microbatches)} "
-                        f"samples={int(self._episode_input_sample_count(microbatch))}"
-                    )
+                runtime_log(
+                    "rl compute_loss microbatch start: "
+                    f"batch={batch_index}/{len(episode_inputs)} "
+                    f"microbatch={microbatch_index}/{len(microbatches)} "
+                    f"samples={int(self._episode_input_sample_count(microbatch))}",
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=False,
+                )
                 device_microbatch = self._move_episode_input_to_device(microbatch, device=model_device)
                 liger_unwrapped_model = self._resolve_liger_unwrapped_model(model) if self.use_liger_loss else None
                 if self.use_liger_loss:
@@ -2858,9 +3478,13 @@ class TimesearchAlignedGRPOTrainerMixin:
                 "rl_fecv_degraded_rollout_count": int(self._fecv_degraded_rollout_count),
                 "rl_ddp_noop_padded_episode_inputs": int(self._ddp_noop_padded_episode_inputs),
                 "rl_skipped_empty_training_steps": int(self._skip_empty_training_steps),
+                "rl_all_empty_batch_skips": int(self._all_empty_batch_skips),
+                "rl_optimizer_step_skips": int(self._optimizer_step_skips),
                 "rl_zero_advantage_replay_uses": int(self._zero_advantage_replay_uses),
                 "rl_zero_advantage_replay_misses": int(self._zero_advantage_replay_misses),
                 "rl_zero_advantage_replay_cache_size": int(len(self._recent_nonzero_advantage_payloads)),
+                "rl_zero_advantage_replay_last_source_video_ids": str(self._zero_advantage_replay_last_source_video_ids or ""),
+                "rl_zero_advantage_replay_last_reason": str(self._zero_advantage_replay_last_reason or ""),
                 "rl_compute_loss_microbatch_size_effective": int(self.compute_loss_microbatch_size),
             }
         )
@@ -2918,7 +3542,7 @@ def create_timesearch_aligned_grpo_trainer(
     policy_repetition_penalty: Optional[float] = None,
     rollout_use_generation_cache: bool = True,
     fecv_use_generation_cache: bool = True,
-    compute_loss_microbatch_size: int = 2,
+    compute_loss_microbatch_size: int = 3,
     use_liger_loss: bool = False,
     iteration_index: int = 0,
     num_iterations: int = 1,

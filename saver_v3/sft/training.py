@@ -2875,6 +2875,72 @@ def compute_completion_only_token_log_probs_from_ids(
     multimodal_inputs: Optional[Dict[str, Any]] = None,
     temperature: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _is_supported_floating_dtype(candidate: Any) -> bool:
+        return isinstance(candidate, torch.dtype) and candidate in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        }
+
+    def _resolve_model_compute_dtype(model_like: Any) -> Optional[torch.dtype]:
+        module_like = getattr(model_like, "module", None)
+        for candidate in (
+            getattr(model_like, "dtype", None),
+            getattr(module_like, "dtype", None),
+        ):
+            if _is_supported_floating_dtype(candidate):
+                return candidate
+        if bool(torch.is_autocast_enabled()):
+            get_autocast_dtype = getattr(torch, "get_autocast_dtype", None)
+            if callable(get_autocast_dtype):
+                for device_type in ("cuda", "cpu"):
+                    try:
+                        candidate = get_autocast_dtype(device_type)
+                    except Exception:
+                        continue
+                    if _is_supported_floating_dtype(candidate):
+                        return candidate
+            get_autocast_gpu_dtype = getattr(torch, "get_autocast_gpu_dtype", None)
+            if callable(get_autocast_gpu_dtype):
+                try:
+                    candidate = get_autocast_gpu_dtype()
+                except Exception:
+                    candidate = None
+                if _is_supported_floating_dtype(candidate):
+                    return candidate
+        for holder in (model_like, module_like):
+            if holder is None:
+                continue
+            try:
+                first_parameter = next(holder.parameters())
+            except Exception:
+                first_parameter = None
+            if isinstance(first_parameter, torch.Tensor) and first_parameter.is_floating_point():
+                return first_parameter.dtype
+            try:
+                first_buffer = next(holder.buffers())
+            except Exception:
+                first_buffer = None
+            if isinstance(first_buffer, torch.Tensor) and first_buffer.is_floating_point():
+                return first_buffer.dtype
+        return None
+
+    def _cast_multimodal_floats(value: Any, *, target_dtype: Optional[torch.dtype]) -> Any:
+        if target_dtype is None:
+            return value
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point() and value.dtype != target_dtype:
+                return value.to(dtype=target_dtype)
+            return value
+        if isinstance(value, dict):
+            return {str(key): _cast_multimodal_floats(item, target_dtype=target_dtype) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_cast_multimodal_floats(item, target_dtype=target_dtype) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_cast_multimodal_floats(item, target_dtype=target_dtype) for item in value)
+        return value
+
     if prompt_ids.ndim != 2 or prompt_mask.ndim != 2 or completion_ids.ndim != 2 or completion_mask.ndim != 2:
         raise ValueError("completion-only token log-prob computation expects rank-2 prompt/completion tensors.")
 
@@ -2895,7 +2961,8 @@ def compute_completion_only_token_log_probs_from_ids(
 
     input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
     attention_mask = torch.cat([prompt_mask, completion_mask.to(dtype=prompt_mask.dtype)], dim=-1)
-    model_inputs = dict(multimodal_inputs or {})
+    model_compute_dtype = _resolve_model_compute_dtype(model)
+    model_inputs = _cast_multimodal_floats(dict(multimodal_inputs or {}), target_dtype=model_compute_dtype)
     model_inputs.update(
         {
             "input_ids": input_ids,
@@ -2918,9 +2985,14 @@ def compute_completion_only_token_log_probs_from_ids(
             return {"type": "tuple", "len": len(value)}
         return type(value).__name__
 
+    effective_multimodal_inputs = {
+        str(key): value
+        for key, value in model_inputs.items()
+        if key not in {"input_ids", "attention_mask"}
+    }
     multimodal_summary = {
         str(key): _summarize_value(value)
-        for key, value in dict(multimodal_inputs or {}).items()
+        for key, value in effective_multimodal_inputs.items()
     }
     helper_forward_start = time.perf_counter()
     runtime_log(
@@ -2930,6 +3002,7 @@ def compute_completion_only_token_log_probs_from_ids(
         f"completion_tokens={int(completion_ids.shape[-1])} "
         f"total_tokens={int(input_ids.shape[-1])} "
         f"logits_to_keep={logits_to_keep} "
+        f"model_compute_dtype={str(model_compute_dtype).replace('torch.', '') if model_compute_dtype is not None else 'none'} "
         f"multimodal_keys={sorted(multimodal_summary.keys())} "
         f"multimodal_summary={multimodal_summary}",
         runtime=distributed_runtime_from_env(),

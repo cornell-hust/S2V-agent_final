@@ -460,6 +460,7 @@ def _build_continuous_iteration_callback(
                 native_progress.iteration_index = int(iteration_index)
                 native_progress.num_iterations = int(self.owner.args.num_iterations)
                 native_progress.set_total_groups(len(items))
+                native_progress.reset_iteration_state()
             if hasattr(self.trainer, "_buffered_generation_step_payloads"):
                 self.trainer._buffered_generation_step_payloads = []
             if hasattr(self.trainer, "_buffered_generation_batch_key"):

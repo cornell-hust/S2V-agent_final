@@ -37,6 +37,12 @@ SELF_VERIFICATION_VERDICT_KEYS = (
     "rationale",
     "explanation",
 )
+OPTIONAL_FINALIZE_SEMANTIC_FIELDS = (
+    "summary",
+    "rationale",
+    "event_chain_summary",
+    "qa_focus_answers",
+)
 
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -863,6 +869,25 @@ def finalize_case(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
         normalized_arguments["event_chain_summary"] = dict(semantic_answer.get("event_chain_summary") or {})
         normalized_arguments["qa_focus_answers"] = dict(semantic_answer.get("qa_focus_answers") or {})
     schema = augment_finalize_case_schema(multimodal_cache.get("tool_io", {}).get("finalize_case_schema"))
+    allowed_decision_fields = set(str(field_name) for field_name in dict(schema.get("properties") or {}).keys())
+    if allowed_decision_fields:
+        decision_arguments = {
+            str(key): value
+            for key, value in dict(decision_arguments or {}).items()
+            if str(key) in allowed_decision_fields
+        }
+        normalized_arguments = {
+            **{
+                str(key): value
+                for key, value in dict(normalized_arguments or {}).items()
+                if str(key) in allowed_decision_fields
+            },
+            **{
+                key: normalized_arguments[key]
+                for key in OPTIONAL_FINALIZE_SEMANTIC_FIELDS
+                if key in normalized_arguments
+            },
+        }
     validate_required_fields(normalized_arguments, schema)
     state.finalized_case = dict(decision_arguments)
     state.finalized_semantic_answer = dict(semantic_answer) if isinstance(semantic_answer, dict) else None

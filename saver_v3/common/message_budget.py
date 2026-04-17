@@ -109,7 +109,24 @@ def prune_stale_tool_images(
             if isinstance(item, dict)
         )
     ]
-    keep_indices = set(image_tool_message_indices[-int(keep_recent_tool_image_messages) :])
+    keep_budget = int(keep_recent_tool_image_messages)
+    keep_indices: set[int] = set()
+    pinned_scan_index = None
+    for message_index in reversed(image_tool_message_indices):
+        message = prepared[message_index]
+        if str(message.get("name") or "").strip() == "scan_timeline":
+            pinned_scan_index = int(message_index)
+            break
+    if keep_budget > 0 and pinned_scan_index is not None:
+        keep_indices.add(int(pinned_scan_index))
+        keep_budget -= 1
+    for message_index in reversed(image_tool_message_indices):
+        if keep_budget <= 0:
+            break
+        if int(message_index) in keep_indices:
+            continue
+        keep_indices.add(int(message_index))
+        keep_budget -= 1
 
     for message_index in image_tool_message_indices:
         if message_index in keep_indices:

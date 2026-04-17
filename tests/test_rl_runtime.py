@@ -13,19 +13,29 @@ import yaml
 import train_saver_rl
 
 from saver_v3.rl import cli_shared
+from saver_v3.rl import grpo_trainer_env as native_grpo_module
 from saver_v3.rl.runtime import RLJobConfig, build_active_rl_trl_argv, run_rl_job
 from saver_v3.core.rollout import SaverRolloutRunner, _build_episode_training_feature
 from saver_v3.core.counterfactual_verification import run_counterfactual_verification_batch
 from saver_v3.core.schema import SaverEnvironmentState
+from saver_v3.core.tools import finalize_case
 from saver_v3.sft.training import _build_rl_completion_episode_spec_from_feature
+from saver_v3.sft import training as sft_training_module
 from saver_v3.model.vllm_generation import VllmQwenGenerationPolicy
 from saver_v3.rl import timesearch_aligned_grpo_trainer as aligned_grpo_module
 from saver_v3.rl import trl_grpo_trainer as trl_grpo_module
-from saver_v3.rl.trl_grpo_trainer import MutableIterationDataset, TrlVllmGrpoRunner, _continuous_rl_args
+from saver_v3.rl.trl_grpo_trainer import (
+    MutableIterationDataset,
+    TrlVllmGrpoRunner,
+    _build_continuous_iteration_callback,
+    _continuous_rl_args,
+)
 from saver_v3.rl.timesearch_aligned_grpo_trainer import (
     TimesearchAlignedGRPOTrainerMixin,
     _USE_CURRENT_POLICY_LOGPROBS_SENTINEL,
+    _ActiveRLOptimizerStepProxy,
     _build_managed_reference_model_like_timesearch_r,
+    _strip_rl_unused_decision_fields_from_item,
     _resolve_liger_linear_head,
 )
 from saver_v3.rl.trl_grpo_trainer import _save_loadable_hf_authority_checkpoint
@@ -36,6 +46,210 @@ def _write_yaml(path: Path, payload: dict) -> None:
 
 
 class RLRuntimeTests(unittest.TestCase):
+    def test_native_progress_reporter_reset_iteration_state(self) -> None:
+        runtime = types.SimpleNamespace()
+        reporter = native_grpo_module._NativeGRPOProgressReporter(
+            runtime=runtime,
+            iteration_index=0,
+            num_iterations=10,
+            total_groups=12,
+            num_generations=6,
+        )
+        reporter.processed_groups = 7
+        reporter.batch_index = 3
+        reporter.last_video_id = "vid"
+        reporter.last_stage = "score"
+
+        reporter.reset_iteration_state()
+
+        self.assertEqual(reporter.processed_groups, 0)
+        self.assertEqual(reporter.batch_index, 0)
+        self.assertEqual(reporter.last_video_id, "")
+        self.assertEqual(reporter.last_stage, "")
+
+    def test_native_progress_reporter_finish_item_logs_local_groups_processed(self) -> None:
+        runtime = types.SimpleNamespace()
+        reporter = native_grpo_module._NativeGRPOProgressReporter(
+            runtime=runtime,
+            iteration_index=1,
+            num_iterations=10,
+            total_groups=12,
+            num_generations=6,
+        )
+        reporter.start_batch(num_items=4)
+        logged_messages = []
+        with mock.patch.object(native_grpo_module, "runtime_log", side_effect=lambda message, **kwargs: logged_messages.append(str(message))):
+            reporter.finish_item(video_id="vid1")
+
+        self.assertTrue(any("local_groups_processed=1" in message for message in logged_messages))
+        self.assertFalse(any("groups=1/" in message for message in logged_messages))
+
+    def test_continuous_iteration_callback_resets_native_progress(self) -> None:
+        mutable_dataset = MutableIterationDataset([{"video_id": "old"}])
+        trainer = types.SimpleNamespace(
+            train_dataset=mutable_dataset,
+            _native_grpo_progress=types.SimpleNamespace(
+                iteration_index=99,
+                num_iterations=99,
+                total_groups=99,
+                processed_groups=7,
+                batch_index=3,
+                last_video_id="vid",
+                last_stage="score",
+                set_total_groups=mock.Mock(),
+                reset_iteration_state=mock.Mock(),
+            ),
+        )
+        owner = types.SimpleNamespace(
+            dataset=[{"video_id": "a"}, {"video_id": "b"}],
+            raw_records=[{"video_id": "a"}, {"video_id": "b"}],
+            select_iteration_indices_fn=lambda raw_record_count, rollout_count, rollout_start_index, iteration_index: [0],
+            args=types.SimpleNamespace(rollout_count=1, rollout_start_index=0, seed=42, num_iterations=5, num_generations=6),
+            current_model_path="/tmp/model",
+            runtime=types.SimpleNamespace(),
+        )
+        callback = _build_continuous_iteration_callback(
+            owner=owner,
+            mutable_dataset=mutable_dataset,
+            trainer=trainer,
+            processor=None,
+            eval_every_iterations=1,
+        )
+
+        refreshed_items = callback._refresh_iteration_items(2)
+
+        self.assertEqual(len(refreshed_items), 1)
+        trainer._native_grpo_progress.set_total_groups.assert_called_once_with(1)
+        trainer._native_grpo_progress.reset_iteration_state.assert_called_once()
+
+    def test_strip_rl_unused_decision_fields_from_item_shrinks_finalize_schema_and_prompt(self) -> None:
+        item = {
+            "tool_io": {
+                "allowed_tools": ["scan_timeline", "finalize_case"],
+                "finalize_case_schema": {
+                    "type": "object",
+                    "properties": {
+                        "existence": {"type": "string"},
+                        "category": {"type": "string"},
+                        "severity": {"type": "integer"},
+                        "counterfactual_type": {"type": "string", "enum": ["none", "remove_actor_interaction"]},
+                    },
+                    "required": ["existence", "category", "severity", "counterfactual_type"],
+                },
+            },
+            "multimodal_cache": {
+                "tool_io": {
+                    "allowed_tools": ["scan_timeline", "finalize_case"],
+                    "finalize_case_schema": {
+                        "type": "object",
+                        "properties": {
+                            "existence": {"type": "string"},
+                            "category": {"type": "string"},
+                            "severity": {"type": "integer"},
+                            "counterfactual_type": {"type": "string", "enum": ["none", "remove_actor_interaction"]},
+                        },
+                        "required": ["existence", "category", "severity", "counterfactual_type"],
+                    },
+                }
+            },
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "old system prompt"}]},
+                {"role": "user", "content": [{"type": "text", "text": "question"}]},
+            ],
+        }
+
+        updated = _strip_rl_unused_decision_fields_from_item(item)
+
+        schema = updated["multimodal_cache"]["tool_io"]["finalize_case_schema"]
+        self.assertNotIn("severity", schema["properties"])
+        self.assertNotIn("counterfactual_type", schema["properties"])
+        self.assertEqual(schema["required"], ["existence", "category"])
+        system_text = updated["messages"][0]["content"][0]["text"]
+        self.assertNotIn("counterfactual_type", system_text)
+
+    def test_finalize_case_drops_fields_not_present_in_active_rl_schema(self) -> None:
+        multimodal_cache = {
+            "tool_io": {
+                "finalize_case_schema": {
+                    "type": "object",
+                    "properties": {
+                        "existence": {"type": "string"},
+                        "category": {"type": "string"},
+                        "anomaly_interval_sec": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                    },
+                    "required": ["existence", "category"],
+                }
+            }
+        }
+        state = SaverEnvironmentState()
+        content, state, finalized_case = finalize_case(
+            {
+                "existence": "anomaly",
+                "category": "fall",
+                "severity": 4,
+                "counterfactual_type": "remove_actor_interaction",
+                "anomaly_interval_sec": [1.0, 2.0],
+            },
+            multimodal_cache,
+            state,
+        )
+        self.assertIsInstance(content, list)
+        self.assertNotIn("severity", finalized_case)
+        self.assertNotIn("counterfactual_type", finalized_case)
+        self.assertNotIn("severity", state.finalized_case)
+        self.assertNotIn("counterfactual_type", state.finalized_case)
+
+    def test_completion_only_helper_casts_pixel_values_to_model_dtype_and_logs_effective_dtype(self) -> None:
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+                self.dtype = torch.bfloat16
+                self.forward_pixel_dtype = None
+                self.forward_grid_dtype = None
+
+            def forward(self, *, input_ids, attention_mask, pixel_values, image_grid_thw, logits_to_keep, **kwargs):
+                del attention_mask, kwargs
+                self.forward_pixel_dtype = pixel_values.dtype
+                self.forward_grid_dtype = image_grid_thw.dtype
+                batch_size = int(input_ids.shape[0])
+                vocab_size = 8
+                return types.SimpleNamespace(
+                    logits=torch.zeros((batch_size, logits_to_keep, vocab_size), dtype=torch.float32)
+                )
+
+        model = FakeModel()
+        logged_messages = []
+        with mock.patch.object(
+            sft_training_module,
+            "runtime_log",
+            side_effect=lambda message, **kwargs: logged_messages.append(str(message)),
+        ):
+            token_log_probs, response_mask = sft_training_module.compute_completion_only_token_log_probs_from_ids(
+                model=model,
+                prompt_ids=torch.tensor([[1, 2]], dtype=torch.long),
+                prompt_mask=torch.tensor([[1, 1]], dtype=torch.long),
+                completion_ids=torch.tensor([[3, 4]], dtype=torch.long),
+                completion_mask=torch.tensor([[1, 1]], dtype=torch.bool),
+                multimodal_inputs={
+                    "pixel_values": torch.ones((4, 6), dtype=torch.float32),
+                    "image_grid_thw": torch.ones((2, 3), dtype=torch.int64),
+                },
+            )
+
+        self.assertEqual(tuple(token_log_probs.shape), (1, 2))
+        self.assertTrue(torch.equal(response_mask, torch.tensor([[True, True]])))
+        self.assertEqual(model.forward_pixel_dtype, torch.bfloat16)
+        self.assertEqual(model.forward_grid_dtype, torch.int64)
+        self.assertTrue(any("model_compute_dtype=bfloat16" in message for message in logged_messages))
+        self.assertTrue(any("'pixel_values': {'shape': (4, 6), 'dtype': 'bfloat16'" in message for message in logged_messages))
+        self.assertTrue(any("'image_grid_thw': {'shape': (2, 3), 'dtype': 'int64'" in message for message in logged_messages))
+
     def test_save_loadable_hf_authority_checkpoint_uses_accelerator_state_dict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -614,7 +828,6 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertTrue(trainer.use_liger_loss)
         self.assertTrue(trainer.use_liger_loss_effective)
         self.assertIsNone(trainer._liger_runtime_disable_reason)
-        self.assertEqual(trainer._forward_redirection.call_count, 4)
         self.assertEqual(trainer._compute_liger_loss_for_batch.call_count, 4)
         trainer._compute_sample_losses_for_batch.assert_not_called()
 
@@ -681,6 +894,200 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertTrue(any("rl compute_loss batch start: batch=1/2" in message for message in logged_messages))
         self.assertTrue(any("rl compute_loss batch start: batch=2/2" in message for message in logged_messages))
         self.assertTrue(any("rl compute_loss end:" in message for message in logged_messages))
+
+    def test_compute_sample_losses_uses_cached_reference_log_probs_without_inline_reference_forward(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.policy_temperature = None
+        trainer.ppo_clip_epsilon = 0.2
+        trainer.kl_beta = 0.01
+        trainer.reference_model = object()
+        trainer.use_lora_reference_disable_adapter = False
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer._prepare_advantages = TimesearchAlignedGRPOTrainerMixin._prepare_advantages.__get__(trainer)
+        trainer._episode_input_multimodal_inputs = TimesearchAlignedGRPOTrainerMixin._episode_input_multimodal_inputs.__get__(trainer)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2, 3]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "advantages": torch.tensor([1.0], dtype=torch.float32),
+            "old_policy_token_log_probs": torch.tensor([[0.2, 0.4]], dtype=torch.float32),
+            "reference_token_log_probs": torch.tensor([0.1, 0.3], dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+            "multimodal_inputs": {},
+        }
+        logged_messages = []
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_ids",
+            side_effect=[
+                (torch.tensor([[0.2, 0.4]], dtype=torch.float32, requires_grad=True), torch.tensor([[1, 1]], dtype=torch.bool)),
+            ],
+        ) as helper, mock.patch.object(
+            aligned_grpo_module,
+            "runtime_log",
+            side_effect=lambda message, **kwargs: logged_messages.append(str(message)),
+        ):
+            sample_losses = trainer._compute_sample_losses_for_batch(model=model, batch=batch)
+
+        self.assertEqual(helper.call_count, 1)
+        self.assertIsNotNone(sample_losses)
+        self.assertEqual(tuple(sample_losses.shape), (1,))
+        self.assertFalse(any("rl compute_loss reference kl forward start:" in message for message in logged_messages))
+        self.assertFalse(any("rl compute_loss reference kl forward end:" in message for message in logged_messages))
+
+    def test_compute_sample_losses_falls_back_to_inline_reference_forward_when_reference_cache_missing(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.policy_temperature = None
+        trainer.ppo_clip_epsilon = 0.2
+        trainer.kl_beta = 0.01
+        trainer.reference_model = object()
+        trainer.use_lora_reference_disable_adapter = False
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer._prepare_advantages = TimesearchAlignedGRPOTrainerMixin._prepare_advantages.__get__(trainer)
+        trainer._episode_input_multimodal_inputs = TimesearchAlignedGRPOTrainerMixin._episode_input_multimodal_inputs.__get__(trainer)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2, 3]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "advantages": torch.tensor([1.0], dtype=torch.float32),
+            "old_policy_token_log_probs": torch.tensor([[0.2, 0.4]], dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+            "multimodal_inputs": {},
+        }
+        logged_messages = []
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_ids",
+            side_effect=[
+                (torch.tensor([[0.2, 0.4]], dtype=torch.float32, requires_grad=True), torch.tensor([[1, 1]], dtype=torch.bool)),
+                (torch.tensor([[0.1, 0.3]], dtype=torch.float32), torch.tensor([[1, 1]], dtype=torch.bool)),
+            ],
+        ) as helper, mock.patch.object(
+            aligned_grpo_module,
+            "runtime_log",
+            side_effect=lambda message, **kwargs: logged_messages.append(str(message)),
+        ):
+            sample_losses = trainer._compute_sample_losses_for_batch(model=model, batch=batch)
+
+        self.assertEqual(helper.call_count, 2)
+        self.assertIsNotNone(sample_losses)
+        self.assertEqual(tuple(sample_losses.shape), (1,))
+        self.assertTrue(any("rl compute_loss reference kl forward start:" in message for message in logged_messages))
+        self.assertTrue(any("rl compute_loss reference kl forward end:" in message for message in logged_messages))
+
+    def test_compute_sample_losses_cached_reference_matches_inline_reference(self) -> None:
+        def _build_trainer():
+            trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+            trainer.policy_temperature = None
+            trainer.ppo_clip_epsilon = 0.2
+            trainer.kl_beta = 0.01
+            trainer.reference_model = object()
+            trainer.use_lora_reference_disable_adapter = False
+            trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+            trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+            trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+            trainer._prepare_advantages = TimesearchAlignedGRPOTrainerMixin._prepare_advantages.__get__(trainer)
+            trainer._episode_input_multimodal_inputs = TimesearchAlignedGRPOTrainerMixin._episode_input_multimodal_inputs.__get__(trainer)
+            return trainer
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        base_batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2, 3]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "advantages": torch.tensor([1.0], dtype=torch.float32),
+            "old_policy_token_log_probs": torch.tensor([[0.2, 0.4]], dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+            "multimodal_inputs": {},
+        }
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_ids",
+            side_effect=[
+                (torch.tensor([[0.2, 0.4]], dtype=torch.float32, requires_grad=True), torch.tensor([[1, 1]], dtype=torch.bool)),
+                (torch.tensor([[0.1, 0.3]], dtype=torch.float32), torch.tensor([[1, 1]], dtype=torch.bool)),
+            ],
+        ):
+            fallback_loss = _build_trainer()._compute_sample_losses_for_batch(model=model, batch=dict(base_batch))
+
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_ids",
+            side_effect=[
+                (torch.tensor([[0.2, 0.4]], dtype=torch.float32, requires_grad=True), torch.tensor([[1, 1]], dtype=torch.bool)),
+            ],
+        ):
+            cached_loss = _build_trainer()._compute_sample_losses_for_batch(
+                model=model,
+                batch={**dict(base_batch), "reference_token_log_probs": torch.tensor([[0.1, 0.3]], dtype=torch.float32)},
+            )
+
+        self.assertTrue(torch.allclose(cached_loss, fallback_loss, atol=1e-6, rtol=1e-6))
+
+    def test_compute_reference_token_log_probs_moves_batch_to_model_device(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.policy_temperature = None
+        trainer._move_episode_input_to_device = mock.Mock(side_effect=lambda batch, device: dict(batch))
+        trainer._find_first_tensor_device = TimesearchAlignedGRPOTrainerMixin._find_first_tensor_device.__get__(trainer)
+        trainer._episode_input_multimodal_inputs = TimesearchAlignedGRPOTrainerMixin._episode_input_multimodal_inputs.__get__(trainer)
+        trainer._compute_reference_token_log_probs_for_batch = (
+            TimesearchAlignedGRPOTrainerMixin._compute_reference_token_log_probs_for_batch.__get__(trainer)
+        )
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2, 3]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "multimodal_inputs": {},
+        }
+
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_ids",
+            return_value=(torch.tensor([[0.1, 0.3]], dtype=torch.float32), torch.tensor([[1, 1]], dtype=torch.bool)),
+        ):
+            cached = trainer._compute_reference_token_log_probs_for_batch(model, batch=batch)
+
+        trainer._move_episode_input_to_device.assert_called_once()
+        _, kwargs = trainer._move_episode_input_to_device.call_args
+        self.assertEqual(kwargs["device"], model.weight.device)
+        self.assertTrue(torch.equal(cached, torch.tensor([[0.1, 0.3]], dtype=torch.float32)))
 
     def test_training_step_logs_backward_start_end(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -1064,6 +1471,7 @@ class RLRuntimeTests(unittest.TestCase):
         trainer._buffered_generation_step_payloads = []
         trainer._buffered_generation_batch_key = None
         trainer._build_generation_batch_key = lambda items: ("batch",)
+        trainer._maybe_replay_zero_advantage_payload = lambda payload: payload
         trainer._empty_generation_step_payload = lambda video_ids=None: {"episode_inputs": [], "runtime_stats": {}, "rollout_metrics": {}, "budgeting_metrics": {}, "video_ids": video_ids or []}
         trainer._align_episode_inputs_across_ranks = lambda episode_inputs, device, runtime_stats: list(episode_inputs)
         trainer._materialize_episode_inputs = mock.Mock(side_effect=lambda episode_inputs, device: list(episode_inputs))
@@ -1131,6 +1539,7 @@ class RLRuntimeTests(unittest.TestCase):
         trainer._buffered_generation_step_payloads = []
         trainer._buffered_generation_batch_key = None
         trainer._build_generation_batch_key = lambda items: ("batch",)
+        trainer._maybe_replay_zero_advantage_payload = lambda payload: payload
         trainer._empty_generation_step_payload = lambda video_ids=None: {"episode_inputs": [], "runtime_stats": {}, "rollout_metrics": {}, "budgeting_metrics": {}, "video_ids": video_ids or []}
         trainer._align_episode_inputs_across_ranks = lambda episode_inputs, device, runtime_stats: list(episode_inputs)
         trainer._materialize_episode_inputs = mock.Mock(side_effect=lambda episode_inputs, device: list(episode_inputs))
@@ -1172,6 +1581,97 @@ class RLRuntimeTests(unittest.TestCase):
 
         self.assertEqual(len(prepared["episode_inputs"]), 1)
         trainer._populate_old_policy_log_probs.assert_not_called()
+
+    def test_prepare_inputs_prefetches_reference_log_probs_after_materialization_and_zero_fills_inactive_batches(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.model = mock.Mock()
+        trainer.model.training = True
+        trainer.model.train = mock.Mock()
+        trainer.model.eval = mock.Mock()
+        trainer._native_grpo_progress = None
+        trainer._active_generation_progress = None
+        trainer._buffered_generation_step_payloads = []
+        trainer._buffered_generation_batch_key = None
+        trainer._build_generation_batch_key = lambda items: ("batch",)
+        trainer._maybe_replay_zero_advantage_payload = lambda payload: payload
+        trainer._empty_generation_step_payload = lambda video_ids=None: {"episode_inputs": [], "runtime_stats": {}, "rollout_metrics": {}, "budgeting_metrics": {}, "video_ids": video_ids or []}
+        trainer._align_episode_inputs_across_ranks = lambda episode_inputs, device, runtime_stats: list(episode_inputs)
+        trainer._has_trainable_weight = TimesearchAlignedGRPOTrainerMixin._has_trainable_weight.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._plan_balanced_batch_sizes = TimesearchAlignedGRPOTrainerMixin._plan_balanced_batch_sizes.__get__(trainer)
+        trainer._iter_sample_ranges_from_sizes = TimesearchAlignedGRPOTrainerMixin._iter_sample_ranges_from_sizes.__get__(trainer)
+        trainer._episode_input_supports_sample_slicing = TimesearchAlignedGRPOTrainerMixin._episode_input_supports_sample_slicing.__get__(trainer)
+        trainer._iter_reference_prefetch_batches = TimesearchAlignedGRPOTrainerMixin._iter_reference_prefetch_batches.__get__(trainer)
+        trainer._slice_episode_input_sample_range = TimesearchAlignedGRPOTrainerMixin._slice_episode_input_sample_range.__get__(trainer)
+        trainer._slice_multimodal_input_samples = TimesearchAlignedGRPOTrainerMixin._slice_multimodal_input_samples.__get__(trainer)
+        trainer._zero_reference_token_log_probs_for_episode_input = (
+            TimesearchAlignedGRPOTrainerMixin._zero_reference_token_log_probs_for_episode_input.__get__(trainer)
+        )
+        trainer._prefetch_reference_log_probs_for_episode_inputs = (
+            TimesearchAlignedGRPOTrainerMixin._prefetch_reference_log_probs_for_episode_inputs.__get__(trainer)
+        )
+        trainer.compute_loss_microbatch_size = 3
+        trainer.kl_beta = 0.01
+        trainer.reference_model = object()
+        call_order = []
+
+        def _materialize(episode_inputs, device):
+            call_order.append("materialize")
+            return list(episode_inputs)
+
+        trainer._materialize_episode_inputs = mock.Mock(side_effect=_materialize)
+
+        def _prefetch(model, batch):
+            call_order.append("prefetch")
+            sample_count = int(batch["completion_ids"].shape[0])
+            return torch.full((sample_count, int(batch["completion_ids"].shape[-1])), 0.25, dtype=torch.float32)
+
+        trainer._compute_reference_token_log_probs_for_batch = mock.Mock(side_effect=_prefetch)
+
+        class TinyRolloutModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        rollout_model = TinyRolloutModel()
+        with mock.patch.object(aligned_grpo_module, "_unwrap_model", return_value=rollout_model):
+            trainer._pop_or_generate_generation_step_payload = mock.Mock(
+                return_value={
+                    "episode_inputs": [
+                        {
+                            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+                            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                            "completion_ids": torch.tensor([[2]], dtype=torch.long),
+                            "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+                            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+                        },
+                        {
+                            "prompt_ids": torch.tensor([[3]], dtype=torch.long),
+                            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                            "completion_ids": torch.tensor([[4]], dtype=torch.long),
+                            "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                            "sample_loss_multiplier": torch.tensor([0.0], dtype=torch.float32),
+                            "sample_weight": torch.tensor([0.0], dtype=torch.float32),
+                        },
+                    ],
+                    "runtime_stats": {},
+                    "rollout_metrics": {},
+                    "budgeting_metrics": {},
+                    "video_ids": ["vid1"],
+                }
+            )
+            prepared = trainer._prepare_inputs([{"video_id": "vid1"}])
+
+        self.assertEqual(call_order, ["materialize", "prefetch"])
+        self.assertEqual(len(prepared["episode_inputs"]), 2)
+        self.assertTrue(torch.equal(prepared["episode_inputs"][0]["reference_token_log_probs"], torch.tensor([[0.25]], dtype=torch.float32)))
+        self.assertTrue(torch.equal(prepared["episode_inputs"][1]["reference_token_log_probs"], torch.zeros((1, 1), dtype=torch.float32)))
+        self.assertEqual(str(prepared["episode_inputs"][0]["reference_token_log_probs"].device), "cpu")
+        self.assertEqual(str(prepared["episode_inputs"][1]["reference_token_log_probs"].device), "cpu")
 
     def test_materialize_episode_inputs_merges_old_logprob_sentinel_batches(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -1281,6 +1781,16 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertEqual(materialized[0]["old_policy_token_log_probs"].shape[0], 5)
         self.assertEqual(len(materialized[0]["multimodal_inputs"]), 5)
 
+    def test_plan_balanced_batch_sizes_matches_expected_layouts(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._plan_balanced_batch_sizes = TimesearchAlignedGRPOTrainerMixin._plan_balanced_batch_sizes.__get__(trainer)
+
+        self.assertEqual(trainer._plan_balanced_batch_sizes(4, preferred_target=3, max_chunk_size=4), [4])
+        self.assertEqual(trainer._plan_balanced_batch_sizes(5, preferred_target=3, max_chunk_size=4), [3, 2])
+        self.assertEqual(trainer._plan_balanced_batch_sizes(7, preferred_target=3, max_chunk_size=4), [4, 3])
+        self.assertEqual(trainer._plan_balanced_batch_sizes(8, preferred_target=3, max_chunk_size=4), [4, 4])
+        self.assertEqual(trainer._plan_balanced_batch_sizes(10, preferred_target=3, max_chunk_size=4), [4, 3, 3])
+
     def test_iter_loss_microbatches_slices_nested_multimodal_inputs(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
         trainer.compute_loss_microbatch_size = 2
@@ -1290,6 +1800,15 @@ class RLRuntimeTests(unittest.TestCase):
         )
         trainer._slice_multimodal_input_samples = (
             TimesearchAlignedGRPOTrainerMixin._slice_multimodal_input_samples.__get__(trainer)
+        )
+        trainer._episode_input_supports_sample_slicing = (
+            TimesearchAlignedGRPOTrainerMixin._episode_input_supports_sample_slicing.__get__(trainer)
+        )
+        trainer._plan_balanced_batch_sizes = TimesearchAlignedGRPOTrainerMixin._plan_balanced_batch_sizes.__get__(
+            trainer
+        )
+        trainer._iter_sample_ranges_from_sizes = TimesearchAlignedGRPOTrainerMixin._iter_sample_ranges_from_sizes.__get__(
+            trainer
         )
         trainer._iter_loss_microbatches = TimesearchAlignedGRPOTrainerMixin._iter_loss_microbatches.__get__(trainer)
 
@@ -1313,19 +1832,76 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertEqual(microbatches[1]["prompt_ids"].shape[0], 2)
         self.assertEqual(len(microbatches[1]["multimodal_inputs"]), 2)
 
-    def test_zero_advantage_payload_no_longer_replays_recent_payload(self) -> None:
+    def test_iter_loss_microbatches_balances_tail_and_slices_reference_token_log_probs(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.compute_loss_microbatch_size = 3
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._slice_episode_input_sample_range = (
+            TimesearchAlignedGRPOTrainerMixin._slice_episode_input_sample_range.__get__(trainer)
+        )
+        trainer._slice_multimodal_input_samples = (
+            TimesearchAlignedGRPOTrainerMixin._slice_multimodal_input_samples.__get__(trainer)
+        )
+        trainer._episode_input_supports_sample_slicing = (
+            TimesearchAlignedGRPOTrainerMixin._episode_input_supports_sample_slicing.__get__(trainer)
+        )
+        trainer._plan_balanced_batch_sizes = TimesearchAlignedGRPOTrainerMixin._plan_balanced_batch_sizes.__get__(
+            trainer
+        )
+        trainer._iter_sample_ranges_from_sizes = TimesearchAlignedGRPOTrainerMixin._iter_sample_ranges_from_sizes.__get__(
+            trainer
+        )
+        trainer._iter_loss_microbatches = TimesearchAlignedGRPOTrainerMixin._iter_loss_microbatches.__get__(trainer)
+
+        reference_token_log_probs = torch.arange(16, dtype=torch.float32).view(8, 2)
+        microbatches = trainer._iter_loss_microbatches(
+            {
+                "prompt_ids": torch.arange(8, dtype=torch.long).view(8, 1),
+                "prompt_mask": torch.ones((8, 1), dtype=torch.long),
+                "completion_ids": torch.arange(16, dtype=torch.long).view(8, 2),
+                "completion_mask": torch.ones((8, 2), dtype=torch.bool),
+                "advantages": torch.ones((8,), dtype=torch.float32),
+                "reference_token_log_probs": reference_token_log_probs,
+                "multimodal_inputs": [
+                    {"pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32)}
+                    for _ in range(8)
+                ],
+            }
+        )
+
+        self.assertEqual(len(microbatches), 2)
+        self.assertEqual(microbatches[0]["prompt_ids"].shape[0], 4)
+        self.assertEqual(microbatches[1]["prompt_ids"].shape[0], 4)
+        self.assertEqual(len(microbatches[0]["multimodal_inputs"]), 4)
+        self.assertEqual(len(microbatches[1]["multimodal_inputs"]), 4)
+        self.assertTrue(torch.equal(microbatches[0]["reference_token_log_probs"], reference_token_log_probs[:4]))
+        self.assertTrue(torch.equal(microbatches[1]["reference_token_log_probs"], reference_token_log_probs[4:]))
+
+    def test_zero_advantage_payload_replays_recent_nonzero_payload(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
         trainer._recent_nonzero_advantage_payloads = []
         trainer._recent_nonzero_advantage_payload_capacity = 8
         trainer._zero_advantage_replay_uses = 0
         trainer._zero_advantage_replay_misses = 0
+        trainer._zero_advantage_replay_last_source_video_ids = ""
+        trainer._zero_advantage_replay_last_reason = ""
+        trainer._zero_advantage_replay_rng = None
         trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
         trainer._episode_input_cpu_copy = TimesearchAlignedGRPOTrainerMixin._episode_input_cpu_copy.__get__(trainer)
+        trainer._count_local_trainable_samples = TimesearchAlignedGRPOTrainerMixin._count_local_trainable_samples.__get__(trainer)
+        trainer._payload_has_trainable_samples = TimesearchAlignedGRPOTrainerMixin._payload_has_trainable_samples.__get__(trainer)
         trainer._payload_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._payload_has_nonzero_advantage.__get__(trainer)
         trainer._episode_input_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._episode_input_has_nonzero_advantage.__get__(trainer)
         trainer._clone_generation_step_payload_for_replay = TimesearchAlignedGRPOTrainerMixin._clone_generation_step_payload_for_replay.__get__(trainer)
+        trainer._zero_advantage_replay_rng_instance = TimesearchAlignedGRPOTrainerMixin._zero_advantage_replay_rng_instance.__get__(trainer)
         trainer._maybe_store_nonzero_advantage_payload = TimesearchAlignedGRPOTrainerMixin._maybe_store_nonzero_advantage_payload.__get__(trainer)
         trainer._maybe_replay_zero_advantage_payload = TimesearchAlignedGRPOTrainerMixin._maybe_replay_zero_advantage_payload.__get__(trainer)
+        trainer._zero_advantage_replay_reason = TimesearchAlignedGRPOTrainerMixin._zero_advantage_replay_reason.__get__(trainer)
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer.args = types.SimpleNamespace(seed=123)
 
         nonzero_payload = {
             "episode_inputs": [
@@ -1362,11 +1938,15 @@ class RLRuntimeTests(unittest.TestCase):
 
         replayed = trainer._maybe_replay_zero_advantage_payload(zero_payload)
 
-        self.assertIs(replayed, zero_payload)
+        self.assertIsNot(replayed, zero_payload)
         self.assertEqual(replayed["video_ids"], ["zero_vid"])
-        self.assertEqual(float(replayed["episode_inputs"][0]["advantages"].item()), 0.0)
-        self.assertEqual(trainer._zero_advantage_replay_uses, 0)
-        self.assertEqual(trainer._zero_advantage_replay_misses, 1)
+        self.assertEqual(float(replayed["episode_inputs"][0]["advantages"].item()), 0.5)
+        self.assertEqual(replayed["runtime_stats"]["zero_advantage_replay_applied"], 1)
+        self.assertEqual(replayed["zero_advantage_replay_source_video_ids"], ["cached_vid"])
+        self.assertEqual(trainer._zero_advantage_replay_uses, 1)
+        self.assertEqual(trainer._zero_advantage_replay_misses, 0)
+        self.assertEqual(trainer._zero_advantage_replay_last_source_video_ids, "cached_vid")
+        self.assertEqual(trainer._zero_advantage_replay_last_reason, "all_zero_advantages")
 
     def test_zero_advantage_payload_without_cache_returns_original_payload(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -1374,12 +1954,23 @@ class RLRuntimeTests(unittest.TestCase):
         trainer._recent_nonzero_advantage_payload_capacity = 8
         trainer._zero_advantage_replay_uses = 0
         trainer._zero_advantage_replay_misses = 0
+        trainer._zero_advantage_replay_last_source_video_ids = ""
+        trainer._zero_advantage_replay_last_reason = ""
+        trainer._zero_advantage_replay_rng = None
         trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
         trainer._episode_input_cpu_copy = TimesearchAlignedGRPOTrainerMixin._episode_input_cpu_copy.__get__(trainer)
+        trainer._count_local_trainable_samples = TimesearchAlignedGRPOTrainerMixin._count_local_trainable_samples.__get__(trainer)
+        trainer._payload_has_trainable_samples = TimesearchAlignedGRPOTrainerMixin._payload_has_trainable_samples.__get__(trainer)
         trainer._payload_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._payload_has_nonzero_advantage.__get__(trainer)
         trainer._episode_input_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._episode_input_has_nonzero_advantage.__get__(trainer)
         trainer._clone_generation_step_payload_for_replay = TimesearchAlignedGRPOTrainerMixin._clone_generation_step_payload_for_replay.__get__(trainer)
         trainer._maybe_replay_zero_advantage_payload = TimesearchAlignedGRPOTrainerMixin._maybe_replay_zero_advantage_payload.__get__(trainer)
+        trainer._zero_advantage_replay_reason = TimesearchAlignedGRPOTrainerMixin._zero_advantage_replay_reason.__get__(trainer)
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer.args = types.SimpleNamespace(seed=123)
 
         zero_payload = {
             "episode_inputs": [
@@ -1402,6 +1993,209 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertIs(replayed, zero_payload)
         self.assertEqual(trainer._zero_advantage_replay_uses, 0)
         self.assertEqual(trainer._zero_advantage_replay_misses, 1)
+        self.assertEqual(replayed["runtime_stats"]["zero_advantage_replay_missed"], 1)
+        self.assertEqual(trainer._zero_advantage_replay_last_reason, "all_zero_advantages")
+
+    def test_zero_advantage_payload_is_not_stored_in_replay_cache(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._recent_nonzero_advantage_payloads = []
+        trainer._recent_nonzero_advantage_payload_capacity = 8
+        trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
+        trainer._episode_input_cpu_copy = TimesearchAlignedGRPOTrainerMixin._episode_input_cpu_copy.__get__(trainer)
+        trainer._count_local_trainable_samples = TimesearchAlignedGRPOTrainerMixin._count_local_trainable_samples.__get__(trainer)
+        trainer._payload_has_trainable_samples = TimesearchAlignedGRPOTrainerMixin._payload_has_trainable_samples.__get__(trainer)
+        trainer._payload_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._payload_has_nonzero_advantage.__get__(trainer)
+        trainer._episode_input_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._episode_input_has_nonzero_advantage.__get__(trainer)
+        trainer._clone_generation_step_payload_for_replay = TimesearchAlignedGRPOTrainerMixin._clone_generation_step_payload_for_replay.__get__(trainer)
+        trainer._maybe_store_nonzero_advantage_payload = TimesearchAlignedGRPOTrainerMixin._maybe_store_nonzero_advantage_payload.__get__(trainer)
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+
+        zero_payload = {
+            "episode_inputs": [
+                {
+                    "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+                    "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[2]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                    "advantages": torch.tensor([0.0], dtype=torch.float32),
+                }
+            ],
+            "runtime_stats": {},
+            "rollout_metrics": {},
+            "budgeting_metrics": {},
+            "video_ids": ["zero_vid"],
+        }
+
+        trainer._maybe_store_nonzero_advantage_payload(zero_payload)
+        self.assertEqual(len(trainer._recent_nonzero_advantage_payloads), 0)
+
+    def test_nonzero_replay_cache_materializes_old_policy_log_probs_when_model_is_provided(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._recent_nonzero_advantage_payloads = []
+        trainer._recent_nonzero_advantage_payload_capacity = 8
+        trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
+        trainer._episode_input_cpu_copy = TimesearchAlignedGRPOTrainerMixin._episode_input_cpu_copy.__get__(trainer)
+        trainer._count_local_trainable_samples = TimesearchAlignedGRPOTrainerMixin._count_local_trainable_samples.__get__(trainer)
+        trainer._payload_has_trainable_samples = TimesearchAlignedGRPOTrainerMixin._payload_has_trainable_samples.__get__(trainer)
+        trainer._payload_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._payload_has_nonzero_advantage.__get__(trainer)
+        trainer._episode_input_has_nonzero_advantage = TimesearchAlignedGRPOTrainerMixin._episode_input_has_nonzero_advantage.__get__(trainer)
+        trainer._clone_generation_step_payload_for_replay = TimesearchAlignedGRPOTrainerMixin._clone_generation_step_payload_for_replay.__get__(trainer)
+        trainer._maybe_store_nonzero_advantage_payload = TimesearchAlignedGRPOTrainerMixin._maybe_store_nonzero_advantage_payload.__get__(trainer)
+        trainer._populate_old_policy_log_probs = mock.Mock(
+            return_value=[
+                {
+                    "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+                    "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[2]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                    "advantages": torch.tensor([0.5], dtype=torch.float32),
+                    "old_policy_token_log_probs": torch.tensor([[0.2]], dtype=torch.float32),
+                }
+            ]
+        )
+        payload = {
+            "episode_inputs": [
+                {
+                    "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+                    "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[2]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                    "advantages": torch.tensor([0.5], dtype=torch.float32),
+                    "old_policy_token_log_probs": _USE_CURRENT_POLICY_LOGPROBS_SENTINEL,
+                }
+            ],
+            "runtime_stats": {},
+            "rollout_metrics": {},
+            "budgeting_metrics": {},
+            "video_ids": ["vid"],
+        }
+
+        trainer._maybe_store_nonzero_advantage_payload(payload, model=object())
+
+        trainer._populate_old_policy_log_probs.assert_called_once()
+        cached = trainer._recent_nonzero_advantage_payloads[0]["episode_inputs"][0]["old_policy_token_log_probs"]
+        self.assertTrue(torch.is_tensor(cached))
+
+    def test_active_rl_optimizer_proxy_skips_step_when_flagged(self) -> None:
+        optimizer = mock.Mock()
+        accelerator = types.SimpleNamespace(optimizer_step_was_skipped=False)
+        trainer = types.SimpleNamespace(
+            accelerator=accelerator,
+            _active_rl_skip_next_optimizer_step=True,
+            _optimizer_step_skips=0,
+        )
+        proxy = _ActiveRLOptimizerStepProxy(optimizer, trainer=trainer)
+
+        result = proxy.step()
+
+        self.assertIsNone(result)
+        optimizer.step.assert_not_called()
+        self.assertTrue(accelerator.optimizer_step_was_skipped)
+        self.assertFalse(trainer._active_rl_skip_next_optimizer_step)
+        self.assertEqual(trainer._optimizer_step_skips, 1)
+
+    def test_maybe_skip_empty_training_step_skips_all_zero_advantage_miss(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._skip_empty_training_steps = 0
+        trainer._all_empty_batch_skips = 0
+        trainer._active_rl_skip_next_optimizer_step = False
+        trainer._active_rl_window_had_trainable_signal = False
+        trainer._active_rl_last_skip_reason = ""
+        trainer._count_local_trainable_samples = lambda episode_inputs: 2
+        trainer._maybe_log_empty_batch_rank_summary = lambda **kwargs: None
+        trainer._mark_skip_next_optimizer_step = TimesearchAlignedGRPOTrainerMixin._mark_skip_next_optimizer_step.__get__(trainer)
+        model = types.SimpleNamespace(parameters=lambda: iter([torch.nn.Parameter(torch.tensor([1.0]))]))
+        inputs = {
+            "episode_inputs": [
+                {
+                    "prompt_ids": torch.tensor([[1], [1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[2], [2]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1], [1]], dtype=torch.bool),
+                    "advantages": torch.tensor([0.0, 0.0], dtype=torch.float32),
+                }
+            ],
+            "runtime_stats": {"zero_advantage_replay_missed": 1},
+        }
+
+        with mock.patch.object(aligned_grpo_module, "_distributed_sum_int", return_value=2), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_bool_consensus",
+            return_value=(False, False),
+        ):
+            skipped = trainer._maybe_skip_empty_training_step(model, inputs)
+
+        self.assertTrue(torch.is_tensor(skipped))
+        self.assertFalse(trainer._active_rl_skip_next_optimizer_step)
+        self.assertEqual(trainer._active_rl_last_skip_reason, "all_zero_advantages")
+
+    def test_maybe_skip_empty_training_step_uses_mixed_rank_reason(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._skip_empty_training_steps = 0
+        trainer._all_empty_batch_skips = 0
+        trainer._active_rl_skip_next_optimizer_step = False
+        trainer._active_rl_window_had_trainable_signal = False
+        trainer._active_rl_last_skip_reason = ""
+        trainer._count_local_trainable_samples = lambda episode_inputs: 2
+        trainer._maybe_log_empty_batch_rank_summary = lambda **kwargs: None
+        model = types.SimpleNamespace(parameters=lambda: iter([torch.nn.Parameter(torch.tensor([1.0]))]))
+        inputs = {
+            "episode_inputs": [
+                {
+                    "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[2]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                    "advantages": torch.tensor([0.0], dtype=torch.float32),
+                }
+            ],
+            "runtime_stats": {"zero_advantage_replay_missed": 1},
+        }
+
+        with mock.patch.object(aligned_grpo_module, "_distributed_sum_int", return_value=2), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_bool_consensus",
+            return_value=(False, True),
+        ):
+            skipped = trainer._maybe_skip_empty_training_step(model, inputs)
+
+        self.assertTrue(torch.is_tensor(skipped))
+        self.assertEqual(trainer._active_rl_last_skip_reason, "mixed_rank_zero_advantage_replay_state")
+
+    def test_training_step_clears_skip_flag_when_later_substep_has_signal(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.accelerator = mock.Mock()
+        trainer.accelerator.distributed_type = "DEEPSPEED"
+        trainer.accelerator.sync_gradients = False
+        trainer.use_liger_loss = False
+        trainer.compute_loss_context_manager = lambda: contextlib.nullcontext()
+        trainer._prepare_inputs = lambda inputs: inputs
+        trainer._maybe_skip_empty_training_step = mock.Mock(side_effect=[torch.tensor(0.0), None])
+        trainer.compute_loss = mock.Mock(return_value=torch.tensor(1.0, requires_grad=True))
+        trainer.args = type("Args", (), {"n_gpu": 1})()
+        trainer.current_gradient_accumulation_steps = 1
+        trainer.model_accepts_loss_kwargs = False
+        trainer.compute_loss_func = None
+        trainer._active_rl_skip_next_optimizer_step = False
+        trainer._active_rl_window_had_trainable_signal = False
+        trainer._active_rl_last_skip_reason = "all_zero_advantages"
+        trainer._optimizer_step_skips = 0
+        trainer._all_empty_batch_skips = 0
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        trainer.training_step(model, {"episode_inputs": [], "runtime_stats": {}}, num_items_in_batch=None)
+        self.assertFalse(trainer._active_rl_skip_next_optimizer_step)
+        self.assertFalse(trainer._active_rl_window_had_trainable_signal)
+
+        trainer.accelerator.sync_gradients = True
+        trainer.training_step(model, {"episode_inputs": [{"completion_mask": torch.tensor([[1]])}], "runtime_stats": {}}, num_items_in_batch=None)
+        self.assertFalse(trainer._active_rl_skip_next_optimizer_step)
 
     def test_trl_runner_build_dataset_requires_materialized_runtime_cache_path(self) -> None:
         runner = object.__new__(TrlVllmGrpoRunner)

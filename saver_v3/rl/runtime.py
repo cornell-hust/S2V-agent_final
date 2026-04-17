@@ -215,7 +215,7 @@ class RLJobConfig:
     max_image_side: int = 640
     max_image_pixels: int = 0
     keep_recent_text_messages: int = 20
-    keep_recent_tool_image_messages: int = 0
+    keep_recent_tool_image_messages: int = 3
     num_preview_frames: int = 8
     proposal_model_path: str = ""
     proposal_torch_dtype: str = "auto"
@@ -397,7 +397,7 @@ class RLJobConfig:
             max_image_side=int(((model_config.get("vision") or {}).get("max_image_side", 640)) or 640),
             max_image_pixels=int(((model_config.get("vision") or {}).get("max_image_pixels", 0)) or 0),
             keep_recent_text_messages=int(optimization.get("keep_recent_text_messages", 20) or 20),
-            keep_recent_tool_image_messages=int(optimization.get("keep_recent_tool_image_messages", 0) or 0),
+            keep_recent_tool_image_messages=int(optimization.get("keep_recent_tool_image_messages", 3) or 3),
             num_preview_frames=int(optimization.get("num_preview_frames", 8) or 8),
             proposal_model_path=str(proposal_cfg.get("model_path") or "").strip(),
             proposal_torch_dtype=str(proposal_cfg.get("torch_dtype") or "auto"),

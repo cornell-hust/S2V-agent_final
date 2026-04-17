@@ -46,8 +46,9 @@ optimization:
   policy_top_p: 0.95
   policy_top_k: 50
   policy_repetition_penalty: 1.02
-  gradient_accumulation_steps: 22
+  gradient_accumulation_steps: 8
   rl_steps_per_generation: 1
+  keep_recent_tool_image_messages: 3
   rollout_stage_batch_size: 8
   fecv_stage_batch_size: 8
   vllm_max_num_seqs: 2
