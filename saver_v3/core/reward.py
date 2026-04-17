@@ -153,22 +153,13 @@ def build_timesearch_reward_funcs(
     reward_config: Optional[Dict[str, Any]] = None,
     llm_judge: Optional[OpenAICompatibleLlmJudge] = None,
     reward_version: str = "timesearch_v3",
-    include_aux_decision_fields: bool = True,
-    include_counterfactual_type_in_fecv: bool = True,
 ) -> List[Any]:
     del reward_config
     judge = llm_judge or OpenAICompatibleLlmJudge()
 
     def accuracy_reward(*, rollout_traces: Sequence[Dict[str, Any]], **_: Any) -> List[float]:
         return [
-            float(
-                _compute_accuracy_breakdown(
-                    rollout_trace,
-                    llm_judge=judge,
-                    reward_version=reward_version,
-                    include_aux_decision_fields=include_aux_decision_fields,
-                )["accuracy_reward"]
-            )
+            float(_compute_accuracy_breakdown(rollout_trace, llm_judge=judge, reward_version=reward_version)["accuracy_reward"])
             for rollout_trace in list(rollout_traces or [])
         ]
 
@@ -181,15 +172,7 @@ def build_timesearch_reward_funcs(
         for rollout_trace in list(rollout_traces or []):
             profile = _extract_counterfactual_profile(rollout_trace)
             target = _infer_target(rollout_trace)
-            values.append(
-                float(
-                    _timesearch_fecv_reward(
-                        profile,
-                        target=target,
-                        include_counterfactual_type=include_counterfactual_type_in_fecv,
-                    )
-                )
-            )
+            values.append(float(_timesearch_fecv_reward(profile, target=target)))
         return values
 
     def protocol_finalize_reward(*, rollout_traces: Sequence[Dict[str, Any]], **_: Any) -> List[float]:
@@ -762,7 +745,6 @@ def _compute_accuracy_breakdown(
     *,
     llm_judge: Optional[OpenAICompatibleLlmJudge] = None,
     reward_version: str = "timesearch_v3",
-    include_aux_decision_fields: bool = True,
 ) -> Dict[str, Any]:
     structured_target = _infer_target(rollout_trace)
     semantic_payload = _infer_semantic_payload(rollout_trace)
@@ -796,14 +778,14 @@ def _compute_accuracy_breakdown(
             family_scores["multiple_choice"].append(category_score)
             type_scores["category"] = category_score
 
-        if include_aux_decision_fields and structured_target.get("severity") is not None:
+        if structured_target.get("severity") is not None:
             severity_score = 1.0 if _normalize_severity(final_prediction.get("severity")) == _normalize_severity(structured_target.get("severity")) else 0.0
             if not _is_v3:  # v3: no primary metric for severity
                 family_scores["multiple_choice"].append(severity_score)
             type_scores["severity"] = severity_score
 
         target_counterfactual_type = _normalize_counterfactual_type(structured_target.get("counterfactual_type"))
-        if include_aux_decision_fields and target_counterfactual_type != "none":
+        if target_counterfactual_type != "none":
             prediction_counterfactual_type = _normalize_counterfactual_type(final_prediction.get("counterfactual_type"))
             counterfactual_score = 1.0 if prediction_counterfactual_type == target_counterfactual_type else 0.0
             if not _is_v3:  # v3: no primary metric for counterfactual_type
@@ -881,7 +863,6 @@ def _timesearch_selected_support_score(
     profile: Dict[str, Any],
     *,
     target: Dict[str, Any],
-    include_counterfactual_type: bool = True,
 ) -> float:
     """Continuous evidence support score -- NO hard boolean gate.
 
@@ -898,7 +879,7 @@ def _timesearch_selected_support_score(
     decision_keys = ["existence", "category"]
     if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
         decision_keys.append("temporal")
-    if include_counterfactual_type and _target_requires_counterfactual_type(target):
+    if _target_requires_counterfactual_type(target):
         decision_keys.append("counterfactual_type")
     # Continuous scores -- no boolean gating. Each field contributes its raw score.
     decision_scores = [_safe_float((fields.get(key) or {}).get("score"), 0.0) for key in decision_keys if key in fields]
@@ -917,7 +898,6 @@ def _timesearch_fecv_reward(
     profile: Dict[str, Any],
     *,
     target: Dict[str, Any],
-    include_counterfactual_type: bool = True,
 ) -> float:
     """Continuous FECV reward.
 
@@ -941,11 +921,7 @@ def _timesearch_fecv_reward(
     online_core = normalized_branch_profile == "online_core"
 
     # Term 1: Continuous evidence support (no boolean gate)
-    selected_support = _timesearch_selected_support_score(
-        profile,
-        target=target,
-        include_counterfactual_type=include_counterfactual_type,
-    )
+    selected_support = _timesearch_selected_support_score(profile, target=target)
 
     # Term 2: Trigger necessity -- continuous delta from drop_trigger branch
     drop_trigger_delta = dict((branch_delta_matrix.get("drop_trigger") or {}).get("fields") or {})

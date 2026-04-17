@@ -458,12 +458,6 @@ class _NativeGRPOProgressReporter:
         self.last_video_id = ""
         self.last_stage = ""
 
-    def reset_iteration_state(self) -> None:
-        self.processed_groups = 0
-        self.batch_index = 0
-        self.last_video_id = ""
-        self.last_stage = ""
-
     def set_total_groups(self, total_groups: int) -> None:
         self.total_groups = max(0, int(total_groups))
 
@@ -490,10 +484,11 @@ class _NativeGRPOProgressReporter:
     def finish_item(self, *, video_id: str) -> None:
         self.processed_groups += 1
         self.last_video_id = str(video_id or "")
+        total_display = int(self.total_groups) if self.total_groups > 0 else "?"
         runtime_log(
             (
                 f"RL rank progress: iter={int(self.iteration_index) + 1}/{int(self.num_iterations)} "
-                f"batch={int(self.batch_index)} local_groups_processed={int(self.processed_groups)}"
+                f"batch={int(self.batch_index)} groups={int(self.processed_groups)}/{total_display}"
             ),
             runtime=self.runtime,
             main_process_only=False,
