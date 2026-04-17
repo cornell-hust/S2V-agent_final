@@ -1332,8 +1332,14 @@ class _NativeGRPOTrainerMixin:
                     generation_id=int(generation_id),
                     stage="rollout",
                 )
-            rollout["group_id"] = str(item.get("video_id") or f"group_{generation_id}")
+            rollout["group_id"] = str(
+                item.get("rl_instance_id")
+                or item.get("video_id")
+                or f"group_{generation_id}"
+            )
             rollout["generation_id"] = int(generation_id)
+            if item.get("source_video_id") is not None:
+                rollout["source_video_id"] = str(item.get("source_video_id") or "")
             if isinstance(item.get("structured_target"), dict):
                 rollout["scoring_target"] = copy.deepcopy(item["structured_target"])
             if isinstance(item.get("qa_pairs"), list):
@@ -2363,6 +2369,10 @@ def run_trainer_native_grpo(
     reference_model_resolver: Any,
     select_iteration_indices_fn: Any,
 ) -> Dict[str, Any]:
+    raise RuntimeError(
+        "idea2_v3 RL has converged on saver_v3.cli.train_rl_ds -> train_saver_rl_trl.py; "
+        "the legacy native GRPO backend is deprecated and unsupported."
+    )
     runtime = runtime or distributed_runtime_from_env()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2506,12 +2516,21 @@ def run_trainer_native_grpo(
         iter_dir = output_dir / f"iter_{int(iteration):03d}"
         checkpoint_dir = iter_dir / "checkpoint"
         iter_dir.mkdir(parents=True, exist_ok=True)
-        indices = select_iteration_indices_fn(
-            len(raw_records),
-            args.rollout_count,
-            args.rollout_start_index,
-            iteration,
-        )
+        try:
+            indices = select_iteration_indices_fn(
+                len(raw_records),
+                args.rollout_count,
+                args.rollout_start_index,
+                iteration,
+                seed=getattr(args, "seed", 42),
+            )
+        except TypeError:
+            indices = select_iteration_indices_fn(
+                len(raw_records),
+                args.rollout_count,
+                args.rollout_start_index,
+                iteration,
+            )
         items = [dataset[int(index)] for index in indices]
         summary: Dict[str, Any] = {
             "iteration": int(iteration),

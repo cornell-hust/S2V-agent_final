@@ -8,6 +8,6 @@ This directory stores the owned v3 runtime contract.
 - `sft/` contains the full-model SFT template for `train_sft_ds`; it now consumes `data.prepared_data_path`.
 - `inference/` contains the full-rollout policy inference template for `run_policy_rollout_vllm`.
 - `rollout_eval/` contains the raw-SAVER rollout-eval template for `run_sft_rollout_eval_vllm`.
-- `rl/` contains the full-model RL template for `train_rl_ds`.
+- `rl/` contains the full-model active RL template for `train_rl_ds`; it now requires materialized runtime item caches and the pure-pack episode GRPO route.
 
 These files are implementation-facing, not placeholder stubs.

@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, Sequence
 import train_saver_rl_trl as legacy_train_saver_rl_trl
 
 from saver_v3.core.reward import (
+    DEFAULT_RL_REWARD_VERSION,
     DEFAULT_COMPONENT_WEIGHTS,
     LEGACY_COMPONENT_ALIASES,
     TIMESARCH_COMPONENT_ALIASES,
@@ -17,6 +18,25 @@ from saver_v3.core.reward import (
 )
 from saver_v3.cli.common import apply_config_overrides, load_yaml_mapping, resolve_path, write_json
 from saver_v3.common import ensure_fa3_training_ready
+
+
+REMOVED_ACTIVE_RL_CONFIG_FIELDS = {
+    "optimization.rl_replay_buffer_enable": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.rl_replay_buffer_type": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.rl_replay_buffer_capacity": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.rl_replay_buffer_alpha": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.replay_buffer_enable": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.replay_buffer_type": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.replay_buffer_capacity": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.replay_buffer_alpha": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "optimization.rl_all_empty_policy": "legacy empty-batch policy was removed because active RL now always uses donor no-op padding on pure-pack episode_inputs.",
+    "optimization.all_empty_policy": "legacy empty-batch policy was removed because active RL now always uses donor no-op padding on pure-pack episode_inputs.",
+    "rewards.open_ended_judge_enabled": "external LLM judging was removed from the RL reward path; active RL now uses only built-in lexical semantic scoring.",
+    "rewards.open_ended_judge_base_url": "external LLM judging was removed from the RL reward path; active RL now uses only built-in lexical semantic scoring.",
+    "rewards.open_ended_judge_model": "external LLM judging was removed from the RL reward path; active RL now uses only built-in lexical semantic scoring.",
+    "rewards.open_ended_judge_cache_path": "external LLM judging was removed from the RL reward path; active RL now uses only built-in lexical semantic scoring.",
+    "rewards.open_ended_judge_timeout_sec": "external LLM judging was removed from the RL reward path; active RL now uses only built-in lexical semantic scoring.",
+}
 
 
 def _resolve_bool(mapping: Mapping[str, Any], key: str, default: bool) -> bool:
@@ -48,8 +68,45 @@ def _normalize_vllm_mode(*, engine: Any, launcher: Any) -> str:
     return normalized or "colocate"
 
 
+def _deepspeed_config_uses_param_offload(config_path: str | Path | None) -> bool:
+    config_text = str(config_path or "").strip()
+    if not config_text:
+        return False
+    try:
+        payload = json.loads(Path(config_text).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    zero_optimization = payload.get("zero_optimization") or {}
+    offload_param = zero_optimization.get("offload_param") or {}
+    if not isinstance(offload_param, Mapping) or not offload_param:
+        return False
+    device = str(offload_param.get("device") or "").strip().lower()
+    return device not in {"", "none"}
+
+
+def _resolve_liger_compatible_deepspeed_config(config_path: str | Path | None) -> tuple[str | None, bool, str]:
+    config_text = str(config_path or "").strip()
+    if not config_text:
+        return None, False, ""
+    resolved = Path(config_text).expanduser().resolve()
+    if not _deepspeed_config_uses_param_offload(resolved):
+        return str(resolved), False, ""
+    fallback = resolved.with_name("zero2_rl.json")
+    if not fallback.exists():
+        raise FileNotFoundError(
+            "Liger-compatible DeepSpeed config requires a non-offload ZeRO-3 config next to the current RL config: "
+            f"requested={resolved} expected_fallback={fallback}"
+        )
+    reason = (
+        "Active RL uses Liger loss by default, and Liger + ZeRO-3 parameter offload causes extremely slow "
+        "compute_loss forwards in idea2_v3. Switching to zero2_rl.json keeps training semantics unchanged "
+        "while moving RL to the faster ZeRO-2 path."
+    )
+    return str(fallback), True, reason
+
+
 def _supported_reward_weight_keys(reward_version: str) -> set[str]:
-    normalized = str(reward_version or "timesearch_v2").strip().lower()
+    normalized = str(reward_version or DEFAULT_RL_REWARD_VERSION).strip().lower()
     if normalized == "timesearch_v1":
         return set(TIMESARCH_V1_COMPONENT_WEIGHTS) | set(TIMESARCH_COMPONENT_ALIASES)
     if normalized == "timesearch_v3":
@@ -84,6 +141,23 @@ def _extract_reward_weight_mapping(rewards: Mapping[str, Any], *, reward_version
     return weight_mapping
 
 
+def _reject_removed_active_rl_config_fields(config: Mapping[str, Any]) -> None:
+    for dotted_key, reason in REMOVED_ACTIVE_RL_CONFIG_FIELDS.items():
+        cursor: Any = config
+        found = True
+        for segment in dotted_key.split("."):
+            if isinstance(cursor, Mapping) and segment in cursor:
+                cursor = cursor[segment]
+            else:
+                found = False
+                break
+        if found:
+            raise ValueError(
+                f"Removed active RL config field `{dotted_key}` is no longer supported: {reason} "
+                "Migrate to the current default saver_v3.cli.train_rl_ds pure-pack episode GRPO route."
+            )
+
+
 @dataclass
 class RLJobConfig:
     run_name: str
@@ -103,30 +177,34 @@ class RLJobConfig:
     rollout_backend: str
     rollout_config: str
     deepspeed_config_path: str | None
+    requested_deepspeed_config_path: str | None = None
+    liger_deepspeed_auto_switched: bool = False
+    liger_deepspeed_switch_reason: str = ""
     materialized_train_items_path: str = ""
     materialized_eval_items_path: str = ""
     require_materialized_runtime_cache: bool = False
-    include_splits: str
-    eval_include_splits: str
-    policy_init_from: str
-    reference_model: str
-    base_model: str
-    torch_dtype: str
-    attn_implementation: str
-    gradient_checkpointing: bool
-    rollout_backend: str
-    rollout_config: str
-    deepspeed_config_path: str | None
-    reward_version: str = "timesearch_v2"
+    reward_version: str = DEFAULT_RL_REWARD_VERSION
     reward_config: Dict[str, Any] = field(default_factory=dict)
     num_iterations: int = 1
     num_train_epochs: float = 1.0
     learning_rate: float = 5e-7
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 8
+    min_weight: float = 0.1
+    advantage_clip: float = 3.0
+    ppo_clip_epsilon: float = 0.2
+    kl_beta: float = 0.0
+    rl_steps_per_generation: int = 4
+    rollout_stage_batch_size: int = 16
+    fecv_stage_batch_size: int = 16
     rollout_count: int = 16
     num_generations: int = 8
     rollout_max_turns: int = 14
+    policy_do_sample: bool = False
+    policy_temperature: float | None = None
+    policy_top_p: float | None = None
+    policy_top_k: int | None = None
+    policy_repetition_penalty: float | None = None
     logging_steps: int = 10
     save_steps: int = 100
     save_total_limit: int = 2
@@ -148,6 +226,8 @@ class RLJobConfig:
     vllm_mode: str = "colocate"
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.35
+    vllm_max_num_seqs: int = 4
+    vllm_fallback_max_num_seqs: int = 2
     vllm_guided_decoding_regex: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -166,6 +246,7 @@ class RLJobConfig:
         resolved_config_path = resolve_path(config_path)
         config_anchor = (resolved_config_path or Path(config_path).expanduser()).resolve().parent
         config = apply_config_overrides(load_yaml_mapping(config_path), config_overrides)
+        _reject_removed_active_rl_config_fields(config)
         model_config = load_yaml_mapping(model_config_path)
         attention_config = load_yaml_mapping(attention_config_path)
         rollout_config_path = str(config.get("rollout_config") or "").strip()
@@ -177,6 +258,12 @@ class RLJobConfig:
         logging_cfg = dict(config.get("logging") or {})
         rewards = dict(config.get("rewards") or {})
         proposal_cfg = dict(config.get("proposal") or {})
+        explicit_reference_model = str(config.get("reference_model") or "").strip()
+        if explicit_reference_model:
+            raise ValueError(
+                "Active RL no longer accepts `reference_model` in config; "
+                "reference now follows the per-iteration trainer init model in TimeSearch-R style."
+            )
         rollout_engine = str(rollout_config.get("engine") or "").strip()
         server_cfg = dict(rollout_config.get("server") or {})
         client_cfg = dict(rollout_config.get("client") or {})
@@ -188,6 +275,17 @@ class RLJobConfig:
             if (deepspeed_config_path or str(config.get("deepspeed_config") or "").strip())
             else None
         )
+        requested_deepspeed_config_path = (
+            str(resolved_deepspeed_config_path) if resolved_deepspeed_config_path is not None else None
+        )
+        liger_deepspeed_auto_switched = False
+        liger_deepspeed_switch_reason = ""
+        if resolved_deepspeed_config_path is not None:
+            (
+                resolved_deepspeed_config_path,
+                liger_deepspeed_auto_switched,
+                liger_deepspeed_switch_reason,
+            ) = _resolve_liger_compatible_deepspeed_config(resolved_deepspeed_config_path)
         if str(attention_config.get("policy_name") or "").strip() != "fa3_only":
             raise ValueError("idea2_v3 requires attention policy fa3_only for RL")
         if str(model_config.get("attn_implementation") or "").strip() != "flash_attention_3":
@@ -195,20 +293,10 @@ class RLJobConfig:
         if str(config.get("rollout_backend") or "vllm").strip().lower() != "vllm":
             raise ValueError("idea2_v3 RL currently supports only rollout_backend=vllm")
         reward_config: Dict[str, Any] = {}
-        reward_version = str(rewards.get("reward_version") or "timesearch_v2")
+        reward_version = str(rewards.get("reward_version") or DEFAULT_RL_REWARD_VERSION)
         weight_mapping = _extract_reward_weight_mapping(rewards, reward_version=reward_version)
         if weight_mapping:
             reward_config["weights"] = weight_mapping
-        if "open_ended_judge_enabled" in rewards:
-            reward_config["open_ended_judge_enabled"] = _resolve_bool(rewards, "open_ended_judge_enabled", True)
-        if "open_ended_judge_base_url" in rewards:
-            reward_config["open_ended_judge_base_url"] = str(rewards.get("open_ended_judge_base_url") or "")
-        if "open_ended_judge_model" in rewards:
-            reward_config["open_ended_judge_model"] = str(rewards.get("open_ended_judge_model") or "")
-        if "open_ended_judge_cache_path" in rewards:
-            reward_config["open_ended_judge_cache_path"] = str(rewards.get("open_ended_judge_cache_path") or "")
-        if "open_ended_judge_timeout_sec" in rewards:
-            reward_config["open_ended_judge_timeout_sec"] = float(rewards.get("open_ended_judge_timeout_sec") or 30.0)
         return cls(
             run_name=str(config.get("run_name") or "qwen3_vl_8b_grpo_ds8"),
             output_dir=str(config.get("output_dir") or "artifacts/rl/qwen3_vl_8b_grpo"),
@@ -222,7 +310,7 @@ class RLJobConfig:
             include_splits=str((data.get("include_splits") or "")).strip(),
             eval_include_splits=str((data.get("eval_include_splits") or data.get("include_splits") or "")).strip(),
             policy_init_from=str(config.get("policy_init_from") or "").strip(),
-            reference_model=str(config.get("reference_model") or model_config.get("base_model") or "").strip(),
+            reference_model="",
             base_model=str(model_config.get("base_model") or "").strip(),
             torch_dtype=str(model_config.get("torch_dtype") or "bfloat16"),
             attn_implementation=str(model_config.get("attn_implementation") or "flash_attention_3"),
@@ -230,6 +318,9 @@ class RLJobConfig:
             rollout_backend="vllm",
             rollout_config=str(resolved_rollout_config_path) if resolved_rollout_config_path is not None else rollout_config_path,
             deepspeed_config_path=(str(resolved_deepspeed_config_path) if resolved_deepspeed_config_path is not None else None),
+            requested_deepspeed_config_path=requested_deepspeed_config_path,
+            liger_deepspeed_auto_switched=bool(liger_deepspeed_auto_switched),
+            liger_deepspeed_switch_reason=str(liger_deepspeed_switch_reason or ""),
             reward_version=reward_version,
             reward_config=reward_config,
             num_iterations=int(optimization.get("num_iterations", optimization.get("num_updates", 1)) or 1),
@@ -237,9 +328,65 @@ class RLJobConfig:
             learning_rate=float(optimization.get("learning_rate", 5e-7) or 5e-7),
             per_device_train_batch_size=int(optimization.get("per_device_batch_size", optimization.get("per_device_train_batch_size", 1)) or 1),
             gradient_accumulation_steps=int(optimization.get("gradient_accumulation_steps", 8) or 8),
+            min_weight=(
+                float(optimization.get("min_weight"))
+                if optimization.get("min_weight") is not None
+                else 0.1
+            ),
+            advantage_clip=(
+                float(optimization.get("advantage_clip"))
+                if optimization.get("advantage_clip") is not None
+                else 3.0
+            ),
+            ppo_clip_epsilon=(
+                float(optimization.get("ppo_clip_epsilon"))
+                if optimization.get("ppo_clip_epsilon") is not None
+                else 0.2
+            ),
+            kl_beta=(
+                float(optimization.get("kl_beta"))
+                if optimization.get("kl_beta") is not None
+                else 0.0
+            ),
+            rl_steps_per_generation=int(optimization.get("rl_steps_per_generation", optimization.get("steps_per_generation", 4)) or 4),
+            rollout_stage_batch_size=int(optimization.get("rollout_stage_batch_size", 16) or 16),
+            fecv_stage_batch_size=int(optimization.get("fecv_stage_batch_size", 16) or 16),
             rollout_count=int(optimization.get("rollout_count", 16) or 16),
             num_generations=int(optimization.get("num_generations", 8) or 8),
             rollout_max_turns=int(optimization.get("rollout_max_turns", 14) or 14),
+            policy_do_sample=_resolve_bool(optimization, "policy_do_sample", False),
+            policy_temperature=(
+                float(optimization.get("policy_temperature"))
+                if optimization.get("policy_temperature") is not None
+                else (
+                    float(client_cfg.get("temperature"))
+                    if client_cfg.get("temperature") is not None
+                    else None
+                )
+            ),
+            policy_top_p=(
+                float(optimization.get("policy_top_p"))
+                if optimization.get("policy_top_p") is not None
+                else (
+                    float(client_cfg.get("top_p"))
+                    if client_cfg.get("top_p") is not None
+                    else None
+                )
+            ),
+            policy_top_k=(
+                int(optimization.get("policy_top_k"))
+                if optimization.get("policy_top_k") is not None
+                else (
+                    int(client_cfg.get("top_k"))
+                    if client_cfg.get("top_k") is not None
+                    else None
+                )
+            ),
+            policy_repetition_penalty=(
+                float(optimization.get("policy_repetition_penalty"))
+                if optimization.get("policy_repetition_penalty") is not None
+                else None
+            ),
             logging_steps=int(logging_cfg.get("logging_steps", logging_cfg.get("log_every_n_steps", 10)) or 10),
             save_steps=int(logging_cfg.get("save_steps", logging_cfg.get("save_every_n_steps", 100)) or 100),
             save_total_limit=int(logging_cfg.get("save_total_limit", 2) or 2),
@@ -261,6 +408,8 @@ class RLJobConfig:
             vllm_mode=normalized_vllm_mode,
             vllm_tensor_parallel_size=int(server_cfg.get("tensor_parallel_size", 1) or 1),
             vllm_gpu_memory_utilization=float(server_cfg.get("gpu_memory_utilization", 0.9) or 0.9),
+            vllm_max_num_seqs=int(optimization.get("vllm_max_num_seqs", 4) or 4),
+            vllm_fallback_max_num_seqs=int(optimization.get("vllm_fallback_max_num_seqs", 2) or 2),
             vllm_guided_decoding_regex=str(client_cfg.get("guided_decoding_regex") or "").strip(),
         )
 
@@ -287,12 +436,11 @@ def _append_flag(argv: list[str], flag: str, value: str | None) -> None:
         argv.extend([flag, text])
 
 
-def build_legacy_rl_trl_argv(job: RLJobConfig) -> list[str]:
+def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
     argv: list[str] = [
         "--data", job.train_manifest,
         "--output-dir", job.output_dir,
         "--model-path", job.policy_init_from,
-        "--reference-model-path", job.reference_model or job.base_model,
         "--num-iterations", str(job.num_iterations),
         "--rollout-count", str(job.rollout_count),
         "--num-generations", str(job.num_generations),
@@ -301,6 +449,10 @@ def build_legacy_rl_trl_argv(job: RLJobConfig) -> list[str]:
         "--num-train-epochs", str(job.num_train_epochs),
         "--per-device-train-batch-size", str(job.per_device_train_batch_size),
         "--gradient-accumulation-steps", str(job.gradient_accumulation_steps),
+        "--min-weight", str(job.min_weight),
+        "--advantage-clip", str(job.advantage_clip),
+        "--ppo-clip-epsilon", str(job.ppo_clip_epsilon),
+        "--kl-beta", str(job.kl_beta),
         "--logging-steps", str(job.logging_steps),
         "--save-steps", str(job.save_steps),
         "--save-total-limit", str(job.save_total_limit),
@@ -314,12 +466,13 @@ def build_legacy_rl_trl_argv(job: RLJobConfig) -> list[str]:
         "--keep-recent-tool-image-messages", str(job.keep_recent_tool_image_messages),
         "--num-preview-frames", str(job.num_preview_frames),
         "--rl-reward-version", job.reward_version,
-        "--rl-steps-per-generation", "1",
-        "--use-vllm", "true",
-        "--vllm-mode", job.vllm_mode,
+        "--rl-steps-per-generation", str(job.rl_steps_per_generation),
+        "--rollout-stage-batch-size", str(job.rollout_stage_batch_size),
+        "--fecv-stage-batch-size", str(job.fecv_stage_batch_size),
         "--vllm-tensor-parallel-size", str(job.vllm_tensor_parallel_size),
         "--vllm-gpu-memory-utilization", str(job.vllm_gpu_memory_utilization),
-        "--rl-open-ended-judge-enabled", str(bool(job.reward_config.get("open_ended_judge_enabled", True))).lower(),
+        "--vllm-max-num-seqs", str(job.vllm_max_num_seqs),
+        "--vllm-fallback-max-num-seqs", str(job.vllm_fallback_max_num_seqs),
         "--rl-reward-config-json", json.dumps(job.reward_config, ensure_ascii=False),
     ]
     if job.gradient_checkpointing:
@@ -328,6 +481,9 @@ def build_legacy_rl_trl_argv(job: RLJobConfig) -> list[str]:
         argv.append("--bf16")
     if job.fp16:
         argv.append("--fp16")
+    if job.policy_do_sample:
+        argv.append("--policy-do-sample")
+    argv.extend(["--use-liger-loss", "false"])
     _append_flag(argv, "--include-splits", job.include_splits)
     _append_flag(argv, "--data-root", job.data_root)
     _append_flag(argv, "--eval-data", job.eval_manifest)
@@ -344,6 +500,10 @@ def build_legacy_rl_trl_argv(job: RLJobConfig) -> list[str]:
     _append_flag(argv, "--eval-proposal-device", job.eval_proposal_device)
     _append_flag(argv, "--deepspeed", job.deepspeed_config_path)
     _append_flag(argv, "--vllm-guided-decoding-regex", job.vllm_guided_decoding_regex)
+    _append_flag(argv, "--policy-temperature", job.policy_temperature)
+    _append_flag(argv, "--policy-top-p", job.policy_top_p)
+    _append_flag(argv, "--policy-top-k", job.policy_top_k)
+    _append_flag(argv, "--policy-repetition-penalty", job.policy_repetition_penalty)
     return argv
 
 
@@ -355,12 +515,20 @@ def run_rl_job(job: RLJobConfig) -> RLRunResult:
     ensure_fa3_training_ready(require_gpu=True)
     output_dir = Path(job.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    argv = build_legacy_rl_trl_argv(job)
+    argv = build_active_rl_trl_argv(job)
     launch_manifest_path = write_json(
         {
             "entrypoint": "train_saver_rl_trl.py",
+            "episode_grpo_pure_pack": True,
+            "use_liger_loss": False,
+            "rl_replay_buffer_supported": False,
+            "rl_replay_buffer_mode": "disabled_episode_grpo",
             "argv": argv,
             "config": job.to_dict(),
+            "requested_deepspeed_config_path": job.requested_deepspeed_config_path,
+            "effective_deepspeed_config_path": job.deepspeed_config_path,
+            "liger_deepspeed_auto_switched": bool(job.liger_deepspeed_auto_switched),
+            "liger_deepspeed_switch_reason": str(job.liger_deepspeed_switch_reason or ""),
         },
         output_dir / "rl_launch_manifest.json",
     )
@@ -370,7 +538,11 @@ def run_rl_job(job: RLJobConfig) -> RLRunResult:
         {
             "run_name": job.run_name,
             "output_dir": str(output_dir),
-            "legacy_entrypoint": "train_saver_rl_trl.py",
+            "entrypoint": "train_saver_rl_trl.py",
+            "episode_grpo_pure_pack": True,
+            "use_liger_loss": False,
+            "rl_replay_buffer_supported": False,
+            "rl_replay_buffer_mode": "disabled_episode_grpo",
             "launch_manifest_path": str(launch_manifest_path),
         }
     )
@@ -384,7 +556,15 @@ def run_rl_job(job: RLJobConfig) -> RLRunResult:
         launch_manifest_path=str(launch_manifest_path),
         notes=[
             "RL now dispatches through the TRL + vLLM GRPO route.",
-            f"reference_model={job.reference_model or job.base_model}",
+            f"reference_model_mode=per_iteration_trainer_init source={job.policy_init_from}",
             f"deepspeed={job.deepspeed_config_path or '(none)'}",
+            *(
+                [
+                    f"requested_deepspeed={job.requested_deepspeed_config_path or '(none)'}",
+                    f"liger_deepspeed_auto_switched=true reason={job.liger_deepspeed_switch_reason}",
+                ]
+                if bool(job.liger_deepspeed_auto_switched)
+                else []
+            ),
         ],
     )

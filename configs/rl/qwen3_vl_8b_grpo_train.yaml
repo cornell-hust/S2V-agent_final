@@ -3,16 +3,19 @@ output_dir: artifacts/rl/qwen3_vl_8b_grpo
 
 model_config: configs/model/qwen3_vl_8b_full.yaml
 attention_config: configs/model/attention_fa3_only.yaml
-deepspeed_config: configs/deepspeed/zero3_full_model.json
+deepspeed_config: configs/deepspeed/zero2_rl.json
 
 policy_init_from: /abs/path/to/sft_checkpoint
-reference_model: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+reference_model: ""
 rollout_backend: vllm
-rollout_config: configs/rollout_eval/vllm_qwen3_vl_8b.yaml
+rollout_config: configs/rollout_eval/vllm_qwen3_vl_8b_rl_lowmem.yaml
 
 data:
   train_manifest: /abs/path/to/rl_train.jsonl
   eval_manifest: /abs/path/to/rl_eval.jsonl
+  materialized_train_items_path: /abs/path/to/rl_train.materialized_items_v1.jsonl
+  materialized_eval_items_path: /abs/path/to/rl_eval.materialized_items_v1.jsonl
+  require_materialized_runtime_cache: true
   data_root: /abs/path/to/data_root
   eval_data_root: /abs/path/to/data_root
   include_splits: train
@@ -20,26 +23,40 @@ data:
 
 proposal:
   model_path: /abs/path/to/proposal_model
-  torch_dtype: auto
+  torch_dtype: float16
   device: ""
   eval_model_path: /abs/path/to/proposal_model
-  eval_torch_dtype: auto
+  eval_torch_dtype: float16
   eval_device: ""
 
 optimization:
-  num_iterations: 1000
+  num_iterations: 400
   learning_rate: 5.0e-7
   per_device_batch_size: 1
   num_train_epochs: 1.0
-  rollout_count: 16
-  num_generations: 8
-  rollout_max_turns: 14
-  gradient_accumulation_steps: 8
+  min_weight: 0.01
+  advantage_clip: 3.0
+  ppo_clip_epsilon: 0.2
+  kl_beta: 0.005
+  rollout_count: 12
+  num_generations: 6
+  rollout_max_turns: 12
+  policy_do_sample: true
+  policy_temperature: 0.8
+  policy_top_p: 0.95
+  policy_top_k: 50
+  policy_repetition_penalty: 1.02
+  gradient_accumulation_steps: 22
+  rl_steps_per_generation: 1
+  rollout_stage_batch_size: 8
+  fecv_stage_batch_size: 8
+  vllm_max_num_seqs: 2
+  vllm_fallback_max_num_seqs: 2
 
 distributed:
   seed: 42
   nnodes: 1
-  nproc_per_node: 8
+  nproc_per_node: 3
   bf16: true
 
 rewards:

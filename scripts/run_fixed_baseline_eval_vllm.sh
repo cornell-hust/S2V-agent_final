@@ -18,7 +18,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29730}"
-BASELINE_CONFIG="${BASELINE_CONFIG:-${ROOT_DIR}/configs/fixed_baseline_eval/vllm_qwen3_vl_8b_fixed_28.yaml}"
+BASELINE_CONFIG="${BASELINE_CONFIG:-${ROOT_DIR}/configs/fixed_baseline_eval/vllm_qwen3_vl_8b_fixed.yaml}"
 
 CMD=(
   torchrun

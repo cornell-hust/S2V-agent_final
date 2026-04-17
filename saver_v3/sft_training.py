@@ -9,7 +9,6 @@ import json
 import math
 import random
 import re
-import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -2903,46 +2902,7 @@ def compute_completion_only_token_log_probs_from_ids(
         }
     )
     logits_to_keep = int(completion_ids.shape[-1]) + 1
-    def _summarize_value(value):
-        if isinstance(value, torch.Tensor):
-            return {
-                "shape": tuple(int(v) for v in value.shape),
-                "dtype": str(value.dtype).replace("torch.", ""),
-                "device": str(value.device),
-            }
-        if isinstance(value, dict):
-            return {str(k): _summarize_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return {"type": "list", "len": len(value)}
-        if isinstance(value, tuple):
-            return {"type": "tuple", "len": len(value)}
-        return type(value).__name__
-
-    multimodal_summary = {
-        str(key): _summarize_value(value)
-        for key, value in dict(multimodal_inputs or {}).items()
-    }
-    helper_forward_start = time.perf_counter()
-    runtime_log(
-        "rl completion_only helper before model forward: "
-        f"batch_size={int(input_ids.shape[0])} "
-        f"prompt_tokens={int(prompt_ids.shape[-1])} "
-        f"completion_tokens={int(completion_ids.shape[-1])} "
-        f"total_tokens={int(input_ids.shape[-1])} "
-        f"logits_to_keep={logits_to_keep} "
-        f"multimodal_keys={sorted(multimodal_summary.keys())} "
-        f"multimodal_summary={multimodal_summary}",
-        runtime=distributed_runtime_from_env(),
-        main_process_only=True,
-    )
     outputs = model(**model_inputs, logits_to_keep=logits_to_keep)
-    runtime_log(
-        "rl completion_only helper after model forward: "
-        f"batch_size={int(input_ids.shape[0])} "
-        f"elapsed_sec={time.perf_counter() - helper_forward_start:.3f}",
-        runtime=distributed_runtime_from_env(),
-        main_process_only=True,
-    )
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise RuntimeError("completion-only forward expected model outputs to expose `.logits`.")

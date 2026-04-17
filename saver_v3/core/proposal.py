@@ -604,6 +604,36 @@ def _l2_normalize(tensor: torch.Tensor) -> torch.Tensor:
     return tensor / denom
 
 
+def _resolve_feature_tensor_device(*, proposal_runtime: Any = None, feature_cache: Optional[Dict[str, Any]] = None) -> torch.device:
+    if proposal_runtime is not None:
+        device_value = getattr(proposal_runtime, "device", None)
+        if device_value is not None:
+            try:
+                return torch.device(str(device_value))
+            except Exception:
+                pass
+        model = getattr(proposal_runtime, "model", None)
+        if model is not None:
+            try:
+                return next(model.parameters()).device
+            except Exception:
+                pass
+    if isinstance(feature_cache, dict):
+        embeddings = feature_cache.get("embeddings")
+        if isinstance(embeddings, torch.Tensor):
+            return embeddings.device
+    return torch.device("cpu")
+
+
+def _to_feature_device_tensor(value: torch.Tensor, *, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    tensor = value.detach()
+    if tensor.device != device:
+        tensor = tensor.to(device)
+    if tensor.dtype != dtype:
+        tensor = tensor.to(dtype=dtype)
+    return tensor
+
+
 def coerce_encoder_feature_tensor(
     value: Any,
     *,
@@ -721,6 +751,7 @@ def _encode_query_text_entries(
 
     texts = [str(entry["text"]) for entry in entries]
     encoded_entries: List[Dict[str, Any]] = []
+    feature_device = _resolve_feature_tensor_device(proposal_runtime=proposal_runtime)
 
     try:
         embeddings = proposal_runtime.encode_texts(texts)
@@ -730,9 +761,10 @@ def _encode_query_text_entries(
             embeddings = embeddings.unsqueeze(0)
         if int(embeddings.shape[0]) != len(entries):
             raise ValueError("proposal_runtime.encode_texts returned a mismatched batch size.")
+        embeddings = _to_feature_device_tensor(embeddings, device=feature_device, dtype=torch.float32)
         for entry, embedding in zip(entries, embeddings):
             encoded_entry = dict(entry)
-            encoded_entry["embedding"] = embedding.detach().float().cpu()
+            encoded_entry["embedding"] = embedding.detach()
             encoded_entries.append(encoded_entry)
         return encoded_entries
     except Exception:
@@ -753,7 +785,7 @@ def _encode_query_text_entries(
         elif embedding.ndim != 1:
             raise ValueError("proposal_runtime.encode_texts returned an unexpected tensor rank.")
         encoded_entry = dict(entry)
-        encoded_entry["embedding"] = embedding.detach().float().cpu()
+        encoded_entry["embedding"] = _to_feature_device_tensor(embedding, device=feature_device, dtype=torch.float32)
         encoded_entries.append(encoded_entry)
     return encoded_entries
 
@@ -854,20 +886,23 @@ def feature_guided_frame_proposal(
     negative_encoded_entries = _encode_query_text_entries(proposal_runtime, negative_texts)
     if not positive_encoded_entries:
         return {**base_metadata, "proposal_fallback_reason": "empty_query_embeddings"}
-    frame_embeddings = embeddings.detach().float().cpu()
-    positive_embeddings = torch.stack(
-        [entry["embedding"] for entry in positive_encoded_entries],
-        dim=0,
-    ).detach().float().cpu()
+    feature_device = _resolve_feature_tensor_device(proposal_runtime=proposal_runtime, feature_cache=feature_cache)
+    frame_embeddings = _to_feature_device_tensor(embeddings, device=feature_device, dtype=torch.float32)
+    positive_embeddings = _to_feature_device_tensor(
+        torch.stack([entry["embedding"] for entry in positive_encoded_entries], dim=0),
+        device=feature_device,
+        dtype=torch.float32,
+    )
     if not bool(feature_cache.get("normalized", False)):
         frame_embeddings = _l2_normalize(frame_embeddings)
     positive_embeddings = _l2_normalize(positive_embeddings)
     negative_embeddings = None
     if negative_encoded_entries:
-        negative_embeddings = torch.stack(
-            [entry["embedding"] for entry in negative_encoded_entries],
-            dim=0,
-        ).detach().float().cpu()
+        negative_embeddings = _to_feature_device_tensor(
+            torch.stack([entry["embedding"] for entry in negative_encoded_entries], dim=0),
+            device=feature_device,
+            dtype=torch.float32,
+        )
         negative_embeddings = _l2_normalize(negative_embeddings)
 
     start_index = max(int(math.floor(float(start_sec) * float(fps))), 0)
@@ -878,6 +913,7 @@ def feature_guided_frame_proposal(
     positive_weight_tensor = torch.tensor(
         [float(entry.get("weight") or 0.0) for entry in positive_encoded_entries],
         dtype=torch.float32,
+        device=feature_device,
     )
     positive_scores = torch.matmul(search_embeddings, positive_embeddings.T)
     scores = torch.matmul(positive_scores, positive_weight_tensor)
@@ -885,6 +921,7 @@ def feature_guided_frame_proposal(
         negative_weight_tensor = torch.tensor(
             [float(entry.get("weight") or 0.0) for entry in negative_encoded_entries],
             dtype=torch.float32,
+            device=feature_device,
         )
         negative_scores = torch.matmul(search_embeddings, negative_embeddings.T)
         scores = scores - torch.matmul(negative_scores, negative_weight_tensor)
@@ -926,13 +963,14 @@ def feature_guided_frame_proposal(
         requested_num_frames=requested_num_frames,
         max_num_frames=8,
     )
-    candidate_index_tensor = torch.tensor([int(index - start_index) for index in candidate_global_indices], dtype=torch.long)
+    candidate_index_tensor = torch.tensor([int(index - start_index) for index in candidate_global_indices], dtype=torch.long, device=feature_device)
     candidate_embeddings = search_embeddings.index_select(0, candidate_index_tensor)
     candidate_timestamps = torch.tensor(
         [float(index) / max(float(fps), 1e-6) for index in candidate_global_indices],
         dtype=torch.float32,
+        device=feature_device,
     )
-    candidate_score_tensor = torch.tensor(candidate_frame_scores, dtype=torch.float32)
+    candidate_score_tensor = torch.tensor(candidate_frame_scores, dtype=torch.float32, device=feature_device)
     dpp_kernel = _build_dpp_kernel(
         candidate_embeddings=candidate_embeddings,
         candidate_scores=candidate_score_tensor,
@@ -1071,7 +1109,7 @@ class SiglipFeatureEncoder:
                 features,
                 preferred_keys=("text_embeds", "pooler_output", "last_hidden_state", "hidden_states"),
             )
-            features = _l2_normalize(features.detach().cpu())
+            features = _l2_normalize(features.detach().to(self.device, dtype=torch.float32))
             for text, feature in zip(missing_texts, features):
                 self._text_feature_cache[text] = feature.clone()
                 self._text_feature_cache.move_to_end(text)

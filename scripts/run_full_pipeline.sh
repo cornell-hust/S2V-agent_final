@@ -27,6 +27,85 @@ skip()  { printf "${YELLOW}[SKIP]${RESET}  %s\n" "$*"; }
 ok()    { printf "${GREEN}[OK]${RESET}    %s\n" "$*"; }
 err()   { printf "${RED}[ERROR]${RESET} %s\n" "$*" >&2; }
 
+resolve_cuda_runtime_lib_dirs() {
+  local conda_prefix="${CONDA_PREFIX:-}"
+  local py_ver=""
+  local dirs=()
+  if [[ -n "${conda_prefix}" ]]; then
+    py_ver="$(python - <<'PY'
+import sys
+print(f"python{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+    dirs+=(
+      "${conda_prefix}/lib/${py_ver}/site-packages/nvidia/cuda_runtime/lib"
+      "${conda_prefix}/lib/${py_ver}/site-packages/nvidia/curand/lib"
+    )
+  fi
+  local existing=()
+  local d
+  for d in "${dirs[@]}"; do
+    if [[ -d "${d}" ]]; then
+      existing+=("${d}")
+    fi
+  done
+  printf '%s\n' "${existing[@]}"
+}
+
+link_fake_cuda_runtime_libs() {
+  local conda_prefix="${CONDA_PREFIX:-}"
+  [[ -n "${conda_prefix}" ]] || return 0
+  local fake_cuda_lib64="${conda_prefix}/fake_cuda/lib64"
+  mkdir -p "${fake_cuda_lib64}"
+  local py_ver="$(python - <<'PY'
+import sys
+print(f"python{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+  local libcudart_real="${conda_prefix}/lib/${py_ver}/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12"
+  local libcurand_real="${conda_prefix}/lib/${py_ver}/site-packages/nvidia/curand/lib/libcurand.so.10"
+  if [[ -f "${libcudart_real}" ]]; then
+    ln -sfn "${libcudart_real}" "${fake_cuda_lib64}/libcudart.so.12"
+    ln -sfn "${libcudart_real}" "${fake_cuda_lib64}/libcudart.so"
+  fi
+  if [[ -f "${libcurand_real}" ]]; then
+    ln -sfn "${libcurand_real}" "${fake_cuda_lib64}/libcurand.so.10"
+    ln -sfn "${libcurand_real}" "${fake_cuda_lib64}/libcurand.so"
+  fi
+}
+
+export_rl_cuda_link_env() {
+  link_fake_cuda_runtime_libs
+  local lib_dirs=()
+  mapfile -t lib_dirs < <(resolve_cuda_runtime_lib_dirs)
+  if (( ${#lib_dirs[@]} > 0 )); then
+    local joined=""
+    local d
+    for d in "${lib_dirs[@]}"; do
+      if [[ -z "${d}" ]]; then
+        continue
+      fi
+      if [[ -z "${joined}" ]]; then
+        joined="${d}"
+      else
+        joined="${joined}:${d}"
+      fi
+    done
+    export LD_LIBRARY_PATH="${joined}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  fi
+  if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/fake_cuda" ]]; then
+    export CUDA_HOME="${CONDA_PREFIX}/fake_cuda"
+  fi
+}
+
+prebuild_deepspeed_cpu_adam() {
+  python - <<'PY'
+from deepspeed.ops.op_builder import CPUAdamBuilder
+CPUAdamBuilder().load(verbose=True)
+PY
+}
+
+
 collect_sft_epoch_output_issues() {
   local epoch_dir="$1"
   local processor_sentinel_found=0
@@ -93,6 +172,103 @@ require_valid_sft_epoch_output() {
   mapfile -t issues < <(collect_sft_epoch_output_issues "${epoch_dir}")
   if (( ${#issues[@]} > 0 )); then
     err "${label} is not a valid HF checkpoint at ${epoch_dir}: ${issues[*]}"
+    exit 1
+  fi
+}
+
+collect_hf_checkpoint_dir_issues() {
+  local model_dir="$1"
+  local processor_sentinel_found=0
+  [[ -d "${model_dir}" ]] || { printf "%s\n" "missing directory"; return 0; }
+  [[ -f "${model_dir}/config.json" ]] || printf "%s\n" "missing config.json"
+  if [[ -f "${model_dir}/adapter_config.json" ]]; then
+    return 0
+  fi
+  for sentinel in preprocessor_config.json processor_config.json tokenizer_config.json; do
+    if [[ -f "${model_dir}/${sentinel}" ]]; then
+      processor_sentinel_found=1
+      break
+    fi
+  done
+  if (( ! processor_sentinel_found )); then
+    printf "%s\n" "missing processor/tokenizer config"
+  fi
+}
+
+is_valid_hf_checkpoint_dir() {
+  local model_dir="$1"
+  local issues=()
+  mapfile -t issues < <(collect_hf_checkpoint_dir_issues "${model_dir}")
+  (( ${#issues[@]} == 0 ))
+}
+
+resolve_rl_latest_checkpoint_path() {
+  local rl_dir="$1"
+  python3 - "${rl_dir}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+rl_dir = Path(sys.argv[1]).expanduser().resolve()
+candidates = []
+summary_path = rl_dir / "rl_summary.json"
+if summary_path.exists():
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        value = str(payload.get("latest_checkpoint") or "").strip()
+        if value:
+            candidates.append(Path(value).expanduser().resolve())
+latest_txt = rl_dir / "latest_checkpoint.txt"
+if latest_txt.exists():
+    value = str(latest_txt.read_text(encoding="utf-8")).strip()
+    if value:
+        candidates.append(Path(value).expanduser().resolve())
+for candidate in candidates:
+    if candidate.exists():
+        print(candidate)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+collect_rl_output_issues() {
+  local rl_dir="$1"
+  local latest_checkpoint=""
+  [[ -d "${rl_dir}" ]] || { printf "%s\n" "missing directory"; return 0; }
+  [[ -f "${rl_dir}/rl_summary.json" ]] || printf "%s\n" "missing rl_summary.json"
+  [[ -f "${rl_dir}/latest_checkpoint.txt" ]] || printf "%s\n" "missing latest_checkpoint.txt"
+  latest_checkpoint="$(resolve_rl_latest_checkpoint_path "${rl_dir}" 2>/dev/null || true)"
+  if [[ -z "${latest_checkpoint}" ]]; then
+    printf "%s\n" "missing latest RL checkpoint path"
+    return 0
+  fi
+  local issues=()
+  mapfile -t issues < <(collect_hf_checkpoint_dir_issues "${latest_checkpoint}")
+  if (( ${#issues[@]} > 0 )); then
+    local issue
+    for issue in "${issues[@]}"; do
+      printf "%s\n" "latest checkpoint invalid: ${issue}"
+    done
+  fi
+}
+
+is_complete_rl_output() {
+  local rl_dir="$1"
+  local issues=()
+  mapfile -t issues < <(collect_rl_output_issues "${rl_dir}")
+  (( ${#issues[@]} == 0 ))
+}
+
+require_valid_rl_output() {
+  local rl_dir="$1"
+  local label="${2:-RL output}"
+  local issues=()
+  mapfile -t issues < <(collect_rl_output_issues "${rl_dir}")
+  if (( ${#issues[@]} > 0 )); then
+    err "${label} is not a valid RL checkpoint root at ${rl_dir}: ${issues[*]}"
     exit 1
   fi
 }
@@ -181,6 +357,7 @@ DATA_DIR="${DATA_DIR:-${ROOT_DIR}/data_utils}"
 MODEL_PATH="${MODEL_PATH:-${DATA_ROOT}/Wmh/MLLMs/qwen3-vl-8b-Instruct}"
 PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-${DATA_ROOT}/Wmh/MLLMs/siglip}"
 PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
+RL_PROPOSAL_TORCH_DTYPE="${RL_PROPOSAL_TORCH_DTYPE:-float16}"
 PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
 
 SFT_CONFIG="${SFT_CONFIG:-${ROOT_DIR}/configs/sft/qwen3_vl_8b_full_train.yaml}"
@@ -190,10 +367,17 @@ ROLLOUT_CONFIG="${ROLLOUT_CONFIG:-${ROOT_DIR}/configs/rollout_eval/vllm_qwen3_vl
 MODEL_CONFIG="${MODEL_CONFIG:-${ROOT_DIR}/configs/model/qwen3_vl_8b_full.yaml}"
 ATTENTION_CONFIG="${ATTENTION_CONFIG:-${ROOT_DIR}/configs/model/attention_fa3_only.yaml}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
+RL_DEEPSPEED_CONFIG="${RL_DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero2_rl.json}"
 
 NNODES="${NNODES:-1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
 EVAL_MASTER_PORT="${EVAL_MASTER_PORT:-29710}"
+
+BASELINE_NPROC_PER_NODE="${BASELINE_NPROC_PER_NODE:-8}"
+BASELINE_GRADIENT_ACCUMULATION_STEPS="${BASELINE_GRADIENT_ACCUMULATION_STEPS:-8}"
+DEFAULT_EQUIVALENT_GRAD_ACC="$(( (BASELINE_NPROC_PER_NODE * BASELINE_GRADIENT_ACCUMULATION_STEPS + NPROC_PER_NODE - 1) / NPROC_PER_NODE ))"
+SFT_GRADIENT_ACCUMULATION_STEPS="${SFT_GRADIENT_ACCUMULATION_STEPS:-${DEFAULT_EQUIVALENT_GRAD_ACC}}"
+RL_GRADIENT_ACCUMULATION_STEPS="${RL_GRADIENT_ACCUMULATION_STEPS:-${DEFAULT_EQUIVALENT_GRAD_ACC}}"
 
 NUM_SFT_EPOCHS="${NUM_SFT_EPOCHS:-3}"
 PREPARE_SFT_OVERWRITE_EXISTING="${PREPARE_SFT_OVERWRITE_EXISTING:-0}"
@@ -247,10 +431,15 @@ printf "  NUM_SFT_EPOCHS     = %s\n" "${NUM_SFT_EPOCHS}"
 printf "  NNODES             = %s\n" "${NNODES}"
 printf "  NPROC_PER_NODE     = %s\n" "${NPROC_PER_NODE}"
 printf "  EVAL_MASTER_PORT   = %s\n" "${EVAL_MASTER_PORT}"
+printf "  SFT_GRAD_ACC       = %s\n" "${SFT_GRADIENT_ACCUMULATION_STEPS}"
+printf "  RL_GRAD_ACC        = %s\n" "${RL_GRADIENT_ACCUMULATION_STEPS}"
 printf "  SFT_CONFIG         = %s\n" "${SFT_CONFIG}"
 printf "  PREPARE_SFT_CONFIG = %s\n" "${PREPARE_SFT_CONFIG}"
 printf "  RL_CONFIG          = %s\n" "${RL_CONFIG}"
 printf "  ROLLOUT_CONFIG     = %s\n" "${ROLLOUT_CONFIG}"
+printf "  DEEPSPEED_CONFIG   = %s\n" "${DEEPSPEED_CONFIG}"
+printf "  RL_DEEPSPEED_CONFIG= %s\n" "${RL_DEEPSPEED_CONFIG}"
+printf "  RL_PROPOSAL_DTYPE  = %s\n" "${RL_PROPOSAL_TORCH_DTYPE}"
 printf "  SFT_PREPARED_FILE      = %s\n" "${SFT_PREPARED_FILE}"
 printf "  TEACHER_PREPARED_FILE  = %s\n" "${TEACHER_PREPARED_FILE}"
 printf "  TEACHER_JUDGE_MODEL    = %s\n" "${TEACHER_JUDGE_MODEL_PATH:-disabled}"
@@ -267,7 +456,7 @@ printf "  PROPOSAL_MODEL         = %s\n" "${PROPOSAL_MODEL_PATH}"
 banner "${GREEN}" "Stage 1: Data Preprocessing Check"
 
 MISSING=0
-for f in "${PREPARE_SFT_CONFIG}" "${SFT_CONFIG}" "${RL_CONFIG}" "${ROLLOUT_CONFIG}" "${MODEL_CONFIG}" "${ATTENTION_CONFIG}" "${DEEPSPEED_CONFIG}" "${RUNTIME_TRAIN_FILE}" "${RUNTIME_EVAL_FILE}"; do
+for f in "${PREPARE_SFT_CONFIG}" "${SFT_CONFIG}" "${RL_CONFIG}" "${ROLLOUT_CONFIG}" "${MODEL_CONFIG}" "${ATTENTION_CONFIG}" "${DEEPSPEED_CONFIG}" "${RL_DEEPSPEED_CONFIG}" "${RUNTIME_TRAIN_FILE}" "${RUNTIME_EVAL_FILE}"; do
   if [[ ! -f "${f}" ]]; then
     err "Missing required file: ${f}"
     MISSING=1
@@ -556,6 +745,17 @@ PY
   fi
 }
 
+resolve_eval_summary_file() {
+  local eval_dir="${1}"
+  local metrics_file="${eval_dir}/metrics.json"
+  local wrapper_file="${eval_dir}/rollout_eval_wrapper_summary.json"
+  if [[ -f "${metrics_file}" ]]; then
+    printf "%s\n" "${metrics_file}"
+  else
+    printf "%s\n" "${wrapper_file}"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Stage 1c: Materialized Cache Resolve
 # ---------------------------------------------------------------------------
@@ -604,6 +804,9 @@ for (( epoch=1; epoch<=NUM_SFT_EPOCHS; epoch++ )); do
       --override "proposal.torch_dtype=${PROPOSAL_TORCH_DTYPE}"
       --override "proposal.device=${PROPOSAL_DEVICE}"
       --override "optimization.epochs=1"
+      --override "optimization.gradient_accumulation_steps=${SFT_GRADIENT_ACCUMULATION_STEPS}"
+      --override "distributed.nnodes=${NNODES}"
+      --override "distributed.nproc_per_node=${NPROC_PER_NODE}"
       --override "output_dir=${EPOCH_OUT}"
       --override "logging.log_dir=${LOG_DIR}"
       --override "logging.rollout_eval_output_dir=${EVAL_DIR}/sft_epoch_${EPOCH_TAG}"
@@ -625,9 +828,10 @@ for (( epoch=1; epoch<=NUM_SFT_EPOCHS; epoch++ )); do
   # ---- Per-epoch evaluation ------------------------------------------------
   EPOCH_EVAL_DIR="${EVAL_DIR}/sft_epoch_${EPOCH_TAG}"
   EPOCH_METRICS="${EPOCH_EVAL_DIR}/metrics.json"
+  EPOCH_EVAL_DONE_FILE="${EPOCH_EVAL_DIR}/rollout_eval_wrapper_summary.json"
 
-  if [[ -f "${EPOCH_METRICS}" ]]; then
-    skip "Eval metrics for SFT epoch ${epoch} already exist at ${EPOCH_METRICS} — skipping."
+  if [[ -f "${EPOCH_EVAL_DONE_FILE}" ]]; then
+    skip "Eval wrapper summary for SFT epoch ${epoch} already exists at ${EPOCH_EVAL_DONE_FILE} — skipping."
   else
     banner "${GREEN}" "Stage 2.${epoch}: Evaluating SFT Epoch ${epoch}"
 
@@ -654,8 +858,9 @@ for (( epoch=1; epoch<=NUM_SFT_EPOCHS; epoch++ )); do
 
     ok "Eval for SFT epoch ${epoch} complete → ${EPOCH_EVAL_DIR}"
   fi
-  print_metrics "${EPOCH_METRICS}" "SFT epoch ${epoch}"
-  record_summary "SFT epoch ${epoch}" "${EPOCH_METRICS}"
+  EPOCH_SUMMARY_FILE="$(resolve_eval_summary_file "${EPOCH_EVAL_DIR}")"
+  print_metrics "${EPOCH_SUMMARY_FILE}" "SFT epoch ${epoch}"
+  record_summary "SFT epoch ${epoch}" "${EPOCH_SUMMARY_FILE}"
 done
 
 # ---------------------------------------------------------------------------
@@ -673,10 +878,19 @@ require_valid_sft_epoch_output "${LAST_SFT_EPOCH_DIR}" "last SFT checkpoint befo
 LAST_SFT_CKPT="$(resolve_sft_epoch_model_path "${LAST_SFT_EPOCH_DIR}")"
 info "Using SFT checkpoint: ${LAST_SFT_CKPT}"
 
-if [[ -d "${RL_DIR}" && -n "$(ls -A "${RL_DIR}" 2>/dev/null)" ]]; then
-  skip "RL output directory already populated at ${RL_DIR} — skipping RL training."
+if is_complete_rl_output "${RL_DIR}"; then
+  RL_CKPT="$(resolve_rl_latest_checkpoint_path "${RL_DIR}")"
+  skip "RL output already complete at ${RL_DIR}; latest checkpoint=${RL_CKPT} — skipping RL training."
 else
+  if [[ -d "${RL_DIR}" && -n "$(ls -A "${RL_DIR}" 2>/dev/null)" ]]; then
+    info "Removing stale/incomplete RL output at ${RL_DIR} before retraining."
+    rm -rf "${RL_DIR}"
+    mkdir -p "${RL_DIR}"
+  fi
   info "Launching DeepSpeed RL training ..."
+  export_rl_cuda_link_env
+  info "Prebuilding DeepSpeed CPUAdam extension ..."
+  prebuild_deepspeed_cpu_adam
   deepspeed \
     --num_nodes  "${NNODES}" \
     --num_gpus   "${NPROC_PER_NODE}" \
@@ -684,7 +898,7 @@ else
     --config "${RL_CONFIG}" \
     --model-config "${MODEL_CONFIG}" \
     --attention-config "${ATTENTION_CONFIG}" \
-    --deepspeed-config "${DEEPSPEED_CONFIG}" \
+    --deepspeed-config "${RL_DEEPSPEED_CONFIG}" \
     --override "data.train_manifest=${RUNTIME_TRAIN_FILE}" \
     --override "data.eval_manifest=${RUNTIME_EVAL_FILE}" \
     --override "data.data_root=${DATA_ROOT}" \
@@ -695,16 +909,20 @@ else
     --override "data.materialized_eval_items_path=${RUNTIME_EVAL_ITEMS_FILE}" \
     --override "data.require_materialized_runtime_cache=true" \
     --override "proposal.model_path=${PROPOSAL_MODEL_PATH}" \
-    --override "proposal.torch_dtype=${PROPOSAL_TORCH_DTYPE}" \
+    --override "proposal.torch_dtype=${RL_PROPOSAL_TORCH_DTYPE}" \
     --override "proposal.device=${PROPOSAL_DEVICE}" \
     --override "proposal.eval_model_path=${PROPOSAL_MODEL_PATH}" \
-    --override "proposal.eval_torch_dtype=${PROPOSAL_TORCH_DTYPE}" \
+    --override "proposal.eval_torch_dtype=${RL_PROPOSAL_TORCH_DTYPE}" \
     --override "proposal.eval_device=${PROPOSAL_DEVICE}" \
+    --override "optimization.gradient_accumulation_steps=${RL_GRADIENT_ACCUMULATION_STEPS}" \
+    --override "distributed.nnodes=${NNODES}" \
+    --override "distributed.nproc_per_node=${NPROC_PER_NODE}" \
     --override "policy_init_from=${LAST_SFT_CKPT}" \
     --override "output_dir=${RL_DIR}" \
     --override "logging.log_dir=${LOG_DIR}"
 
   ok "RL training complete → ${RL_DIR}"
+  require_valid_rl_output "${RL_DIR}" "RL output after training"
 fi
 
 # ---------------------------------------------------------------------------
@@ -712,11 +930,16 @@ fi
 # ---------------------------------------------------------------------------
 banner "${GREEN}" "Stage 4: RL Evaluation"
 
+require_valid_rl_output "${RL_DIR}" "RL checkpoint before eval"
+RL_CKPT="$(resolve_rl_latest_checkpoint_path "${RL_DIR}")"
+info "Using RL checkpoint for eval: ${RL_CKPT}"
+
 RL_EVAL_DIR="${EVAL_DIR}/rl_final"
 RL_METRICS="${RL_EVAL_DIR}/metrics.json"
+RL_EVAL_DONE_FILE="${RL_EVAL_DIR}/rollout_eval_wrapper_summary.json"
 
-if [[ -f "${RL_METRICS}" ]]; then
-  skip "RL eval metrics already exist at ${RL_METRICS} — skipping."
+if [[ -f "${RL_EVAL_DONE_FILE}" ]]; then
+  skip "RL eval wrapper summary already exists at ${RL_EVAL_DONE_FILE} — skipping."
 else
   info "Launching torchrun RL eval ..."
   torchrun \
@@ -725,7 +948,7 @@ else
     --master_port     "${EVAL_MASTER_PORT}" \
     --module saver_v3.cli.run_sft_rollout_eval_vllm \
       --config "${ROLLOUT_CONFIG}" \
-      --override "base_model=${RL_DIR}" \
+      --override "base_model=${RL_CKPT}" \
       --override "io.data_path=${RUNTIME_EVAL_FILE}" \
       --override "io.data_root=${DATA_ROOT}" \
       --override "io.materialized_items_path=${RUNTIME_EVAL_ITEMS_FILE}" \
@@ -740,8 +963,9 @@ else
   ok "RL eval complete → ${RL_EVAL_DIR}"
 fi
 
-print_metrics "${RL_METRICS}" "RL final"
-record_summary "RL final" "${RL_METRICS}"
+RL_SUMMARY_FILE="$(resolve_eval_summary_file "${RL_EVAL_DIR}")"
+print_metrics "${RL_SUMMARY_FILE}" "RL final"
+record_summary "RL final" "${RL_SUMMARY_FILE}"
 
 # ---------------------------------------------------------------------------
 # Stage 5: Summary table

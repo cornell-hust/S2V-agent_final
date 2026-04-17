@@ -160,6 +160,189 @@ def _dedupe_string_list(values: List[Any] | Tuple[Any, ...] | None) -> List[str]
     return deduped
 
 
+def _normalize_interval_tuple(value: Any) -> Tuple[float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        start_sec = float(value[0])
+        end_sec = float(value[1])
+    except Exception:
+        return None
+    if end_sec < start_sec:
+        start_sec, end_sec = end_sec, start_sec
+    return start_sec, end_sec
+
+
+def _interval_iou(interval_a: Any, interval_b: Any) -> float:
+    a = _normalize_interval_tuple(interval_a)
+    b = _normalize_interval_tuple(interval_b)
+    if a is None or b is None:
+        return 0.0
+    overlap = max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+    if overlap <= 0.0:
+        return 0.0
+    union = max(a[1] - a[0], 0.0) + max(b[1] - b[0], 0.0) - overlap
+    if union <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, overlap / union))
+
+
+def _oracle_moment_stage_lookup(multimodal_cache: Dict[str, Any]) -> Dict[str, str]:
+    stage_by_moment_id: Dict[str, str] = {}
+    structured_target = dict(multimodal_cache.get("structured_target") or {})
+    chain_target = dict(structured_target.get("event_chain_target") or {})
+    for stage, moment_ids in dict(chain_target.get("stage_to_moment_ids") or {}).items():
+        normalized_stage = event_chain_stage_for_role(stage) or str(stage or "").strip().lower()
+        if normalized_stage not in {"precursor", "trigger", "confirmation"}:
+            continue
+        for moment_id in list(moment_ids or []):
+            moment_id_text = str(moment_id or "").strip()
+            if moment_id_text:
+                stage_by_moment_id[moment_id_text] = normalized_stage
+    for entry in list(((multimodal_cache.get("tool_io") or {}).get("oracle_windows_sec")) or []):
+        moment_id = str(entry.get("moment_id") or "").strip()
+        stage = event_chain_stage_for_role(entry.get("role"))
+        if moment_id and stage:
+            stage_by_moment_id[moment_id] = stage
+    return stage_by_moment_id
+
+
+def _oracle_window_entries(multimodal_cache: Dict[str, Any]) -> List[Dict[str, Any]]:
+    windows: List[Dict[str, Any]] = []
+    for entry in list(((multimodal_cache.get("tool_io") or {}).get("oracle_windows_sec")) or []):
+        moment_id = str(entry.get("moment_id") or "").strip()
+        interval = entry.get("window") or entry.get("window_sec")
+        normalized_interval = _normalize_interval_tuple(interval)
+        stage = event_chain_stage_for_role(entry.get("role"))
+        if not moment_id or normalized_interval is None:
+            continue
+        windows.append(
+            {
+                "moment_id": moment_id,
+                "stage": stage,
+                "interval": normalized_interval,
+            }
+        )
+    return windows
+
+
+def _runtime_entry_stage(entry: Dict[str, Any], *, stage_by_moment_id: Dict[str, str]) -> str:
+    stage = event_chain_stage_for_role(entry.get("role"))
+    if stage:
+        return stage
+    moment_id = str(entry.get("moment_id") or "").strip()
+    return stage_by_moment_id.get(moment_id, "")
+
+
+def _selected_evidence_entries_for_finalization(
+    state: SaverEnvironmentState,
+    decision_arguments: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    by_window_id = {
+        str(entry.get("window_id")): entry
+        for entry in state.evidence_ledger
+        if str(entry.get("window_id") or "").strip()
+    }
+    by_evidence_id = {
+        str(entry.get("evidence_id")): entry
+        for entry in state.evidence_ledger
+        if str(entry.get("evidence_id") or "").strip()
+    }
+    selected_ids = _dedupe_string_list(
+        list(decision_arguments.get("selected_window_ids") or [])
+        + list(decision_arguments.get("verified_window_ids") or [])
+        + list(decision_arguments.get("best_effort_window_ids") or [])
+        + list(getattr(state, "active_evidence_window_ids", []) or [])
+    )
+    selected_evidence_ids = _dedupe_string_list(
+        list(decision_arguments.get("selected_evidence_ids") or [])
+        + [
+            value
+            for value in list(decision_arguments.get("evidence_moment_ids") or [])
+            if str(value or "").strip().startswith("e")
+        ]
+    )
+    selected: List[Dict[str, Any]] = []
+    seen_window_ids = set()
+    for window_id in selected_ids:
+        entry = by_window_id.get(str(window_id))
+        if entry is None:
+            continue
+        resolved_window_id = str(entry.get("window_id") or "").strip()
+        if not resolved_window_id or resolved_window_id in seen_window_ids:
+            continue
+        seen_window_ids.add(resolved_window_id)
+        selected.append(entry)
+    for evidence_id in selected_evidence_ids:
+        entry = by_evidence_id.get(str(evidence_id))
+        if entry is None:
+            continue
+        resolved_window_id = str(entry.get("window_id") or "").strip()
+        if not resolved_window_id or resolved_window_id in seen_window_ids:
+            continue
+        seen_window_ids.add(resolved_window_id)
+        selected.append(entry)
+    if selected:
+        return selected
+    return list(state.evidence_ledger or [])
+
+
+def _resolve_finalized_moment_ids_from_state(
+    *,
+    decision_arguments: Dict[str, Any],
+    multimodal_cache: Dict[str, Any],
+    state: SaverEnvironmentState,
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    stage_by_moment_id = _oracle_moment_stage_lookup(multimodal_cache)
+    valid_moment_ids = set(stage_by_moment_id)
+    selected_entries = _selected_evidence_entries_for_finalization(state, decision_arguments)
+    selected_runtime_moment_ids = _dedupe_string_list([entry.get("moment_id") for entry in selected_entries])
+    requested_moment_ids = _dedupe_string_list(
+        [
+            value
+            for value in list(decision_arguments.get("evidence_moment_ids") or [])
+            if str(value or "").strip() in valid_moment_ids
+        ]
+    )
+    moment_ids = _dedupe_string_list(requested_moment_ids + [value for value in selected_runtime_moment_ids if value in valid_moment_ids])
+
+    if not moment_ids:
+        oracle_windows = _oracle_window_entries(multimodal_cache)
+        for entry in selected_entries:
+            entry_interval = _normalize_interval_tuple((entry.get("start_sec"), entry.get("end_sec")))
+            entry_stage = _runtime_entry_stage(entry, stage_by_moment_id=stage_by_moment_id)
+            best: Tuple[float, str] = (0.0, "")
+            for oracle in oracle_windows:
+                oracle_stage = str(oracle.get("stage") or "")
+                if entry_stage and oracle_stage and entry_stage != oracle_stage:
+                    continue
+                score = _interval_iou(entry_interval, oracle.get("interval"))
+                if score > best[0]:
+                    best = (score, str(oracle.get("moment_id") or ""))
+            if best[0] > 0.0 and best[1]:
+                moment_ids.append(best[1])
+        moment_ids = _dedupe_string_list(moment_ids)
+
+    if not moment_ids:
+        moment_ids = _dedupe_string_list(
+            [
+                value
+                for value in list(decision_arguments.get("evidence_moment_ids") or [])
+                if str(value or "").strip() in valid_moment_ids
+            ]
+        )
+
+    stage_selected: Dict[str, List[str]] = {}
+    for moment_id in moment_ids:
+        stage = stage_by_moment_id.get(moment_id)
+        if not stage:
+            continue
+        stage_selected.setdefault(stage, [])
+        if moment_id not in stage_selected[stage]:
+            stage_selected[stage].append(moment_id)
+    return moment_ids, stage_selected
+
+
 def _append_window(
     state: SaverEnvironmentState,
     *,
@@ -651,6 +834,27 @@ def finalize_case(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
         payload_name="finalize_case",
         require_category_for_anomaly=True,
     )
+    resolved_moment_ids, resolved_stage_selected_moment_ids = _resolve_finalized_moment_ids_from_state(
+        decision_arguments=decision_arguments,
+        multimodal_cache=multimodal_cache,
+        state=state,
+    )
+    if resolved_moment_ids:
+        decision_arguments["evidence_moment_ids"] = list(resolved_moment_ids)
+    elif "evidence_moment_ids" in decision_arguments:
+        decision_arguments["evidence_moment_ids"] = []
+    if resolved_stage_selected_moment_ids:
+        decision_arguments["stage_selected_moment_ids"] = {
+            stage: list(moment_ids)
+            for stage, moment_ids in resolved_stage_selected_moment_ids.items()
+        }
+        resolved_covered_stages = [stage for stage, moment_ids in resolved_stage_selected_moment_ids.items() if moment_ids]
+        decision_arguments["covered_stages"] = resolved_covered_stages
+        current_missing = _dedupe_string_list(list(decision_arguments.get("missing_required_stages") or []))
+        if current_missing:
+            decision_arguments["missing_required_stages"] = [
+                stage for stage in current_missing if stage not in resolved_covered_stages
+            ]
     normalized_arguments = dict(arguments or {})
     normalized_arguments.update(decision_arguments)
     if semantic_answer is not None:

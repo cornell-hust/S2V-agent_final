@@ -84,10 +84,7 @@ _OPEN_ENDED_QUESTION_TYPES = (
 ) + tuple(f"event_chain_summary.{stage}" for stage in SEMANTIC_EVENT_CHAIN_STAGES)
 
 # V3: metric-aligned subset — removed normal_reason and rationale (no primary metric)
-_OPEN_ENDED_QUESTION_TYPES_V3 = (
-    "trigger_evidence",
-    "summary",
-) + tuple(f"event_chain_summary.{stage}" for stage in SEMANTIC_EVENT_CHAIN_STAGES)
+_OPEN_ENDED_QUESTION_TYPES_V3: tuple[str, ...] = ()
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -128,21 +125,6 @@ def _normalize_component_weights(
     return merged
 
 
-def build_open_ended_reward_judge(
-    *,
-    reward_config: Optional[Dict[str, Any]] = None,
-) -> OpenAICompatibleLlmJudge:
-    config = dict(reward_config or {})
-    if not bool(config.get("open_ended_judge_enabled", True)):
-        return OpenAICompatibleLlmJudge()
-    return OpenAICompatibleLlmJudge(
-        base_url=str(config.get("open_ended_judge_base_url") or "").strip(),
-        model=str(config.get("open_ended_judge_model") or "").strip(),
-        cache_path=str(config.get("open_ended_judge_cache_path") or "").strip(),
-        timeout_sec=_safe_float(config.get("open_ended_judge_timeout_sec"), 30.0),
-    )
-
-
 def resolve_reward_component_weights(
     *,
     reward_version: str = DEFAULT_RL_REWARD_VERSION,
@@ -158,13 +140,22 @@ def resolve_reward_component_weights(
     )
 
 
+def build_open_ended_reward_judge(
+    *,
+    reward_config: Optional[Dict[str, Any]] = None,
+) -> OpenAICompatibleLlmJudge:
+    del reward_config
+    return OpenAICompatibleLlmJudge()
+
+
 def build_timesearch_reward_funcs(
     *,
     reward_config: Optional[Dict[str, Any]] = None,
     llm_judge: Optional[OpenAICompatibleLlmJudge] = None,
     reward_version: str = "timesearch_v3",
 ) -> List[Any]:
-    judge = llm_judge or build_open_ended_reward_judge(reward_config=reward_config)
+    del reward_config
+    judge = llm_judge or OpenAICompatibleLlmJudge()
 
     def accuracy_reward(*, rollout_traces: Sequence[Dict[str, Any]], **_: Any) -> List[float]:
         return [
@@ -908,19 +899,26 @@ def _timesearch_fecv_reward(
     *,
     target: Dict[str, Any],
 ) -> float:
-    """Continuous FECV reward with 4-term decomposition.
+    """Continuous FECV reward.
 
-    Redesigned to eliminate dead-gradient problem caused by cascading boolean gates.
-    All terms are continuous [0,1]:
-      - support(E):           how well evidence supports the decision (0.5 weight)
-      - trigger_necessity:    decision delta when trigger evidence is dropped (0.2 weight)
-      - negative_resistance:  decision delta when hard negatives are swapped in (0.2 weight)
-      - parsimony_bonus:      compression ratio from minimal subset search (0.1 weight)
+    Online profiles intentionally skip minimal_subset and hard_negative_swap to keep
+    active RL rollout/FECV close to a per-rank local closed loop.
     """
     if not profile:
         return 0.0
     branch_field_matrix = dict(profile.get("branch_field_matrix") or {})
     branch_delta_matrix = dict(profile.get("branch_delta_matrix") or {})
+    profile_source = str(profile.get("counterfactual_profile_source") or profile.get("counterfactual_branch_profile") or "").strip().lower()
+    selection_metadata = dict(profile.get("selection_metadata") or {})
+    normalized_branch_profile = str(selection_metadata.get("normalized_branch_profile") or profile_source).strip().lower()
+    summary = _counterfactual_summary(profile)
+    if normalized_branch_profile == "structured_oracle_v1":
+        selected_support = _safe_float(summary.get("oracle_selected_support_score"), 0.0)
+        required_stage_coverage = _safe_float(summary.get("oracle_required_stage_coverage_score"), 0.0)
+        drop_trigger_necessity = _safe_float(summary.get("oracle_drop_trigger_necessity_score"), 0.0)
+        reward = 0.6 * selected_support + 0.25 * required_stage_coverage + 0.15 * drop_trigger_necessity
+        return round(max(0.0, min(1.0, reward)), 6)
+    online_core = normalized_branch_profile == "online_core"
 
     # Term 1: Continuous evidence support (no boolean gate)
     selected_support = _timesearch_selected_support_score(profile, target=target)
@@ -932,20 +930,20 @@ def _timesearch_fecv_reward(
         _safe_float(drop_trigger_delta.get("category"), 0.0),
     ) if drop_trigger_delta else 0.0
 
-    # Term 3: Negative resistance -- continuous delta from hard_negative_swap
+    if online_core:
+        reward = (0.5 * selected_support + 0.2 * trigger_necessity) / 0.7
+        return round(max(0.0, min(1.0, reward)), 6)
+
+    # Offline/full FECV keeps the heavier specificity and parsimony terms.
     hard_neg_delta = dict((branch_delta_matrix.get("hard_negative_swap") or {}).get("fields") or {})
     negative_resistance = max(
         _safe_float(hard_neg_delta.get("existence"), 0.0),
         _safe_float(hard_neg_delta.get("category"), 0.0),
     ) if hard_neg_delta else 0.0
 
-    # Term 4: Parsimony bonus -- compression ratio from minimal_subset
     full_ids = ((branch_field_matrix.get("full_selected") or {}).get("window_ids") or [])
     minimal_ids = ((branch_field_matrix.get("minimal_subset") or {}).get("window_ids") or [])
-    if full_ids and minimal_ids and len(full_ids) > 0:
-        parsimony_bonus = 1.0 - (float(len(minimal_ids)) / float(len(full_ids)))
-    else:
-        parsimony_bonus = 0.0
+    parsimony_bonus = 1.0 - (float(len(minimal_ids)) / float(len(full_ids))) if full_ids and minimal_ids else 0.0
 
     reward = 0.5 * selected_support + 0.2 * trigger_necessity + 0.2 * negative_resistance + 0.1 * parsimony_bonus
     return round(max(0.0, min(1.0, reward)), 6)
@@ -971,7 +969,7 @@ def _score_rollout_trace_timesearch(
     profile_summary = _counterfactual_summary(profile)
     accuracy = _compute_accuracy_breakdown(
         rollout_trace,
-        llm_judge=llm_judge or build_open_ended_reward_judge(reward_config=reward_config),
+        llm_judge=llm_judge or OpenAICompatibleLlmJudge(),
         reward_version=normalized_reward_version,
     )
 

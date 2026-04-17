@@ -313,6 +313,9 @@ This path is **direct one-shot inference**, not agentic rollout. It uses fixed p
 #   policy_init_from: /path/to/best_sft_checkpoint
 #   data.train_manifest: /path/to/msad_saver_runtime_train.jsonl
 #   data.eval_manifest: /path/to/msad_saver_runtime_test.jsonl
+#   data.materialized_train_items_path: /path/to/msad_saver_runtime_train.materialized_items_v1.jsonl
+#   data.materialized_eval_items_path: /path/to/msad_saver_runtime_test.materialized_items_v1.jsonl
+#   data.require_materialized_runtime_cache: true
 #   data.data_root: /path/to/data_root
 #   proposal.model_path: /path/to/proposal_model
 #   rewards.reward_version: timesearch_v3
@@ -323,6 +326,8 @@ bash scripts/train_rl_qwen3_vl_8b_ds8.sh
 # Execute:
 bash scripts/train_rl_qwen3_vl_8b_ds8.sh --run
 ```
+
+The official active RL path is now pure-pack only: `train_rl_ds` materializes or loads runtime-item caches, converts rollouts into episode tensor packs, and trains on `episode_inputs` with explicit `advantages` and `old_policy_token_log_probs`. Legacy replay-buffer flags, legacy empty-batch flags, and server/client vLLM flags are removed and fail fast.
 
 **Reward (timesearch_v3):**
 ```
@@ -356,7 +361,7 @@ bash scripts/run_sft_rollout_eval_vllm.sh --run \
 | Config | Purpose | Key Fields |
 |--------|---------|-----------|
 | `configs/sft/qwen3_vl_8b_full_train.yaml` | SFT training | data.prepared_data_path, optimization.epochs |
-| `configs/rl/qwen3_vl_8b_grpo_train.yaml` | RL training | policy_init_from, rewards.reward_version |
+| `configs/rl/qwen3_vl_8b_grpo_train.yaml` | RL training | policy_init_from, data.materialized_*_items_path, rewards.reward_version |
 | `configs/rollout_eval/vllm_qwen3_vl_8b.yaml` | Evaluation | base_model, io.data_path, io.output_dir |
 | `configs/prepare_sft/qwen3_vl_8b_prepare.yaml` | Data prep | saver_config_source, io.input_data_path, io.output_path |
 | `configs/model/qwen3_vl_8b_full.yaml` | Model config | model_path, torch_dtype |

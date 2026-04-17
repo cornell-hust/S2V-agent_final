@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import os
@@ -30,6 +31,30 @@ from saver_v3.common.runtime import (
 )
 from saver_v3.rl.trl_compat import patch_vllm_guided_decoding_params
 from saver_v3.model.vllm_transport import encode_transport_payload
+
+
+def _build_rl_completion_mask(
+    completion_ids: torch.Tensor,
+    *,
+    eos_token_id: int,
+) -> torch.Tensor:
+    if completion_ids.ndim != 2:
+        raise ValueError("completion_ids must be rank-2 for RL token trace construction.")
+    is_eos = completion_ids == int(eos_token_id)
+    eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=completion_ids.device)
+    eos_rows = is_eos.any(dim=1)
+    eos_idx[eos_rows] = is_eos.int().argmax(dim=1)[eos_rows]
+    sequence_indices = torch.arange(is_eos.size(1), device=completion_ids.device).expand(is_eos.size(0), -1)
+    return (sequence_indices <= eos_idx.unsqueeze(1)).to(dtype=torch.long)
+
+
+def _tokenize_trimmed_completion_text(
+    processor: Any,
+    text: str,
+) -> torch.Tensor:
+    tokenizer = getattr(processor, "tokenizer", processor)
+    token_ids = list(tokenizer.encode(str(text or ""), add_special_tokens=False) or [])
+    return torch.tensor([token_ids], dtype=torch.long)
 
 
 def _build_limit_mm_per_prompt(args: Any) -> Dict[str, int]:
@@ -437,6 +462,70 @@ def _materialize_named_weights_for_collective_rpc(
     return materialized
 
 
+def _request_input_signature(request_input: Dict[str, Any]) -> str:
+    try:
+        return str(encode_transport_payload(request_input))
+    except Exception:
+        return json.dumps(request_input, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _group_duplicate_request_inputs(
+    request_inputs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    group_index_by_signature: Dict[str, int] = {}
+    for request_index, request_input in enumerate(list(request_inputs or [])):
+        signature = _request_input_signature(request_input)
+        existing_group_index = group_index_by_signature.get(signature)
+        if existing_group_index is None:
+            group_index_by_signature[signature] = len(groups)
+            groups.append(
+                {
+                    "signature": signature,
+                    "request_input": request_input,
+                    "request_indices": [int(request_index)],
+                }
+            )
+            continue
+        groups[existing_group_index]["request_indices"].append(int(request_index))
+    return groups
+
+
+def _flatten_prompt_major_completion_ids(outputs: List[Any]) -> List[List[int]]:
+    completion_ids: List[List[int]] = []
+    for output in list(outputs or []):
+        for candidate in list(getattr(output, "outputs", []) or []):
+            completion_ids.append(list(candidate.token_ids))
+    return completion_ids
+
+
+def _expand_grouped_completion_ids(
+    *,
+    request_groups: List[Dict[str, Any]],
+    grouped_completion_ids: List[List[List[int]]],
+    total_request_count: int,
+) -> List[List[int]]:
+    expanded_completion_ids: List[Optional[List[int]]] = [None] * int(total_request_count)
+    if len(grouped_completion_ids) != len(request_groups):
+        raise ValueError(
+            "Grouped completion ids must align with grouped request inputs: "
+            f"{len(grouped_completion_ids)} vs {len(request_groups)}"
+        )
+    for request_group, completions in zip(request_groups, grouped_completion_ids):
+        request_indices = list(request_group.get("request_indices") or [])
+        if len(completions) != len(request_indices):
+            raise ValueError(
+                "Prompt-group completion count does not match duplicated request count: "
+                f"{len(completions)} vs {len(request_indices)}"
+            )
+        for request_index, completion_ids in zip(request_indices, completions):
+            expanded_completion_ids[int(request_index)] = list(completion_ids)
+    missing = [idx for idx, value in enumerate(expanded_completion_ids) if value is None]
+    if missing:
+        raise ValueError(f"Missing expanded completion ids for request indices: {missing}")
+    return [list(value or []) for value in expanded_completion_ids]
+
+
 def _vllm_worker_reload_supports_weights_iterator() -> bool:
     try:
         from vllm.v1.worker.gpu_worker import GPUWorker
@@ -698,7 +787,9 @@ class _VllmColocateRuntime:
                 "vLLM-backed rollout route requires `vllm` to be importable in the current environment."
             ) from exc
 
-        max_num_seqs = _resolve_rollout_episode_batch_size(self.args)
+        max_num_seqs = max(1, int(getattr(self.args, "vllm_max_num_seqs", 0) or 0))
+        if max_num_seqs <= 0:
+            max_num_seqs = _resolve_rollout_episode_batch_size(self.args)
         tp_size = max(1, int(self.settings["vllm_tensor_parallel_size"]))
         max_model_len = _resolve_vllm_max_model_len(self.args)
         llm_kwargs: Dict[str, Any] = {
@@ -808,12 +899,14 @@ class _VllmColocateRuntime:
         top_k: Optional[int],
         repetition_penalty: Optional[float],
         guided_decoding_regex: str = "",
+        num_completions: int = 1,
+        seed: Optional[int] = None,
     ) -> Any:
         patch_vllm_guided_decoding_params()
         from vllm import SamplingParams
 
         sampling_kwargs: Dict[str, Any] = {
-            "n": 1,
+            "n": max(1, int(num_completions)),
             "repetition_penalty": float(repetition_penalty) if repetition_penalty is not None else 1.0,
             "temperature": float(temperature) if do_sample and temperature is not None else (1.0 if do_sample else 0.0),
             "top_p": float(top_p) if do_sample and top_p is not None else 1.0,
@@ -821,6 +914,8 @@ class _VllmColocateRuntime:
             "min_p": 0.0,
             "max_tokens": int(max_tokens),
         }
+        if seed is not None:
+            sampling_kwargs["seed"] = int(seed)
         sampling_kwargs.update(_build_vllm_structured_stop_kwargs())
         sampling_kwargs.update(_build_vllm_guided_sampling_kwargs(guided_decoding_regex))
         return SamplingParams(**sampling_kwargs)
@@ -890,7 +985,9 @@ class _VllmExternalLauncherRuntime:
                 "Direct external-launcher SFT rollout eval requires `vllm` to be importable in the current environment."
             ) from exc
 
-        max_num_seqs = _resolve_rollout_episode_batch_size(self.args)
+        max_num_seqs = max(1, int(getattr(self.args, "vllm_max_num_seqs", 0) or 0))
+        if max_num_seqs <= 0:
+            max_num_seqs = _resolve_rollout_episode_batch_size(self.args)
         max_model_len = _resolve_vllm_max_model_len(self.args)
         llm_kwargs: Dict[str, Any] = {
             "model": self.base_model_path,
@@ -903,8 +1000,7 @@ class _VllmExternalLauncherRuntime:
             "distributed_executor_backend": "external_launcher",
             "enable_prefix_caching": False,
             "enable_chunked_prefill": False,
-            "enable_lora": True,
-            "max_lora_rank": int(getattr(self.args, "vllm_server_max_lora_rank", 64) or 64),
+            "enable_lora": False,
         }
         torch_dtype = str(getattr(self.args, "torch_dtype", "auto") or "auto").strip()
         if torch_dtype and torch_dtype != "auto":
@@ -954,12 +1050,14 @@ class _VllmExternalLauncherRuntime:
         top_k: Optional[int],
         repetition_penalty: Optional[float],
         guided_decoding_regex: str = "",
+        num_completions: int = 1,
+        seed: Optional[int] = None,
     ) -> Any:
         patch_vllm_guided_decoding_params()
         from vllm import SamplingParams
 
         sampling_kwargs: Dict[str, Any] = {
-            "n": 1,
+            "n": max(1, int(num_completions)),
             "repetition_penalty": float(repetition_penalty) if repetition_penalty is not None else 1.0,
             "temperature": float(temperature) if do_sample and temperature is not None else (1.0 if do_sample else 0.0),
             "top_p": float(top_p) if do_sample and top_p is not None else 1.0,
@@ -967,6 +1065,8 @@ class _VllmExternalLauncherRuntime:
             "min_p": 0.0,
             "max_tokens": int(max_tokens),
         }
+        if seed is not None:
+            sampling_kwargs["seed"] = int(seed)
         sampling_kwargs.update(_build_vllm_structured_stop_kwargs())
         sampling_kwargs.update(_build_vllm_guided_sampling_kwargs(guided_decoding_regex))
         return SamplingParams(**sampling_kwargs)
@@ -988,7 +1088,7 @@ class _VllmExternalLauncherRuntime:
         if resolved_lora_request is not None:
             generation_kwargs["lora_request"] = resolved_lora_request
         outputs = self.llm.generate(llm_inputs, **generation_kwargs)
-        return [list(output.outputs[0].token_ids) for output in outputs]
+        return _flatten_prompt_major_completion_ids(list(outputs or []))
 
     def reset_prefix_cache(self) -> None:
         _maybe_reset_vllm_prefix_cache(self.llm)
@@ -1156,9 +1256,11 @@ class _VllmServerRuntime:
         top_k: Optional[int],
         repetition_penalty: Optional[float],
         guided_decoding_regex: str = "",
+        num_completions: int = 1,
+        seed: Optional[int] = None,
     ) -> Any:
-        return {
-            "n": 1,
+        payload = {
+            "n": max(1, int(num_completions)),
             "repetition_penalty": float(repetition_penalty) if repetition_penalty is not None else 1.0,
             "temperature": float(temperature) if do_sample and temperature is not None else (1.0 if do_sample else 0.0),
             "top_p": float(top_p) if do_sample and top_p is not None else 1.0,
@@ -1168,6 +1270,9 @@ class _VllmServerRuntime:
             "guided_decoding_regex": str(guided_decoding_regex or "") or None,
             **_build_vllm_structured_stop_kwargs(),
         }
+        if seed is not None:
+            payload["seed"] = int(seed)
+        return payload
 
     def generate_completion_ids(
         self,
@@ -1306,6 +1411,13 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
         self.step_resolver = step_resolver
         self.guided_decoding_regex = str(guided_decoding_regex or "")
         self.remote_lora_request = dict(remote_lora_request or {}) or None
+        self.capture_rl_token_traces = False
+        self._last_rl_token_traces: Optional[List[Dict[str, Any]]] = None
+
+    def pop_last_rl_token_traces(self) -> Optional[List[Dict[str, Any]]]:
+        traces = self._last_rl_token_traces
+        self._last_rl_token_traces = None
+        return traces
 
     def _resolve_prompt_token_budget(self) -> int:
         candidate_budgets: List[int] = []
@@ -1361,12 +1473,26 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
     ) -> List[str]:
         if not messages_batch:
             return []
+        self._last_rl_token_traces = None
         if not self.vllm_runtime.enabled:
             if self.source_model is None:
                 raise RuntimeError("vLLM generation policy requires a source HF model when runtime is disabled.")
+            runtime_log(
+                "rl trace generate debug: "
+                f"policy_class={self.__class__.__name__} "
+                f"runtime_enabled=false "
+                f"capture_rl_token_traces={bool(self.capture_rl_token_traces)} "
+                f"batch_size={len(messages_batch)} "
+                "route=hf_fallback",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=True,
+            )
             return super().generate_from_messages_batch(messages_batch)
 
         current_step = int(self.step_resolver() or 0)
+        runtime_args = getattr(self.vllm_runtime, "args", None)
+        base_seed = int(getattr(runtime_args, "seed", 0) or 0)
+        runtime_rank = int(getattr(getattr(self.vllm_runtime, "runtime", None), "rank", 0) or 0)
         if self.source_model is not None:
             self.vllm_runtime.ensure_weights_synced(self.source_model, global_step=current_step)
         if not self.use_generation_cache:
@@ -1384,6 +1510,7 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
         prompt_text_batch = [payload[1] for payload in prompt_payload_batch]
 
         llm_inputs: List[Dict[str, Any]] = []
+        prompt_input_tensors: List[Dict[str, torch.Tensor]] = []
         for prepared_messages, prompt_text in zip(prepared_messages_batch, prompt_text_batch):
             image_inputs, video_inputs = self._extract_vision_inputs(prepared_messages)
             llm_input: Dict[str, Any] = {"prompt": prompt_text}
@@ -1395,52 +1522,220 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
             if multimodal_data:
                 llm_input["multi_modal_data"] = multimodal_data
             llm_inputs.append(llm_input)
+            if self.capture_rl_token_traces:
+                processor_kwargs: Dict[str, Any] = {
+                    "text": prompt_text,
+                    "padding": False,
+                    "return_tensors": "pt",
+                }
+                if image_inputs:
+                    processor_kwargs["images"] = image_inputs
+                if video_inputs:
+                    processor_kwargs["videos"] = video_inputs
+                processor_inputs = self.processor(**processor_kwargs)
+                prompt_input_tensors.append(
+                    {
+                        key: value.detach().cpu()
+                        for key, value in processor_inputs.items()
+                        if isinstance(value, torch.Tensor)
+                    }
+                )
 
-        sampling_params = self.vllm_runtime.build_sampling_params(
-            max_tokens=self.max_new_tokens,
-            do_sample=self.do_sample,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            repetition_penalty=self.repetition_penalty,
-            guided_decoding_regex=self.guided_decoding_regex,
-        )
-        if hasattr(self.vllm_runtime, "generate_completion_ids"):
-            completion_ids_batch = self.vllm_runtime.generate_completion_ids(
-                llm_inputs,
-                sampling_params=sampling_params,
-                lora_request=self.remote_lora_request,
+        def _generate_completion_ids_for_inputs(
+            request_inputs: List[Dict[str, Any]],
+            *,
+            seed: Optional[int],
+            num_completions: int = 1,
+        ) -> List[List[int]]:
+            sampling_params = self.vllm_runtime.build_sampling_params(
+                max_tokens=self.max_new_tokens,
+                do_sample=self.do_sample,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                repetition_penalty=self.repetition_penalty,
+                guided_decoding_regex=self.guided_decoding_regex,
+                num_completions=int(num_completions),
+                seed=seed,
             )
-        else:
-            orig_size = len(llm_inputs)
+            if hasattr(self.vllm_runtime, "generate_completion_ids"):
+                return self.vllm_runtime.generate_completion_ids(
+                    request_inputs,
+                    sampling_params=sampling_params,
+                    lora_request=self.remote_lora_request,
+                )
+            orig_size = len(request_inputs)
             runtime_settings = getattr(self.vllm_runtime, "settings", {}) or {}
             tp_size = max(1, int(runtime_settings.get("vllm_tensor_parallel_size", 1) or 1))
+            llm_inputs_local = list(request_inputs)
             if tp_size > 1 and getattr(self.vllm_runtime, "tp_group", None) is not None:
                 gathered_llm_inputs = [None for _ in range(tp_size)]
                 torch.distributed.all_gather_object(
                     gathered_llm_inputs,
-                    llm_inputs,
+                    llm_inputs_local,
                     group=self.vllm_runtime.tp_group,
                 )
-                llm_inputs = [entry for batch in gathered_llm_inputs for entry in batch]
+                llm_inputs_local = [entry for batch in gathered_llm_inputs for entry in batch]
             generation_kwargs: Dict[str, Any] = {
                 "sampling_params": sampling_params,
                 "use_tqdm": False,
             }
             if self.remote_lora_request:
                 generation_kwargs["lora_request"] = dict(self.remote_lora_request)
-            outputs = self.vllm_runtime.llm.generate(llm_inputs, **generation_kwargs)
-            completion_ids_batch = [list(output.outputs[0].token_ids) for output in outputs]
+            outputs = self.vllm_runtime.llm.generate(llm_inputs_local, **generation_kwargs)
+            completion_ids = _flatten_prompt_major_completion_ids(list(outputs or []))
             if tp_size > 1 and getattr(self.vllm_runtime, "tp_group", None) is not None:
                 local_rank_in_tp_group = int(getattr(self.vllm_runtime, "local_rank_in_tp_group", 0) or 0)
-                tp_slice = slice(local_rank_in_tp_group * orig_size, (local_rank_in_tp_group + 1) * orig_size)
-                completion_ids_batch = completion_ids_batch[tp_slice]
-        output_texts = self.processor.batch_decode(
+                span = int(orig_size) * max(1, int(num_completions))
+                tp_slice = slice(local_rank_in_tp_group * span, (local_rank_in_tp_group + 1) * span)
+                completion_ids = completion_ids[tp_slice]
+            return completion_ids
+
+        if self.do_sample and str(getattr(self.vllm_runtime, "mode", "") or "").strip().lower() == "colocate":
+            request_groups = _group_duplicate_request_inputs(llm_inputs)
+            unique_prompt_count = len(request_groups)
+            if unique_prompt_count < len(llm_inputs):
+                runtime_log(
+                    "rl grouped sampling debug: "
+                    f"batch_size={len(llm_inputs)} "
+                    f"unique_prompts={unique_prompt_count} "
+                    f"deduped_requests={len(llm_inputs) - unique_prompt_count} "
+                    f"max_group_size={max(len(group['request_indices']) for group in request_groups)}",
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=True,
+                )
+                if hasattr(self.vllm_runtime, "generate_completion_ids"):
+                    grouped_completion_ids = []
+                    for request_group in request_groups:
+                        grouped_completion_ids.append(
+                            _generate_completion_ids_for_inputs(
+                                [dict(request_group["request_input"])],
+                                seed=None,
+                                num_completions=len(request_group["request_indices"]),
+                            )
+                        )
+                else:
+                    unique_request_inputs = [dict(request_group["request_input"]) for request_group in request_groups]
+                    sampling_params_batch = [
+                        self.vllm_runtime.build_sampling_params(
+                            max_tokens=self.max_new_tokens,
+                            do_sample=self.do_sample,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=self.top_k,
+                            repetition_penalty=self.repetition_penalty,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                            num_completions=len(request_group["request_indices"]),
+                            seed=None,
+                        )
+                        for request_group in request_groups
+                    ]
+                    unique_request_count = len(unique_request_inputs)
+                    runtime_settings = getattr(self.vllm_runtime, "settings", {}) or {}
+                    tp_size = max(1, int(runtime_settings.get("vllm_tensor_parallel_size", 1) or 1))
+                    unique_request_inputs_local = list(unique_request_inputs)
+                    if tp_size > 1 and getattr(self.vllm_runtime, "tp_group", None) is not None:
+                        gathered_llm_inputs = [None for _ in range(tp_size)]
+                        torch.distributed.all_gather_object(
+                            gathered_llm_inputs,
+                            unique_request_inputs_local,
+                            group=self.vllm_runtime.tp_group,
+                        )
+                        unique_request_inputs_local = [entry for batch in gathered_llm_inputs for entry in batch]
+                        sampling_params_batch = list(sampling_params_batch) * int(tp_size)
+                    generation_kwargs: Dict[str, Any] = {
+                        "sampling_params": sampling_params_batch,
+                        "use_tqdm": False,
+                    }
+                    if self.remote_lora_request:
+                        generation_kwargs["lora_request"] = dict(self.remote_lora_request)
+                    outputs = self.vllm_runtime.llm.generate(unique_request_inputs_local, **generation_kwargs)
+                    grouped_completion_ids = [
+                        [list(candidate.token_ids) for candidate in list(getattr(output, "outputs", []) or [])]
+                        for output in list(outputs or [])
+                    ]
+                    if tp_size > 1 and getattr(self.vllm_runtime, "tp_group", None) is not None:
+                        local_rank_in_tp_group = int(getattr(self.vllm_runtime, "local_rank_in_tp_group", 0) or 0)
+                        tp_slice = slice(
+                            local_rank_in_tp_group * unique_request_count,
+                            (local_rank_in_tp_group + 1) * unique_request_count,
+                        )
+                        grouped_completion_ids = grouped_completion_ids[tp_slice]
+                completion_ids_batch = _expand_grouped_completion_ids(
+                    request_groups=request_groups,
+                    grouped_completion_ids=grouped_completion_ids,
+                    total_request_count=len(llm_inputs),
+                )
+            else:
+                completion_ids_batch = _generate_completion_ids_for_inputs(
+                    llm_inputs,
+                    seed=None,
+                    num_completions=1,
+                )
+        elif self.do_sample:
+            completion_ids_batch = _generate_completion_ids_for_inputs(llm_inputs, seed=None)
+        else:
+            completion_ids_batch = _generate_completion_ids_for_inputs(llm_inputs, seed=None)
+        raw_output_texts = self.processor.batch_decode(
             completion_ids_batch,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        return [_trim_to_first_structured_block(output_text) for output_text in output_texts]
+        output_texts = [_trim_to_first_structured_block(output_text) for output_text in raw_output_texts]
+        if self.capture_rl_token_traces:
+            eos_token_id = int(
+                getattr(getattr(self.processor, "tokenizer", self.processor), "eos_token_id", 0)
+                or getattr(getattr(self.processor, "tokenizer", self.processor), "pad_token_id", 0)
+                or 0
+            )
+            token_traces: List[Dict[str, Any]] = []
+            for prepared_messages, prompt_text, output_text, prompt_inputs in zip(
+                prepared_messages_batch,
+                prompt_text_batch,
+                output_texts,
+                prompt_input_tensors,
+            ):
+                completion_tensor = _tokenize_trimmed_completion_text(self.processor, output_text)
+                completion_mask = _build_rl_completion_mask(
+                    completion_tensor,
+                    eos_token_id=eos_token_id,
+                )
+                trace_spec: Dict[str, Any] = {
+                    "prompt_trace": {
+                        "prompt_ids": prompt_inputs["input_ids"].detach().cpu(),
+                        "prompt_mask": prompt_inputs["attention_mask"].detach().cpu(),
+                        "multimodal_inputs": {},
+                    },
+                    "completion_ids": completion_tensor.detach().cpu(),
+                    "completion_mask": completion_mask.detach().cpu(),
+                }
+                for key, value in prompt_inputs.items():
+                    if key in {"input_ids", "attention_mask"}:
+                        continue
+                    if isinstance(value, torch.Tensor):
+                        trace_spec["prompt_trace"]["multimodal_inputs"][key] = value.detach().cpu()
+                token_traces.append(trace_spec)
+            self._last_rl_token_traces = token_traces
+        trace_count = -1 if self._last_rl_token_traces is None else int(len(self._last_rl_token_traces))
+        first_trace_keys = []
+        if isinstance(self._last_rl_token_traces, list) and self._last_rl_token_traces and isinstance(self._last_rl_token_traces[0], dict):
+            first_trace_keys = sorted(str(key) for key in self._last_rl_token_traces[0].keys())
+        runtime_log(
+            "rl trace generate debug: "
+            f"policy_class={self.__class__.__name__} "
+            "runtime_enabled=true "
+            f"capture_rl_token_traces={bool(self.capture_rl_token_traces)} "
+            f"batch_size={len(messages_batch)} "
+            f"base_seed={base_seed} "
+            f"runtime_rank={runtime_rank} "
+            f"prompt_trace_inputs={len(prompt_input_tensors)} "
+            f"output_count={len(output_texts)} "
+            f"trace_count={trace_count} "
+            f"first_trace_keys={first_trace_keys}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
+        return output_texts
 
 
 def _maybe_load_adapter_source_model(

@@ -37,7 +37,7 @@ BRANCH_ORDER = (
     "drop_confirmation",
     "hard_negative_swap",
 )
-COUNTERFACTUAL_BRANCH_PROFILES = ("full", "offline_full", "online_core")
+COUNTERFACTUAL_BRANCH_PROFILES = ("full", "offline_full", "online_core", "structured_oracle_v1")
 FINALIZE_READINESS_THRESHOLD = 0.75
 
 
@@ -56,6 +56,8 @@ def _normalize_counterfactual_branch_profile(value: Any) -> str:
         return "offline_full"
     if normalized == "online_core":
         return "online_core"
+    if normalized == "structured_oracle_v1":
+        return "structured_oracle_v1"
     raise ValueError(
         f"Unsupported counterfactual branch profile: {value!r}. "
         f"Expected one of {COUNTERFACTUAL_BRANCH_PROFILES}."
@@ -141,6 +143,273 @@ def _interval_iou(pred_interval: Sequence[float] | None, ref_interval: Sequence[
     if union <= 0:
         return 0.0
     return intersection / union
+
+
+def _normalize_decision_payload(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    payload = dict(payload or {})
+    normalized: Dict[str, Any] = {}
+    existence = str(payload.get("existence") or "").strip().lower()
+    normalized["existence"] = "anomaly" if existence == "anomaly" else "normal"
+    normalized["category"] = canonicalize_saver_category(
+        payload.get("category"),
+        existence=normalized["existence"],
+    ) or str(payload.get("category") or "").strip().lower()
+    interval = payload.get("anomaly_interval_sec")
+    normalized["anomaly_interval_sec"] = list(interval) if isinstance(interval, (list, tuple)) and len(interval) == 2 else None
+    normalized["counterfactual_type"] = str(payload.get("counterfactual_type") or "").strip().lower() or "none"
+    return normalized
+
+
+def _extract_final_decision_payload(rollout: Dict[str, Any]) -> Dict[str, Any]:
+    state = dict(rollout.get("state") or {})
+    for candidate in (rollout.get("final_answer"), state.get("finalized_case")):
+        if isinstance(candidate, dict) and candidate:
+            return _normalize_decision_payload(candidate)
+    return {}
+
+
+def _reference_stage_moments(reference_record: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    evidence_moments = list(((reference_record.get("evidence") or {}).get("evidence_moments") or []))
+    by_id = {
+        str(moment.get("moment_id") or "").strip(): dict(moment)
+        for moment in evidence_moments
+        if str(moment.get("moment_id") or "").strip()
+    }
+    grouped: Dict[str, List[Dict[str, Any]]] = {stage: [] for stage in STAGE_ORDER}
+    chain_target = dict((reference_record.get("structured_target") or {}).get("event_chain_target") or {})
+    stage_to_moment_ids = dict(chain_target.get("stage_to_moment_ids") or {})
+    for stage in STAGE_ORDER:
+        for moment_id in list(stage_to_moment_ids.get(stage) or []):
+            moment = by_id.get(str(moment_id).strip())
+            if moment is not None:
+                grouped[stage].append(moment)
+    for moment in evidence_moments:
+        stage = ROLE_TO_STAGE.get(str(moment.get("role") or "").strip().lower(), "")
+        if stage and all(str(existing.get("moment_id") or "") != str(moment.get("moment_id") or "") for existing in grouped[stage]):
+            grouped[stage].append(dict(moment))
+    return grouped
+
+
+def _record_interval(entry: Dict[str, Any]) -> List[float] | None:
+    start_sec = entry.get("start_sec")
+    end_sec = entry.get("end_sec")
+    if start_sec is None or end_sec is None:
+        return None
+    try:
+        start_val = float(start_sec)
+        end_val = float(end_sec)
+    except Exception:
+        return None
+    if end_val < start_val:
+        start_val, end_val = end_val, start_val
+    return [start_val, end_val]
+
+
+def _moment_interval(moment: Dict[str, Any]) -> List[float] | None:
+    try:
+        start_val = float(moment.get("start_sec"))
+        end_val = float(moment.get("end_sec"))
+    except Exception:
+        return None
+    if end_val < start_val:
+        start_val, end_val = end_val, start_val
+    return [start_val, end_val]
+
+
+def _records_support_against_moments(records: Sequence[Dict[str, Any]], moments: Sequence[Dict[str, Any]]) -> float:
+    max_score = 0.0
+    for record in list(records or []):
+        record_interval = _record_interval(record)
+        if record_interval is None:
+            continue
+        for moment in list(moments or []):
+            score = _interval_iou(record_interval, _moment_interval(moment))
+            if score > max_score:
+                max_score = float(score)
+    return round(float(max_score), 6)
+
+
+def _structured_decision_scores(
+    *,
+    rollout: Dict[str, Any],
+    target: Dict[str, Any],
+) -> Dict[str, float]:
+    prediction = _extract_final_decision_payload(rollout)
+    scores: Dict[str, float] = {}
+    target_existence = str(target.get("existence") or "").strip().lower()
+    scores["existence"] = 1.0 if prediction.get("existence") == ("anomaly" if target_existence == "anomaly" else "normal") else 0.0
+    target_category = canonicalize_saver_category(target.get("category"), existence=target_existence) or str(target.get("category") or "").strip().lower()
+    prediction_category = canonicalize_saver_category(prediction.get("category"), existence=prediction.get("existence")) or str(prediction.get("category") or "").strip().lower()
+    scores["category"] = 1.0 if target_category and prediction_category == target_category else 0.0
+    target_interval = target.get("anomaly_interval_sec")
+    prediction_interval = prediction.get("anomaly_interval_sec")
+    if target_existence == "anomaly" and isinstance(target_interval, (list, tuple)) and len(target_interval) == 2:
+        scores["temporal"] = round(float(_interval_iou(prediction_interval, target_interval)), 6)
+    return scores
+
+
+def _average(values: Sequence[float]) -> float:
+    values = [float(value) for value in list(values or [])]
+    if not values:
+        return 0.0
+    return round(sum(values) / float(len(values)), 6)
+
+
+def _required_stage_list(target: Dict[str, Any], stage_requirements: Dict[str, List[str]]) -> List[str]:
+    chain_target = dict(target.get("event_chain_target") or {})
+    required = [str(stage).strip().lower() for stage in list(chain_target.get("required_stages") or []) if str(stage).strip()]
+    if required:
+        return [stage for stage in STAGE_ORDER if stage in required]
+    fallback = [str(stage).strip().lower() for stage in list(stage_requirements.get("finalize_required_stages") or []) if str(stage).strip()]
+    return [stage for stage in STAGE_ORDER if stage in fallback]
+
+
+def _structured_oracle_profile_entry(
+    *,
+    rollout: Dict[str, Any],
+    reference_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    target = dict(reference_record.get("structured_target") or {})
+    evidence_moments = ((reference_record.get("evidence") or {}).get("evidence_moments") or [])
+    stage_requirements = derive_counterfactual_stage_requirements(target, evidence_moments=evidence_moments)
+    selected_window_ids = infer_counterfactual_window_ids(rollout)
+    selected_records = _selected_window_records(rollout, selected_window_ids)
+    stage_moments = _reference_stage_moments(reference_record)
+    decision_scores = _structured_decision_scores(rollout=rollout, target=target)
+    decision_score = _average(list(decision_scores.values()))
+
+    stage_support_scores = {
+        stage: _records_support_against_moments(selected_records, stage_moments.get(stage) or [])
+        for stage in STAGE_ORDER
+    }
+    target_existence = str(target.get("existence") or "").strip().lower()
+    trigger_support_full = float(stage_support_scores.get("trigger", 0.0))
+    if target_existence == "anomaly":
+        selected_support = round(float(decision_score) * float(trigger_support_full), 6)
+    else:
+        selected_support = float(decision_score)
+
+    required_stages = _required_stage_list(target, stage_requirements)
+    if target_existence != "anomaly":
+        required_stage_coverage = 1.0
+    else:
+        required_stage_coverage = _average([stage_support_scores.get(stage, 0.0) for stage in required_stages])
+
+    trigger_aligned_window_ids: List[str] = []
+    for record in selected_records:
+        best_stage = ""
+        best_score = 0.0
+        for stage, moments in stage_moments.items():
+            score = _records_support_against_moments([record], moments)
+            if score > best_score:
+                best_score = score
+                best_stage = stage
+        if best_stage == "trigger" and best_score >= 0.3:
+            window_id = str(record.get("window_id") or "").strip()
+            if window_id:
+                trigger_aligned_window_ids.append(window_id)
+
+    remaining_records = [
+        record for record in selected_records
+        if str(record.get("window_id") or "").strip() not in set(trigger_aligned_window_ids)
+    ]
+    trigger_support_drop = _records_support_against_moments(remaining_records, stage_moments.get("trigger") or [])
+    if target_existence == "anomaly":
+        drop_trigger_necessity = round(max(0.0, float(trigger_support_full) - float(trigger_support_drop)), 6)
+    else:
+        drop_trigger_necessity = 0.0
+
+    full_selected_fields: Dict[str, Dict[str, Any]] = {
+        "existence": {"score": float(decision_scores.get("existence", 0.0)), "supported": bool(decision_scores.get("existence", 0.0) >= 1.0)},
+        "category": {"score": float(decision_scores.get("category", 0.0)), "supported": bool(decision_scores.get("category", 0.0) >= 1.0)},
+        "temporal": {"score": float(decision_scores.get("temporal", 0.0)), "supported": bool(decision_scores.get("temporal", 0.0) >= 0.5)},
+        "trigger": {"score": float(stage_support_scores.get("trigger", 0.0)), "supported": bool(stage_support_scores.get("trigger", 0.0) >= 0.3)},
+        "precursor": {"score": float(stage_support_scores.get("precursor", 0.0)), "supported": bool(stage_support_scores.get("precursor", 0.0) >= 0.3)},
+        "confirmation": {"score": float(stage_support_scores.get("confirmation", 0.0)), "supported": bool(stage_support_scores.get("confirmation", 0.0) >= 0.3)},
+        "finalize_readiness": {"score": float(required_stage_coverage), "supported": bool(required_stage_coverage >= FINALIZE_READINESS_THRESHOLD)},
+    }
+    drop_trigger_fields: Dict[str, Dict[str, Any]] = {
+        "existence": {"score": max(0.0, float(full_selected_fields["existence"]["score"]) - float(drop_trigger_necessity)), "supported": False},
+        "category": {"score": max(0.0, float(full_selected_fields["category"]["score"]) - float(drop_trigger_necessity)), "supported": False},
+        "temporal": {"score": max(0.0, float(full_selected_fields["temporal"]["score"]) - float(drop_trigger_necessity)), "supported": False},
+        "trigger": {"score": float(trigger_support_drop), "supported": bool(trigger_support_drop >= 0.3)},
+        "precursor": {"score": float(stage_support_scores.get("precursor", 0.0)), "supported": bool(stage_support_scores.get("precursor", 0.0) >= 0.3)},
+        "confirmation": {"score": float(stage_support_scores.get("confirmation", 0.0)), "supported": bool(stage_support_scores.get("confirmation", 0.0) >= 0.3)},
+        "finalize_readiness": {"score": float(required_stage_coverage), "supported": bool(required_stage_coverage >= FINALIZE_READINESS_THRESHOLD)},
+    }
+    branch_field_matrix = {
+        "full_selected": {
+            "available": bool(selected_window_ids),
+            "window_ids": list(selected_window_ids),
+            "fields": full_selected_fields,
+            "core_decision_supported": bool(selected_support >= 0.5),
+            "supported_stages": [stage for stage, score in stage_support_scores.items() if score >= 0.3],
+            "missing_required_stages": [stage for stage in required_stages if stage_support_scores.get(stage, 0.0) < 0.3],
+        },
+        "drop_trigger": {
+            "available": bool(trigger_aligned_window_ids),
+            "window_ids": [
+                str(record.get("window_id") or "").strip()
+                for record in remaining_records
+                if str(record.get("window_id") or "").strip()
+            ],
+            "fields": drop_trigger_fields,
+            "core_decision_supported": False,
+            "supported_stages": [stage for stage, score in stage_support_scores.items() if stage != "trigger" and score >= 0.3],
+            "missing_required_stages": [stage for stage in required_stages if (stage == "trigger" or stage_support_scores.get(stage, 0.0) < 0.3)],
+        },
+    }
+    branch_delta_matrix = _build_branch_delta_matrix(branch_field_matrix)
+    summary = {
+        "decision_sufficiency": bool(selected_support >= 0.5),
+        "minimal_subset_sufficiency": False,
+        "negative_specificity_pass": False,
+        "counterfactual_type_supported": True,
+        "stage_necessity": {
+            "trigger": (
+                "decision_critical"
+                if drop_trigger_necessity >= 0.3
+                else ("non_critical" if stage_moments.get("trigger") else "not_observed")
+            )
+        },
+        "oracle_selected_support_score": float(selected_support),
+        "oracle_required_stage_coverage_score": float(required_stage_coverage),
+        "oracle_drop_trigger_necessity_score": float(drop_trigger_necessity),
+    }
+    return {
+        "counterfactual_branches": {},
+        "counterfactual_profile": {
+            "summary": summary,
+            "branch_field_matrix": branch_field_matrix,
+            "branch_delta_matrix": branch_delta_matrix,
+            "stage_packages": {
+                "selected_window_ids": list(selected_window_ids),
+                "selected_by_stage": _stage_window_ids(selected_records),
+                "trigger_aligned_window_ids": list(trigger_aligned_window_ids),
+                "required_stages": list(required_stages),
+            },
+            "selection_metadata": {
+                "normalized_branch_profile": "structured_oracle_v1",
+                "stage_requirements": copy.deepcopy(stage_requirements),
+            },
+            "counterfactual_profile_source": "structured_oracle_v1",
+            "counterfactual_branch_profile": "structured_oracle_v1",
+        },
+        "counterfactual_profile_source": "structured_oracle_v1",
+        "counterfactual_branch_profile": "structured_oracle_v1",
+    }
+
+
+def _run_structured_oracle_verification_batch(
+    batch_inputs: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [
+        _structured_oracle_profile_entry(
+            rollout=dict((batch_input.get("rollout") or {})),
+            reference_record=dict((batch_input.get("reference_record") or batch_input.get("item") or {})),
+        )
+        for batch_input in list(batch_inputs or [])
+    ]
 
 
 def _tokenize(text: Any) -> List[str]:
@@ -348,9 +617,7 @@ def _resolve_counterfactual_branch_order(
     if normalized == "online_core":
         return [
             "full_selected",
-            "minimal_subset",
             "drop_trigger",
-            "hard_negative_swap",
         ]
     return list(BRANCH_ORDER)
 
@@ -1031,6 +1298,13 @@ def run_counterfactual_verification_batch(
     batch_input_list = list(batch_inputs or [])
     if not batch_input_list:
         return []
+    normalized_branch_profile = _normalize_counterfactual_branch_profile(branch_profile)
+    if normalized_branch_profile == "structured_oracle_v1":
+        return _run_structured_oracle_verification_batch(batch_input_list)
+    if policy is None:
+        raise ValueError(
+            "run_counterfactual_verification_batch requires a non-null policy unless branch_profile='structured_oracle_v1'."
+        )
 
     entries: List[Dict[str, Any]] = []
     for batch_input in batch_input_list:

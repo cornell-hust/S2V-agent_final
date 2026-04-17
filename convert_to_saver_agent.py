@@ -863,11 +863,18 @@ class CanonicalSaverAdapter:
                 "Verify the current evidence subset before finalizing the case.",
             ],
         }
+        source_video_id = str(base.get("video_id") or "")
+        rl_prompt_template_id = "default_agent_train_v1"
+        rl_prompt_variant_id = 0
         base["agent_task"] = agent_task
         base["structured_target"] = structured_target
         base["tool_io"] = tool_io
         base["search_supervision"] = search_supervision
         base["stage_supervision"] = copy.deepcopy(search_supervision.get("stage_supervision") or {})
+        base["source_video_id"] = source_video_id
+        base["rl_prompt_template_id"] = rl_prompt_template_id
+        base["rl_prompt_variant_id"] = int(rl_prompt_variant_id)
+        base["rl_instance_id"] = f"{source_video_id}::{rl_prompt_template_id}::{int(rl_prompt_variant_id)}"
         return base
 
     def _build_task_prompt(self, base: Dict[str, Any]) -> str:

@@ -3,6 +3,7 @@ import unittest
 from saver_v3.data.runtime_items import build_runtime_item_from_compact_trace_row
 from saver_v3.core.environment import SaverVideoInteraction
 from saver_v3.core.schema import SaverEnvironmentState
+from saver_v3.core.tool_registry import execute_tool_call
 
 
 def _sample_row() -> dict:
@@ -149,6 +150,75 @@ class RolloutRuntimeSupportTests(unittest.TestCase):
         self.assertEqual(is_search, [1])
         self.assertEqual(state.finalized_case, {"existence": "anomaly", "category": "people_falling"})
         self.assertEqual(state.finalized_semantic_answer["summary"], "A person falls in the aisle.")
+
+    def test_finalize_case_normalizes_runtime_ids_to_gt_moment_ids(self) -> None:
+        state = SaverEnvironmentState()
+        state.evidence_ledger = [
+            {
+                "window_id": "w0002",
+                "evidence_id": "e0002",
+                "moment_id": "m1",
+                "role": "trigger",
+                "start_sec": 4.9,
+                "end_sec": 8.9,
+            },
+            {
+                "window_id": "w0003",
+                "evidence_id": "e0003",
+                "moment_id": None,
+                "role": "confirmation",
+                "start_sec": 8.8,
+                "end_sec": 12.1,
+            },
+        ]
+        state.active_evidence_window_ids = ["w0002", "w0003"]
+        multimodal_cache = {
+            "structured_target": {
+                "existence": "anomaly",
+                "category": "assault",
+                "event_chain_target": {
+                    "stage_to_moment_ids": {
+                        "trigger": ["ev2"],
+                        "confirmation": ["ev4"],
+                    }
+                },
+            },
+            "tool_io": {
+                "oracle_windows_sec": [
+                    {"moment_id": "ev2", "role": "trigger", "window": [5.0, 9.0]},
+                    {"moment_id": "ev4", "role": "confirmation", "window": [9.0, 12.0]},
+                ],
+                "finalize_case_schema": {
+                    "type": "object",
+                    "properties": {
+                        "existence": {"type": "string"},
+                        "category": {"type": "string"},
+                        "evidence_moment_ids": {"type": "array", "items": {"type": "string"}},
+                        "stage_selected_moment_ids": {"type": "object"},
+                    },
+                    "required": ["existence", "category", "evidence_moment_ids", "stage_selected_moment_ids"],
+                },
+            },
+        }
+
+        _, state, _ = execute_tool_call(
+            "finalize_case",
+            {
+                "existence": "anomaly",
+                "category": "assault",
+                "evidence_moment_ids": ["m1", "e0002", "e0003"],
+                "stage_selected_moment_ids": {
+                    "trigger": ["m1", "e0002"],
+                    "confirmation": ["e0003"],
+                },
+            },
+            multimodal_cache,
+            state,
+        )
+
+        self.assertEqual(state.finalized_case["evidence_moment_ids"], ["ev2", "ev4"])
+        self.assertEqual(state.finalized_case["stage_selected_moment_ids"], {"trigger": ["ev2"], "confirmation": ["ev4"]})
+        self.assertEqual(state.finalized_case["covered_stages"], ["trigger", "confirmation"])
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@ import json
 import math
 import random
 import re
-import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1387,45 +1386,14 @@ def _build_pure_grpo_tensor_pack_from_episode_feature(
     max_seq_length: int = 0,
     keep_recent_text_messages: int = 0,
 ) -> BatchBuildResult:
-    def _copy_nested_tensor_payload(value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu()
-        if isinstance(value, dict):
-            return {str(key): _copy_nested_tensor_payload(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [_copy_nested_tensor_payload(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(_copy_nested_tensor_payload(item) for item in value)
-        return copy.deepcopy(value)
-
     prompt_trace = feature.get("episode_prompt_trace")
     assistant_traces = list(feature.get("episode_assistant_traces") or [])
-    completion_ids = feature.get("completion_ids")
-    completion_mask = feature.get("completion_mask")
-    if (
-        not isinstance(prompt_trace, dict)
-        or (
-            not assistant_traces
-            and (
-                not isinstance(completion_ids, torch.Tensor)
-                or not isinstance(completion_mask, torch.Tensor)
-            )
-        )
-    ):
+    if not isinstance(prompt_trace, dict) or not assistant_traces:
         return BatchBuildResult(
             batch=None,
             cached_plan=None,
             completion_token_count=0,
             drop_reason="missing_pure_pack_materials",
-            budgeting_attempted=False,
-            is_episode_feature=True,
-        )
-    if "advantages" not in feature:
-        return BatchBuildResult(
-            batch=None,
-            cached_plan=None,
-            completion_token_count=0,
-            drop_reason="missing_rollout_advantages",
             budgeting_attempted=False,
             is_episode_feature=True,
         )
@@ -1438,71 +1406,84 @@ def _build_pure_grpo_tensor_pack_from_episode_feature(
             budgeting_attempted=False,
             is_episode_feature=True,
         )
-    multimodal_inputs = prompt_trace.get("multimodal_inputs")
-    legacy_prompt_trace_tensor_keys = [
-        str(key)
-        for key, value in prompt_trace.items()
-        if str(key) not in {"prompt_ids", "prompt_mask", "multimodal_inputs"}
-        and isinstance(value, torch.Tensor)
-    ]
-    if legacy_prompt_trace_tensor_keys:
-        raise ValueError(
-            "Legacy RL pure-pack prompt_trace format detected; regenerate materialized/runtime cache with nested "
-            f"`multimodal_inputs`. Offending keys: {', '.join(sorted(legacy_prompt_trace_tensor_keys))}"
-        )
-    if not isinstance(multimodal_inputs, dict):
-        raise ValueError(
-            "Active RL pure-pack prompt_trace must contain dict `multimodal_inputs`; regenerate materialized/runtime cache."
+    completion_ids_list: List[torch.Tensor] = []
+    completion_mask_list: List[torch.Tensor] = []
+    for trace in assistant_traces:
+        if not isinstance(trace, dict):
+            continue
+        completion_ids = trace.get("completion_ids")
+        completion_mask = trace.get("completion_mask")
+        if isinstance(completion_ids, torch.Tensor) and isinstance(completion_mask, torch.Tensor):
+            completion_ids_list.append(completion_ids.detach().cpu())
+            completion_mask_list.append(completion_mask.detach().cpu().to(dtype=torch.bool))
+    if not completion_ids_list:
+        return BatchBuildResult(
+            batch=None,
+            cached_plan=None,
+            completion_token_count=0,
+            drop_reason="zero_response_after_budgeting",
+            budgeting_attempted=False,
+            is_episode_feature=True,
         )
     prompt_ids = prompt_trace["prompt_ids"].detach().cpu()
     prompt_mask = prompt_trace["prompt_mask"].detach().cpu()
-    if isinstance(completion_ids, torch.Tensor) and isinstance(completion_mask, torch.Tensor):
-        packed_completion_ids = completion_ids.detach().cpu()
-        packed_completion_mask = completion_mask.detach().cpu().to(dtype=torch.bool)
-    else:
-        completion_ids_list: List[torch.Tensor] = []
-        completion_mask_list: List[torch.Tensor] = []
-        for trace in assistant_traces:
-            if not isinstance(trace, dict):
-                continue
-            trace_completion_ids = trace.get("completion_ids")
-            trace_completion_mask = trace.get("completion_mask")
-            if isinstance(trace_completion_ids, torch.Tensor) and isinstance(trace_completion_mask, torch.Tensor):
-                completion_ids_list.append(trace_completion_ids.detach().cpu())
-                completion_mask_list.append(trace_completion_mask.detach().cpu().to(dtype=torch.bool))
-        if not completion_ids_list:
-            return BatchBuildResult(
-                batch=None,
-                cached_plan=None,
-                completion_token_count=0,
-                drop_reason="zero_response_after_budgeting",
-                budgeting_attempted=False,
-                is_episode_feature=True,
-            )
-        packed_completion_ids = torch.cat(completion_ids_list, dim=-1)
-        packed_completion_mask = torch.cat(completion_mask_list, dim=-1)
+    completion_ids = torch.cat(completion_ids_list, dim=-1)
+    completion_mask = torch.cat(completion_mask_list, dim=-1)
     pack: Dict[str, Any] = {
         "prompt_ids": prompt_ids,
         "prompt_mask": prompt_mask,
-        "completion_ids": packed_completion_ids,
-        "completion_mask": packed_completion_mask,
-        "advantages": torch.tensor([float(feature.get("advantages") or 0.0)], dtype=torch.float32),
+        "completion_ids": completion_ids,
+        "completion_mask": completion_mask,
+        "advantages": torch.tensor([float(feature.get("advantages", feature.get("advantage", feature.get("sample_weight", 1.0))) or 0.0)], dtype=torch.float32),
         "old_policy_token_log_probs": None,
-        "sample_weight": torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32),
-        "sample_loss_multiplier": torch.tensor(
-            [float(feature.get("sample_loss_multiplier", 1.0))],
-            dtype=torch.float32,
-        ),
-        "multimodal_inputs": _copy_nested_tensor_payload(multimodal_inputs),
     }
+    for key, value in prompt_trace.items():
+        if key in {"input_ids", "attention_mask"}:
+            continue
+        if isinstance(value, torch.Tensor):
+            pack[key] = value.detach().cpu()
     return BatchBuildResult(
         batch=pack,
         cached_plan=None,
-        completion_token_count=int(packed_completion_mask.sum().item()),
+        completion_token_count=int(completion_mask.sum().item()),
         drop_reason=None,
         budgeting_attempted=False,
         is_episode_feature=True,
     )
+
+
+def _extract_assistant_text(message: Dict[str, Any]) -> str:
+    texts: List[str] = []
+    for item in list(message.get("content") or []):
+        if item.get("type") == "text":
+            texts.append(str(item.get("text") or ""))
+    return "".join(texts).strip()
+
+
+def _coerce_rl_prompt_completion_feature(
+    feature: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], str]:
+    prompt_messages = feature.get("prompt_messages")
+    completion_text = str(feature.get("completion_text") or "").strip()
+    if isinstance(prompt_messages, list) and completion_text:
+        return copy.deepcopy(prompt_messages), completion_text
+
+    messages = copy.deepcopy(list(feature.get("messages") or []))
+    if not messages:
+        raise ValueError("RL completion-native batching requires prompt_messages or legacy messages.")
+
+    target_response = str(feature.get("target_response") or "").strip()
+    last_message = messages[-1]
+    last_role = str(last_message.get("role") or "")
+    last_assistant_text = _extract_assistant_text(last_message) if last_role == "assistant" else ""
+    if not completion_text:
+        completion_text = target_response or last_assistant_text
+    if not completion_text:
+        raise ValueError("RL completion-native batching requires a non-empty completion_text/target_response.")
+
+    if last_role == "assistant" and last_assistant_text == completion_text:
+        messages = messages[:-1]
+    return messages, completion_text
 
 
 def _build_rl_completion_episode_spec_from_feature(
@@ -1516,33 +1497,156 @@ def _build_rl_completion_episode_spec_from_feature(
     max_seq_length: int = 0,
     keep_recent_text_messages: int = 0,
 ) -> BatchBuildResult:
-    has_legacy_shape = isinstance(feature.get("episode_prompt_trace"), dict) and isinstance(
-        feature.get("episode_assistant_traces"),
-        list,
-    )
-    has_turn_shape = (
-        isinstance(feature.get("episode_prompt_trace"), dict)
-        and isinstance(feature.get("completion_ids"), torch.Tensor)
-        and isinstance(feature.get("completion_mask"), torch.Tensor)
-    )
-    if not has_legacy_shape and not has_turn_shape:
+    if isinstance(feature.get("episode_prompt_trace"), dict) and isinstance(feature.get("episode_assistant_traces"), list):
+        return _build_pure_grpo_tensor_pack_from_episode_feature(
+            processor,
+            feature,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
+            keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+            max_total_images=max_total_images,
+            max_seq_length=max_seq_length,
+            keep_recent_text_messages=keep_recent_text_messages,
+        )
+
+    token_trace_spec = feature.get("rl_token_trace_spec")
+    if isinstance(token_trace_spec, dict):
+        required_tensor_keys = (
+            "prompt_ids",
+            "prompt_mask",
+            "completion_ids",
+            "completion_mask",
+        )
+        if not all(isinstance(token_trace_spec.get(key), torch.Tensor) for key in required_tensor_keys):
+            return BatchBuildResult(
+                batch=None,
+                cached_plan=None,
+                completion_token_count=0,
+                drop_reason="missing_token_trace_spec",
+                budgeting_attempted=False,
+                is_episode_feature=True,
+            )
+        completion_token_count = int(token_trace_spec["completion_ids"].shape[-1])
+        episode_spec: Dict[str, Any] = {
+            "sample_weight": torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32),
+            "advantage": torch.tensor(
+                [float(feature.get("advantage", feature.get("sample_weight", 1.0)) or 0.0)],
+                dtype=torch.float32,
+            ),
+        }
+        for key, value in token_trace_spec.items():
+            if isinstance(value, torch.Tensor):
+                episode_spec[key] = value.detach().cpu()
+            else:
+                episode_spec[key] = copy.deepcopy(value)
+        episode_spec.setdefault(
+            "prompt_token_count",
+            torch.tensor([int(token_trace_spec["prompt_ids"].shape[-1])], dtype=torch.long),
+        )
+        episode_spec.setdefault(
+            "completion_token_count",
+            torch.tensor([int(completion_token_count)], dtype=torch.long),
+        )
         return BatchBuildResult(
-            batch=None,
+            batch=episode_spec,
             cached_plan=None,
-            completion_token_count=0,
-            drop_reason="missing_pure_pack_materials",
+            completion_token_count=int(completion_token_count),
+            drop_reason=None,
             budgeting_attempted=False,
             is_episode_feature=True,
         )
-    return _build_pure_grpo_tensor_pack_from_episode_feature(
-        processor,
-        feature,
+
+    prompt_messages_raw, completion_text = _coerce_rl_prompt_completion_feature(feature)
+    tagged_messages = _tag_messages_for_cache(prompt_messages_raw)
+    prompt_messages = _prepare_messages(
+        tagged_messages,
         max_image_side=max_image_side,
         max_image_pixels=max_image_pixels,
         keep_recent_tool_image_messages=keep_recent_tool_image_messages,
         max_total_images=max_total_images,
-        max_seq_length=max_seq_length,
         keep_recent_text_messages=keep_recent_text_messages,
+    )
+    prompt_messages, full_messages, prompt_text, full_text, full_inputs = _fit_messages_to_budget(
+        processor,
+        prompt_messages,
+        target_response=completion_text,
+        max_seq_length=max_seq_length,
+        truncation_side="left",
+    )
+
+    retained_prompt_tokens, retained_completion_tokens, completion_token_count_total = (
+        _resolve_retained_prompt_completion_lengths(
+            processor=processor,
+            prompt_messages=prompt_messages,
+            full_messages=full_messages,
+            prompt_text=prompt_text,
+            full_text=full_text,
+            retained_full_inputs=full_inputs,
+        )
+    )
+
+    if retained_completion_tokens <= 0:
+        return BatchBuildResult(
+            batch=None,
+            cached_plan=None,
+            completion_token_count=0,
+            drop_reason="zero_response_after_budgeting",
+            budgeting_attempted=True,
+            is_episode_feature=True,
+        )
+    if retained_prompt_tokens <= 0:
+        return BatchBuildResult(
+            batch=None,
+            cached_plan=None,
+            completion_token_count=int(retained_completion_tokens),
+            drop_reason="zero_prompt_after_budgeting",
+            budgeting_attempted=True,
+            is_episode_feature=True,
+        )
+    if retained_completion_tokens < completion_token_count_total:
+        return BatchBuildResult(
+            batch=None,
+            cached_plan=None,
+            completion_token_count=int(retained_completion_tokens),
+            drop_reason="truncated_completion_after_budgeting",
+            budgeting_attempted=True,
+            is_episode_feature=True,
+        )
+
+    input_ids = full_inputs["input_ids"]
+    attention_mask = full_inputs["attention_mask"]
+    prompt_ids = input_ids[:, :retained_prompt_tokens].clone()
+    prompt_mask = attention_mask[:, :retained_prompt_tokens].clone()
+    completion_ids = input_ids[:, retained_prompt_tokens:].clone()
+    completion_mask = attention_mask[:, retained_prompt_tokens:].clone()
+
+    episode_spec: Dict[str, Any] = {
+        "prompt_ids": prompt_ids.detach().cpu(),
+        "prompt_mask": prompt_mask.detach().cpu(),
+        "completion_ids": completion_ids.detach().cpu(),
+        "completion_mask": completion_mask.detach().cpu(),
+        "prompt_token_count": torch.tensor([int(retained_prompt_tokens)], dtype=torch.long),
+        "completion_token_count": torch.tensor([int(retained_completion_tokens)], dtype=torch.long),
+        "sample_weight": torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32),
+        "advantage": torch.tensor(
+            [float(feature.get("advantage", feature.get("sample_weight", 1.0)) or 0.0)],
+            dtype=torch.float32,
+        ),
+    }
+    for key, value in full_inputs.items():
+        if key in {"input_ids", "attention_mask"}:
+            continue
+        if isinstance(value, torch.Tensor):
+            episode_spec[key] = value.detach().cpu()
+        else:
+            episode_spec[key] = copy.deepcopy(value)
+    return BatchBuildResult(
+        batch=episode_spec,
+        cached_plan=None,
+        completion_token_count=int(retained_completion_tokens),
+        drop_reason=None,
+        budgeting_attempted=True,
+        is_episode_feature=True,
     )
 
 
@@ -2903,46 +3007,7 @@ def compute_completion_only_token_log_probs_from_ids(
         }
     )
     logits_to_keep = int(completion_ids.shape[-1]) + 1
-    def _summarize_value(value):
-        if isinstance(value, torch.Tensor):
-            return {
-                "shape": tuple(int(v) for v in value.shape),
-                "dtype": str(value.dtype).replace("torch.", ""),
-                "device": str(value.device),
-            }
-        if isinstance(value, dict):
-            return {str(k): _summarize_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return {"type": "list", "len": len(value)}
-        if isinstance(value, tuple):
-            return {"type": "tuple", "len": len(value)}
-        return type(value).__name__
-
-    multimodal_summary = {
-        str(key): _summarize_value(value)
-        for key, value in dict(multimodal_inputs or {}).items()
-    }
-    helper_forward_start = time.perf_counter()
-    runtime_log(
-        "rl completion_only helper before model forward: "
-        f"batch_size={int(input_ids.shape[0])} "
-        f"prompt_tokens={int(prompt_ids.shape[-1])} "
-        f"completion_tokens={int(completion_ids.shape[-1])} "
-        f"total_tokens={int(input_ids.shape[-1])} "
-        f"logits_to_keep={logits_to_keep} "
-        f"multimodal_keys={sorted(multimodal_summary.keys())} "
-        f"multimodal_summary={multimodal_summary}",
-        runtime=distributed_runtime_from_env(),
-        main_process_only=True,
-    )
     outputs = model(**model_inputs, logits_to_keep=logits_to_keep)
-    runtime_log(
-        "rl completion_only helper after model forward: "
-        f"batch_size={int(input_ids.shape[0])} "
-        f"elapsed_sec={time.perf_counter() - helper_forward_start:.3f}",
-        runtime=distributed_runtime_from_env(),
-        main_process_only=True,
-    )
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise RuntimeError("completion-only forward expected model outputs to expose `.logits`.")

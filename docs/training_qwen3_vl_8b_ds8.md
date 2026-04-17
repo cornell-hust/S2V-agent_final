@@ -20,7 +20,7 @@ This layer targets single-node 8 GPU full-model training for
 
 `train_sft_ds` now delegates to `saver_agent.training.run_standard_sft`, so the official v3 SFT path uses `compact_trace_v2` episode-format data and the v2 lazy-video collator stack instead of the broken step-format dataset.
 
-`train_rl_ds` launches the TRL + vLLM GRPO route and passes the FA3-only full-model policy configuration through to the dedicated RL trainer.
+`train_rl_ds` launches the pure-pack TRL + colocated-vLLM GRPO route. The active RL contract now requires materialized runtime item caches and only accepts episode-level tensor packs (`prompt_ids`, `prompt_mask`, `completion_ids`, `completion_mask`, `advantages`, `old_policy_token_log_probs`, multimodal inputs). Replay-buffer and legacy empty-batch flags are removed and fail fast.
 
 ## Wrapper Commands
 

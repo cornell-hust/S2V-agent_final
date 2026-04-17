@@ -9,6 +9,7 @@ from unittest import mock
 from saver_v3.inference.policy_rollout import PolicyRolloutConfig
 from saver_v3.inference.rollout_eval import StepRolloutEvalConfig
 from saver_v3.model import vllm_generation
+from saver_v3.rl import trl_grpo_trainer
 
 
 class VllmEntrypointConfigTests(unittest.TestCase):
@@ -475,3 +476,63 @@ class VllmEntrypointConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RLVllmRuntimeSelectionTests(unittest.TestCase):
+    def test_rl_create_vllm_runtime_prefers_direct_local_rank_runtime(self) -> None:
+        args = SimpleNamespace(
+            use_vllm=True,
+            vllm_mode="colocate",
+            vllm_tensor_parallel_size=1,
+            vllm_gpu_memory_utilization=0.4,
+            vllm_max_num_seqs=4,
+            vllm_fallback_max_num_seqs=2,
+        )
+        runtime = SimpleNamespace(local_rank=3, rank=3, world_size=8, is_distributed=True, is_main_process=False)
+        fake_runtime = object()
+        with mock.patch.object(
+            trl_grpo_trainer.shared_vllm_generation,
+            "create_vllm_runtime",
+            return_value=fake_runtime,
+        ) as create_mock:
+            result = trl_grpo_trainer.create_vllm_runtime(
+                args=args,
+                runtime=runtime,
+                model_path="/models/qwen3-vl-8b-Instruct",
+            )
+        self.assertIs(result, fake_runtime)
+        _, kwargs = create_mock.call_args
+        self.assertTrue(kwargs["prefer_direct_local_rank_runtime"])
+        self.assertEqual(kwargs["args"].vllm_max_num_seqs, 4)
+
+    def test_rl_create_vllm_runtime_falls_back_to_two_on_oom(self) -> None:
+        args = SimpleNamespace(
+            use_vllm=True,
+            vllm_mode="colocate",
+            vllm_tensor_parallel_size=1,
+            vllm_gpu_memory_utilization=0.4,
+            vllm_max_num_seqs=4,
+            vllm_fallback_max_num_seqs=2,
+        )
+        runtime = SimpleNamespace(local_rank=1, rank=1, world_size=8, is_distributed=True, is_main_process=False)
+        calls = []
+
+        def _fake_create_vllm_runtime(*, args, runtime, model_path, prefer_direct_local_rank_runtime):
+            calls.append((args.vllm_max_num_seqs, prefer_direct_local_rank_runtime))
+            if args.vllm_max_num_seqs == 4:
+                raise RuntimeError("CUDA out of memory while loading vLLM model")
+            return "ok"
+
+        with mock.patch.object(
+            trl_grpo_trainer.shared_vllm_generation,
+            "create_vllm_runtime",
+            side_effect=_fake_create_vllm_runtime,
+        ):
+            result = trl_grpo_trainer.create_vllm_runtime(
+                args=args,
+                runtime=runtime,
+                model_path="/models/qwen3-vl-8b-Instruct",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, [(4, True), (2, True)])
