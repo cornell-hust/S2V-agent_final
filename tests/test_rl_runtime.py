@@ -1016,6 +1016,53 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertTrue(any("rl compute_loss reference kl forward start:" in message for message in logged_messages))
         self.assertTrue(any("rl compute_loss reference kl forward end:" in message for message in logged_messages))
 
+    def test_compute_sample_losses_reuses_prepared_multimodal_inputs_for_policy_and_reference(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.policy_temperature = None
+        trainer.kl_beta = 0.01
+        trainer.reference_model = object()
+        trainer.ppo_clip_epsilon = 0.2
+        trainer._prepare_advantages = lambda batch, device: torch.ones((2,), dtype=torch.float32, device=device)
+        trainer._episode_input_multimodal_inputs = mock.Mock(
+            return_value={
+                "pixel_values": torch.ones((2, 3), dtype=torch.float32),
+                "image_grid_thw": torch.ones((2, 3), dtype=torch.long),
+            }
+        )
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        batch = {
+            "prompt_ids": torch.tensor([[1, 2], [1, 2]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1], [1, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[3, 4], [3, 4]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1], [1, 1]], dtype=torch.bool),
+            "old_policy_token_log_probs": torch.zeros((2, 2), dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0, 1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0, 1.0], dtype=torch.float32),
+        }
+        policy_logps = torch.zeros((2, 2), dtype=torch.float32, requires_grad=True)
+        reference_logps = torch.zeros((2, 2), dtype=torch.float32)
+        response_mask = torch.ones((2, 2), dtype=torch.bool)
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_prepared_inputs",
+            side_effect=[(policy_logps, response_mask), (reference_logps, response_mask)],
+        ) as prepared_helper:
+            sample_losses = trainer._compute_sample_losses_for_batch(model=TinyModel(), batch=batch)
+
+        self.assertEqual(trainer._episode_input_multimodal_inputs.call_count, 1)
+        self.assertEqual(prepared_helper.call_count, 2)
+        first_call = prepared_helper.call_args_list[0].kwargs
+        second_call = prepared_helper.call_args_list[1].kwargs
+        self.assertIs(first_call["model_inputs"], second_call["model_inputs"])
+        self.assertFalse(first_call["log_runtime_details"])
+        self.assertFalse(second_call["log_runtime_details"])
+        self.assertEqual(tuple(sample_losses.shape), (2,))
+
     def test_counterfactual_verification_batch_allows_null_policy_for_structured_oracle(self) -> None:
         result = run_counterfactual_verification_batch(
             None,

@@ -2893,6 +2893,32 @@ def compute_completion_only_token_log_probs_from_ids(
             "completion-only forward requires the current model forward() to accept logits_to_keep."
         )
 
+    model_inputs, logits_to_keep = build_completion_only_model_inputs(
+        prompt_ids=prompt_ids,
+        prompt_mask=prompt_mask,
+        completion_ids=completion_ids,
+        completion_mask=completion_mask,
+        multimodal_inputs=multimodal_inputs,
+    )
+    return compute_completion_only_token_log_probs_from_prepared_inputs(
+        model=model,
+        model_inputs=model_inputs,
+        completion_ids=completion_ids,
+        completion_mask=completion_mask,
+        logits_to_keep=logits_to_keep,
+        temperature=temperature,
+        log_runtime_details=True,
+    )
+
+
+def build_completion_only_model_inputs(
+    *,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    multimodal_inputs: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], int]:
     input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
     attention_mask = torch.cat([prompt_mask, completion_mask.to(dtype=prompt_mask.dtype)], dim=-1)
     model_inputs = dict(multimodal_inputs or {})
@@ -2903,55 +2929,93 @@ def compute_completion_only_token_log_probs_from_ids(
         }
     )
     logits_to_keep = int(completion_ids.shape[-1]) + 1
-    def _summarize_value(value):
-        if isinstance(value, torch.Tensor):
-            return {
-                "shape": tuple(int(v) for v in value.shape),
-                "dtype": str(value.dtype).replace("torch.", ""),
-                "device": str(value.device),
-            }
-        if isinstance(value, dict):
-            return {str(k): _summarize_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return {"type": "list", "len": len(value)}
-        if isinstance(value, tuple):
-            return {"type": "tuple", "len": len(value)}
-        return type(value).__name__
+    return model_inputs, logits_to_keep
 
-    multimodal_summary = {
-        str(key): _summarize_value(value)
-        for key, value in dict(multimodal_inputs or {}).items()
-    }
-    helper_forward_start = time.perf_counter()
-    runtime_log(
-        "rl completion_only helper before model forward: "
-        f"batch_size={int(input_ids.shape[0])} "
-        f"prompt_tokens={int(prompt_ids.shape[-1])} "
-        f"completion_tokens={int(completion_ids.shape[-1])} "
-        f"total_tokens={int(input_ids.shape[-1])} "
-        f"logits_to_keep={logits_to_keep} "
-        f"multimodal_keys={sorted(multimodal_summary.keys())} "
-        f"multimodal_summary={multimodal_summary}",
-        runtime=distributed_runtime_from_env(),
-        main_process_only=True,
-    )
-    outputs = model(**model_inputs, logits_to_keep=logits_to_keep)
-    runtime_log(
-        "rl completion_only helper after model forward: "
-        f"batch_size={int(input_ids.shape[0])} "
-        f"elapsed_sec={time.perf_counter() - helper_forward_start:.3f}",
-        runtime=distributed_runtime_from_env(),
-        main_process_only=True,
-    )
+
+def compute_completion_only_token_log_probs_from_prepared_inputs(
+    *,
+    model: Any,
+    model_inputs: Dict[str, Any],
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    logits_to_keep: int,
+    temperature: Optional[float] = None,
+    log_runtime_details: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    response_mask = completion_mask.to(dtype=torch.bool)
+    empty_token_log_probs = completion_ids.new_zeros(completion_ids.shape, dtype=torch.float32)
+    if not torch.any(response_mask):
+        return empty_token_log_probs, response_mask
+
+    if not _model_supports_logits_to_keep(model):
+        raise RuntimeError(
+            "completion-only forward requires the current model forward() to accept logits_to_keep."
+        )
+
+    input_ids = model_inputs.get("input_ids")
+    attention_mask = model_inputs.get("attention_mask")
+    if not isinstance(input_ids, torch.Tensor) or not isinstance(attention_mask, torch.Tensor):
+        raise ValueError("prepared completion-only forward requires tensor input_ids and attention_mask.")
+
+    prompt_token_count = int(input_ids.shape[-1]) - int(completion_ids.shape[-1])
+    if prompt_token_count <= 0:
+        raise ValueError("prepared completion-only forward requires at least one retained prompt token.")
+
+    if log_runtime_details:
+        def _summarize_value(value):
+            if isinstance(value, torch.Tensor):
+                return {
+                    "shape": tuple(int(v) for v in value.shape),
+                    "dtype": str(value.dtype).replace("torch.", ""),
+                    "device": str(value.device),
+                }
+            if isinstance(value, dict):
+                return {str(k): _summarize_value(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return {"type": "list", "len": len(value)}
+            if isinstance(value, tuple):
+                return {"type": "tuple", "len": len(value)}
+            return type(value).__name__
+
+        multimodal_summary = {
+            str(key): _summarize_value(value)
+            for key, value in model_inputs.items()
+            if str(key) not in {"input_ids", "attention_mask"}
+        }
+        helper_forward_start = time.perf_counter()
+        runtime_log(
+            "rl completion_only helper before model forward: "
+            f"batch_size={int(input_ids.shape[0])} "
+            f"prompt_tokens={prompt_token_count} "
+            f"completion_tokens={int(completion_ids.shape[-1])} "
+            f"total_tokens={int(input_ids.shape[-1])} "
+            f"logits_to_keep={int(logits_to_keep)} "
+            f"multimodal_keys={sorted(multimodal_summary.keys())} "
+            f"multimodal_summary={multimodal_summary}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
+    else:
+        helper_forward_start = None
+
+    outputs = model(**model_inputs, logits_to_keep=int(logits_to_keep))
+    if log_runtime_details:
+        runtime_log(
+            "rl completion_only helper after model forward: "
+            f"batch_size={int(input_ids.shape[0])} "
+            f"elapsed_sec={time.perf_counter() - helper_forward_start:.3f}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise RuntimeError("completion-only forward expected model outputs to expose `.logits`.")
-    if int(logits.shape[-2]) < logits_to_keep:
+    if int(logits.shape[-2]) < int(logits_to_keep):
         raise RuntimeError(
             "completion-only forward expected the model to honor logits_to_keep="
-            f"{logits_to_keep}, but received logits with seq_len={int(logits.shape[-2])}."
+            f"{int(logits_to_keep)}, but received logits with seq_len={int(logits.shape[-2])}."
         )
-    logits = logits[:, -logits_to_keep:, :]
+    logits = logits[:, -int(logits_to_keep) :, :]
     shift_logits = logits[:, :-1, :]
     if int(shift_logits.shape[-2]) != int(completion_ids.shape[-1]):
         raise RuntimeError("completion-only forward produced logits that do not align with completion_ids.")

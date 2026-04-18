@@ -45,6 +45,8 @@ from saver_v3.sft.training import (
     _build_rl_completion_episode_spec_from_feature,
     _unwrap_model,
     _zero_loss_from_model,
+    build_completion_only_model_inputs,
+    compute_completion_only_token_log_probs_from_prepared_inputs,
     compute_completion_only_token_log_probs_from_ids,
     load_qwen_model_and_processor,
 )
@@ -1768,15 +1770,16 @@ class TimesearchAlignedGRPOTrainerMixin:
         *,
         episode_input: Dict[str, Any],
     ) -> torch.Tensor:
+        prepared_microbatch = self._prepare_device_microbatch_for_completion_only(episode_input)
         with torch.inference_mode():
-            old_policy_token_log_probs, _ = compute_completion_only_token_log_probs_from_ids(
+            old_policy_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
                 model=model,
-                prompt_ids=episode_input["prompt_ids"],
-                prompt_mask=episode_input["prompt_mask"],
-                completion_ids=episode_input["completion_ids"],
-                completion_mask=episode_input["completion_mask"],
-                multimodal_inputs=self._episode_input_multimodal_inputs(episode_input),
+                model_inputs=prepared_microbatch["model_inputs"],
+                completion_ids=prepared_microbatch["completion_ids"],
+                completion_mask=prepared_microbatch["completion_mask"],
+                logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
                 temperature=self.policy_temperature,
+                log_runtime_details=False,
             )
         return old_policy_token_log_probs.detach().cpu()
 
@@ -2546,6 +2549,32 @@ class TimesearchAlignedGRPOTrainerMixin:
         ).to(dtype=torch.float32)
         return float(effective_weight.sum().item()), int((effective_weight > 0).sum().item())
 
+    def _prepare_device_microbatch_for_completion_only(
+        self,
+        batch: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        prompt_ids = batch["prompt_ids"]
+        prompt_mask = batch["prompt_mask"]
+        completion_ids = batch["completion_ids"]
+        completion_mask = batch["completion_mask"]
+        multimodal_inputs = self._episode_input_multimodal_inputs(batch)
+        model_inputs, logits_to_keep = build_completion_only_model_inputs(
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            multimodal_inputs=multimodal_inputs,
+        )
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "multimodal_inputs": multimodal_inputs,
+            "model_inputs": model_inputs,
+            "logits_to_keep": int(logits_to_keep),
+        }
+
     def _training_step_with_immediate_microbatch_backward(
         self,
         model: Any,
@@ -2760,6 +2789,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         )
         if not bool(torch.any(effective_weight > 0)):
             return torch.zeros(sample_count, dtype=torch.float32, device=response_mask.device)
+        prepared_microbatch = self._prepare_device_microbatch_for_completion_only(batch)
         policy_forward_start = time.perf_counter()
         _training_phase_runtime_log(
             "rl compute_loss policy forward start: "
@@ -2771,14 +2801,14 @@ class TimesearchAlignedGRPOTrainerMixin:
             f"prompt_tokens={int(batch['prompt_ids'].shape[-1])} "
             f"completion_tokens={int(batch['completion_ids'].shape[-1])}"
         )
-        policy_token_log_probs, response_mask = compute_completion_only_token_log_probs_from_ids(
+        policy_token_log_probs, response_mask = compute_completion_only_token_log_probs_from_prepared_inputs(
             model=model,
-            prompt_ids=batch["prompt_ids"],
-            prompt_mask=batch["prompt_mask"],
-            completion_ids=batch["completion_ids"],
-            completion_mask=batch["completion_mask"],
-            multimodal_inputs=self._episode_input_multimodal_inputs(batch),
+            model_inputs=prepared_microbatch["model_inputs"],
+            completion_ids=prepared_microbatch["completion_ids"],
+            completion_mask=prepared_microbatch["completion_mask"],
+            logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
             temperature=self.policy_temperature,
+            log_runtime_details=False,
         )
         _training_phase_runtime_log(
             "rl compute_loss after completion_only_token_log_probs: "
@@ -2826,14 +2856,14 @@ class TimesearchAlignedGRPOTrainerMixin:
                     f"samples={sample_count} completion_tokens={int(batch['completion_ids'].shape[-1])}"
                 )
                 with torch.inference_mode():
-                    reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_ids(
+                    reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
                         model=self.reference_model,
-                        prompt_ids=batch["prompt_ids"],
-                        prompt_mask=batch["prompt_mask"],
-                        completion_ids=batch["completion_ids"],
-                        completion_mask=batch["completion_mask"],
-                        multimodal_inputs=self._episode_input_multimodal_inputs(batch),
+                        model_inputs=prepared_microbatch["model_inputs"],
+                        completion_ids=prepared_microbatch["completion_ids"],
+                        completion_mask=prepared_microbatch["completion_mask"],
+                        logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
                         temperature=self.policy_temperature,
+                        log_runtime_details=False,
                     )
                 _training_phase_runtime_log(
                     "rl compute_loss reference kl forward end: "
@@ -2848,14 +2878,14 @@ class TimesearchAlignedGRPOTrainerMixin:
                 )
                 with torch.inference_mode():
                     with disable_context:
-                        reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_ids(
+                        reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
                             model=reference_model,
-                            prompt_ids=batch["prompt_ids"],
-                            prompt_mask=batch["prompt_mask"],
-                            completion_ids=batch["completion_ids"],
-                            completion_mask=batch["completion_mask"],
-                            multimodal_inputs=self._episode_input_multimodal_inputs(batch),
+                            model_inputs=prepared_microbatch["model_inputs"],
+                            completion_ids=prepared_microbatch["completion_ids"],
+                            completion_mask=prepared_microbatch["completion_mask"],
+                            logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
                             temperature=self.policy_temperature,
+                            log_runtime_details=False,
                         )
                 _training_phase_runtime_log(
                     "rl compute_loss reference kl forward end: "
