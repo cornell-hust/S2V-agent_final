@@ -2629,6 +2629,95 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertEqual(backend, "accelerate")
 
 
+class VisionFeatureCacheTests(unittest.TestCase):
+    def test_capture_hook_and_stub_replay_detached_outputs(self) -> None:
+        import torch
+        import torch.nn as nn
+
+        from saver_v3.rl.timesearch_aligned_grpo_trainer import (
+            _CachedVisualStub,
+            _detach_visual_output,
+            _resolve_visual_module_host,
+        )
+
+        class FakeVisual(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dtype = torch.float32
+                self.spatial_merge_size = 2
+                self._proj = nn.Linear(4, 4)
+
+            def forward(self, pixel_values, grid_thw=None):
+                h = self._proj(pixel_values)
+                return h, [h.clone()]
+
+        class FakePolicy(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual = FakeVisual()
+
+        class FakeOuterModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = FakePolicy()
+
+        outer = FakeOuterModel()
+        host = _resolve_visual_module_host(outer)
+        self.assertIs(host, outer.model)
+
+        captured: list = []
+
+        def _capture(_mod, _inp, out):
+            captured.append(_detach_visual_output(out))
+
+        handle = host.visual.register_forward_hook(_capture)
+        try:
+            px_images = torch.randn(5, 4, requires_grad=True)
+            px_videos = torch.randn(3, 4, requires_grad=True)
+            # Simulate policy forward invoking self.visual twice (images + videos).
+            _ = host.visual(px_images, grid_thw=None)
+            _ = host.visual(px_videos, grid_thw=None)
+        finally:
+            handle.remove()
+
+        self.assertEqual(len(captured), 2)
+        # Captured tensors must be detached (no grad history).
+        first_embed, first_deepstack_list = captured[0]
+        self.assertIsInstance(first_embed, torch.Tensor)
+        self.assertFalse(first_embed.requires_grad)
+        self.assertEqual(tuple(first_embed.shape), (5, 4))
+        self.assertIsInstance(first_deepstack_list, list)
+        self.assertFalse(first_deepstack_list[0].requires_grad)
+
+        stub = _CachedVisualStub(
+            cached_calls=captured,
+            dtype=host.visual.dtype,
+            spatial_merge_size=host.visual.spatial_merge_size,
+        )
+        self.assertEqual(stub._call_index, 0)
+        out_a = stub(px_images)
+        self.assertEqual(stub._call_index, 1)
+        out_b = stub(px_videos, grid_thw=None)
+        self.assertEqual(stub._call_index, 2)
+        # Stub replays the captured tensors in order and remains detached.
+        self.assertTrue(torch.equal(out_a[0], captured[0][0]))
+        self.assertTrue(torch.equal(out_b[0], captured[1][0]))
+        self.assertFalse(out_a[0].requires_grad)
+        # Exhaustion raises so downstream callers notice mis-matched call counts.
+        with self.assertRaises(RuntimeError):
+            stub(px_images)
+        # Stub must be assignable to an nn.Module's registered child module slot.
+        original_visual = outer.model.visual
+        outer.model.visual = stub
+        try:
+            self.assertIs(outer.model.visual, stub)
+            self.assertEqual(outer.model.visual.spatial_merge_size, 2)
+            self.assertEqual(outer.model.visual.dtype, torch.float32)
+        finally:
+            outer.model.visual = original_visual
+        self.assertIs(outer.model.visual, original_visual)
+
+
 if __name__ == "__main__":
     unittest.main()
 

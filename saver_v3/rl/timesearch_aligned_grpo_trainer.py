@@ -678,6 +678,73 @@ def _log_rollout_episode_visual_signatures(
     )
 
 
+class _CachedVisualStub(torch.nn.Module):
+    """Callable stand-in for ``Qwen3VLVisionModel`` that replays captured forward outputs.
+
+    Qwen3-VL's ``get_image_features`` / ``get_video_features`` invoke ``self.visual``
+    once per modality (images and videos are each independently encoded), so up to
+    two calls per model forward. This stub stores the captured outputs in invocation
+    order and returns them positionally on subsequent calls, allowing the reference
+    KL forward to reuse the policy forward's frozen visual features.
+
+    Attributes ``dtype`` and ``spatial_merge_size`` are copied from the real visual
+    module because ``get_image_features`` reads them directly
+    (``pixel_values.type(self.visual.dtype)`` and ``self.visual.spatial_merge_size``).
+
+    Inherits from ``torch.nn.Module`` so it can be assigned to the parent model's
+    ``visual`` attribute (PyTorch rejects non-Module assignments to registered
+    child module names).
+    """
+
+    def __init__(self, cached_calls: List[Any], dtype: Any, spatial_merge_size: int) -> None:
+        super().__init__()
+        self._cached_calls = cached_calls
+        self.dtype = dtype
+        self.spatial_merge_size = int(spatial_merge_size)
+        self._call_index = 0
+
+    def reset(self) -> None:
+        self._call_index = 0
+
+    def forward(self, pixel_values: Any, grid_thw: Any = None, **kwargs: Any) -> Any:
+        if self._call_index >= len(self._cached_calls):
+            raise RuntimeError(
+                "rl vision cache stub exhausted: reference forward requested more "
+                f"visual calls ({self._call_index + 1}) than the policy forward captured "
+                f"({len(self._cached_calls)})."
+            )
+        cached_output = self._cached_calls[self._call_index]
+        self._call_index += 1
+        return _detach_visual_output(cached_output)
+
+
+def _detach_visual_output(output: Any) -> Any:
+    """Detach tensors inside a visual-module forward output without copying devices."""
+    if isinstance(output, torch.Tensor):
+        return output.detach()
+    if isinstance(output, tuple):
+        return tuple(_detach_visual_output(item) for item in output)
+    if isinstance(output, list):
+        return [_detach_visual_output(item) for item in output]
+    return output
+
+
+def _resolve_visual_module_host(model: Any) -> Optional[Any]:
+    """Return the object whose ``.visual`` attribute is the real vision module.
+
+    For ``Qwen3VLForConditionalGeneration`` the outer class exposes ``visual`` as a
+    property proxying to ``self.model.visual``, so the underlying attribute lives
+    on ``model.model`` (a ``Qwen3VLModel``). Returns ``None`` when no such host
+    can be found.
+    """
+    inner = getattr(model, "model", None)
+    if inner is not None and isinstance(getattr(inner, "visual", None), torch.nn.Module):
+        return inner
+    if isinstance(getattr(model, "visual", None), torch.nn.Module):
+        return model
+    return None
+
+
 class TimesearchAlignedGRPOTrainerMixin:
     def __init__(
         self,
@@ -697,6 +764,8 @@ class TimesearchAlignedGRPOTrainerMixin:
         self.reference_model_source_path = str(config.get("reference_model_source_path") or "")
         self.reference_model_backend = str(config.get("reference_model_backend") or "none")
         self.kl_beta = float(config["kl_beta"])
+        self.rl_enable_vision_feature_cache = bool(config.get("rl_enable_vision_feature_cache", True))
+        self._vision_cache_disabled_reason: Optional[str] = None
         self.ppo_clip_epsilon = float(config["ppo_clip_epsilon"])
         self.rollout_runner = config["rollout_runner"]
         self.proposal_runtime = config.get("proposal_runtime")
@@ -2769,6 +2838,51 @@ class TimesearchAlignedGRPOTrainerMixin:
             )
         return disable_adapter(), unwrapped_model
 
+    def _resolve_vision_feature_cache_plan(
+        self,
+        *,
+        policy_model: Any,
+        prepared_microbatch: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Decide whether to cache vision features for this microbatch.
+
+        Returns a plan dict with keys ``policy_host`` (module whose ``.visual``
+        attribute to hook) and ``reference_host_getter`` (callable returning the
+        reference model's visual host when needed). Returns ``None`` when the
+        cache should be skipped (flag disabled, no pixel inputs, ViT trainable,
+        or model structure unrecognized).
+        """
+        if not bool(getattr(self, "rl_enable_vision_feature_cache", True)):
+            return None
+        model_inputs = prepared_microbatch.get("model_inputs") or {}
+        has_pixel_values = isinstance(model_inputs.get("pixel_values"), torch.Tensor)
+        has_video_pixel_values = isinstance(model_inputs.get("pixel_values_videos"), torch.Tensor)
+        if not has_pixel_values and not has_video_pixel_values:
+            return None
+        policy_unwrapped = _unwrap_model(policy_model)
+        policy_host = _resolve_visual_module_host(policy_unwrapped)
+        if policy_host is None:
+            if getattr(self, "_vision_cache_disabled_reason", None) is None:
+                self._vision_cache_disabled_reason = "unrecognized_model_structure"
+                _training_phase_runtime_log(
+                    "rl vision cache disabled: could not locate `.visual` submodule on policy model"
+                )
+            return None
+        visual_module = policy_host.visual
+        vit_trainable = any(p.requires_grad for p in visual_module.parameters())
+        if vit_trainable:
+            if getattr(self, "_vision_cache_disabled_reason", None) is None:
+                self._vision_cache_disabled_reason = "vit_trainable"
+                _training_phase_runtime_log(
+                    "rl vision cache disabled: vision tower is trainable (ViT params have "
+                    "requires_grad=True) — skipping to preserve gradient flow"
+                )
+            return None
+        return {
+            "policy_host": policy_host,
+            "policy_visual": visual_module,
+        }
+
     def _compute_sample_losses_for_batch(
         self,
         *,
@@ -2790,6 +2904,19 @@ class TimesearchAlignedGRPOTrainerMixin:
         if not bool(torch.any(effective_weight > 0)):
             return torch.zeros(sample_count, dtype=torch.float32, device=response_mask.device)
         prepared_microbatch = self._prepare_device_microbatch_for_completion_only(batch)
+        cache_plan = self._resolve_vision_feature_cache_plan(
+            policy_model=model,
+            prepared_microbatch=prepared_microbatch,
+        )
+        captured_visual_calls: List[Any] = []
+        capture_hook_handle = None
+        if cache_plan is not None:
+            def _capture_visual_forward(_mod: Any, _inp: Any, output: Any) -> None:
+                captured_visual_calls.append(_detach_visual_output(output))
+
+            capture_hook_handle = cache_plan["policy_visual"].register_forward_hook(
+                _capture_visual_forward
+            )
         policy_forward_start = time.perf_counter()
         _training_phase_runtime_log(
             "rl compute_loss policy forward start: "
@@ -2801,15 +2928,19 @@ class TimesearchAlignedGRPOTrainerMixin:
             f"prompt_tokens={int(batch['prompt_ids'].shape[-1])} "
             f"completion_tokens={int(batch['completion_ids'].shape[-1])}"
         )
-        policy_token_log_probs, response_mask = compute_completion_only_token_log_probs_from_prepared_inputs(
-            model=model,
-            model_inputs=prepared_microbatch["model_inputs"],
-            completion_ids=prepared_microbatch["completion_ids"],
-            completion_mask=prepared_microbatch["completion_mask"],
-            logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
-            temperature=self.policy_temperature,
-            log_runtime_details=False,
-        )
+        try:
+            policy_token_log_probs, response_mask = compute_completion_only_token_log_probs_from_prepared_inputs(
+                model=model,
+                model_inputs=prepared_microbatch["model_inputs"],
+                completion_ids=prepared_microbatch["completion_ids"],
+                completion_mask=prepared_microbatch["completion_mask"],
+                logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
+                temperature=self.policy_temperature,
+                log_runtime_details=False,
+            )
+        finally:
+            if capture_hook_handle is not None:
+                capture_hook_handle.remove()
         _training_phase_runtime_log(
             "rl compute_loss after completion_only_token_log_probs: "
             f"samples={sample_count} "
@@ -2855,16 +2986,24 @@ class TimesearchAlignedGRPOTrainerMixin:
                     "rl compute_loss reference kl forward start: "
                     f"samples={sample_count} completion_tokens={int(batch['completion_ids'].shape[-1])}"
                 )
+                reference_host = None
+                if cache_plan is not None and captured_visual_calls:
+                    reference_host = _resolve_visual_module_host(_unwrap_model(self.reference_model))
                 with torch.inference_mode():
-                    reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
-                        model=self.reference_model,
-                        model_inputs=prepared_microbatch["model_inputs"],
-                        completion_ids=prepared_microbatch["completion_ids"],
-                        completion_mask=prepared_microbatch["completion_mask"],
-                        logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
-                        temperature=self.policy_temperature,
-                        log_runtime_details=False,
-                    )
+                    with self._maybe_swap_visual_with_cache_stub(
+                        host=reference_host,
+                        cached_calls=captured_visual_calls,
+                        reference_visual=cache_plan["policy_visual"] if cache_plan is not None else None,
+                    ):
+                        reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
+                            model=self.reference_model,
+                            model_inputs=prepared_microbatch["model_inputs"],
+                            completion_ids=prepared_microbatch["completion_ids"],
+                            completion_mask=prepared_microbatch["completion_mask"],
+                            logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
+                            temperature=self.policy_temperature,
+                            log_runtime_details=False,
+                        )
                 _training_phase_runtime_log(
                     "rl compute_loss reference kl forward end: "
                     f"samples={sample_count} elapsed_sec={time.perf_counter() - reference_forward_start:.3f}"
@@ -2876,17 +3015,25 @@ class TimesearchAlignedGRPOTrainerMixin:
                     "rl compute_loss reference kl forward start: "
                     f"samples={sample_count} completion_tokens={int(batch['completion_ids'].shape[-1])}"
                 )
+                reference_host = None
+                if cache_plan is not None and captured_visual_calls:
+                    reference_host = _resolve_visual_module_host(_unwrap_model(reference_model))
                 with torch.inference_mode():
                     with disable_context:
-                        reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
-                            model=reference_model,
-                            model_inputs=prepared_microbatch["model_inputs"],
-                            completion_ids=prepared_microbatch["completion_ids"],
-                            completion_mask=prepared_microbatch["completion_mask"],
-                            logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
-                            temperature=self.policy_temperature,
-                            log_runtime_details=False,
-                        )
+                        with self._maybe_swap_visual_with_cache_stub(
+                            host=reference_host,
+                            cached_calls=captured_visual_calls,
+                            reference_visual=cache_plan["policy_visual"] if cache_plan is not None else None,
+                        ):
+                            reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
+                                model=reference_model,
+                                model_inputs=prepared_microbatch["model_inputs"],
+                                completion_ids=prepared_microbatch["completion_ids"],
+                                completion_mask=prepared_microbatch["completion_mask"],
+                                logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
+                                temperature=self.policy_temperature,
+                                log_runtime_details=False,
+                            )
                 _training_phase_runtime_log(
                     "rl compute_loss reference kl forward end: "
                     f"samples={sample_count} elapsed_sec={time.perf_counter() - reference_forward_start:.3f}"
@@ -2900,6 +3047,41 @@ class TimesearchAlignedGRPOTrainerMixin:
         sample_losses = (per_token_loss * response_mask_f).sum(dim=-1) / token_counts
         sample_losses = sample_losses * effective_weight.to(device=sample_losses.device, dtype=sample_losses.dtype)
         return sample_losses
+
+    @contextmanager
+    def _maybe_swap_visual_with_cache_stub(
+        self,
+        *,
+        host: Optional[Any],
+        cached_calls: List[Any],
+        reference_visual: Optional[Any],
+    ):
+        """Temporarily replace ``host.visual`` with a stub replaying ``cached_calls``.
+
+        When ``host`` is ``None``, ``cached_calls`` is empty, or ``reference_visual``
+        is ``None``, this is a no-op pass-through so the reference forward runs
+        exactly as before.
+        """
+        if host is None or not cached_calls or reference_visual is None:
+            yield
+            return
+        original_visual = host.visual
+        stub = _CachedVisualStub(
+            cached_calls=cached_calls,
+            dtype=getattr(reference_visual, "dtype", getattr(original_visual, "dtype", torch.float32)),
+            spatial_merge_size=int(
+                getattr(
+                    reference_visual,
+                    "spatial_merge_size",
+                    getattr(original_visual, "spatial_merge_size", 1),
+                )
+            ),
+        )
+        try:
+            host.visual = stub
+            yield
+        finally:
+            host.visual = original_visual
 
     def _compute_liger_loss_for_batch(self, unwrapped_model: Any, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
         if self.liger_grpo_loss is None:
