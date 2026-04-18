@@ -30,7 +30,7 @@ proposal:
   eval_device: ""
 
 optimization:
-  num_iterations: 400
+  num_iterations: 120
   learning_rate: 5.0e-7
   per_device_batch_size: 1
   num_train_epochs: 1.0
@@ -46,6 +46,7 @@ optimization:
   policy_top_p: 0.95
   policy_top_k: 50
   policy_repetition_penalty: 1.02
+  keep_recent_tool_image_messages: 3
   gradient_accumulation_steps: 22
   rl_steps_per_generation: 1
   rollout_stage_batch_size: 8

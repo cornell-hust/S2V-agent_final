@@ -90,12 +90,132 @@ def _distributed_sum_float(local_value: float, *, device: torch.device) -> float
     return float(total_tensor.item())
 
 
+def _distributed_max_int(local_value: int, *, device: torch.device) -> int:
+    local_max = int(local_value)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_max
+    max_tensor = torch.tensor([local_max], dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(max_tensor, op=torch.distributed.ReduceOp.MAX)
+    return int(max_tensor.item())
+
+
 def _training_phase_runtime_log(message: str) -> None:
     runtime_log(
         message,
         runtime=distributed_runtime_from_env(),
         main_process_only=True,
     )
+
+
+def _distributed_rank() -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    return int(torch.distributed.get_rank())
+
+
+def _distributed_gather_object(local_object: Any) -> List[Any]:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return [copy.deepcopy(local_object)]
+    gathered_objects: List[Any] = [None for _ in range(max(1, int(_distributed_world_size())))]
+    torch.distributed.all_gather_object(gathered_objects, local_object)
+    return gathered_objects
+
+
+def _episode_input_sample_count_for_debug(episode_input: Dict[str, Any]) -> int:
+    for key in ("completion_ids", "prompt_ids", "completion_mask", "advantages"):
+        value = episode_input.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 1:
+            return max(1, int(value.shape[0]))
+    return 1
+
+
+def _summarize_episode_input_for_rank_debug(episode_input: Dict[str, Any]) -> Dict[str, Any]:
+    prompt_ids = episode_input.get("prompt_ids")
+    completion_ids = episode_input.get("completion_ids")
+    multimodal_inputs = episode_input.get("multimodal_inputs")
+    if isinstance(multimodal_inputs, list):
+        multimodal_keys = sorted({str(key) for sample in multimodal_inputs if isinstance(sample, dict) for key in sample.keys()})
+    elif isinstance(multimodal_inputs, dict):
+        multimodal_keys = sorted(str(key) for key in multimodal_inputs.keys())
+    else:
+        multimodal_keys = []
+    return {
+        "samples": int(_episode_input_sample_count_for_debug(episode_input)),
+        "prompt_tokens": int(prompt_ids.shape[-1]) if isinstance(prompt_ids, torch.Tensor) and prompt_ids.ndim >= 1 else -1,
+        "completion_tokens": int(completion_ids.shape[-1]) if isinstance(completion_ids, torch.Tensor) and completion_ids.ndim >= 1 else -1,
+        "multimodal_keys": multimodal_keys,
+    }
+
+
+def _summarize_microbatch_layout_for_rank_debug(episode_inputs: Sequence[Dict[str, Any]], trainer: Any) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for batch_index, batch in enumerate(list(episode_inputs or []), start=1):
+        microbatches = list(trainer._iter_loss_microbatches(batch))
+        rows.append(
+            {
+                "batch_index": int(batch_index),
+                "batch_summary": _summarize_episode_input_for_rank_debug(batch),
+                "microbatch_count": int(len(microbatches)),
+                "microbatch_sample_counts": [int(trainer._episode_input_sample_count(microbatch)) for microbatch in microbatches],
+            }
+        )
+    return rows
+
+
+def _rollout_group_sample_count(rollout_group: Dict[str, Any]) -> int:
+    sample_count = 0
+    for episode_input in list(rollout_group.get("episode_inputs") or []):
+        if isinstance(episode_input, dict):
+            sample_count += int(_episode_input_sample_count_for_debug(episode_input))
+    return int(sample_count)
+
+
+def _flatten_rollout_groups_to_episode_inputs(rollout_groups: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    episode_inputs: List[Dict[str, Any]] = []
+    for rollout_group in list(rollout_groups or []):
+        for episode_input in list((rollout_group or {}).get("episode_inputs") or []):
+            episode_inputs.append(copy.deepcopy(dict(episode_input or {})))
+    return episode_inputs
+
+
+def _summarize_rollout_group_for_rank_debug(rollout_group: Dict[str, Any]) -> Dict[str, Any]:
+    episode_inputs = list((rollout_group or {}).get("episode_inputs") or [])
+    first_episode_input = dict(episode_inputs[0] or {}) if episode_inputs else {}
+    return {
+        "video_id": str(rollout_group.get("video_id") or ""),
+        "generation_id": int(rollout_group.get("generation_id") if rollout_group.get("generation_id") is not None else -1),
+        "source_rank": int(rollout_group.get("source_rank") if rollout_group.get("source_rank") is not None else -1),
+        "source_item_index": int(
+            rollout_group.get("source_item_index") if rollout_group.get("source_item_index") is not None else -1
+        ),
+        "source_rollout_index": int(
+            rollout_group.get("source_rollout_index") if rollout_group.get("source_rollout_index") is not None else -1
+        ),
+        "episode_input_count": int(len(episode_inputs)),
+        "sample_count": int(_rollout_group_sample_count(rollout_group)),
+        "first_batch_summary": _summarize_episode_input_for_rank_debug(first_episode_input) if first_episode_input else None,
+    }
+
+
+def _stable_balance_rollout_groups_across_ranks(
+    gathered_rollout_groups: Sequence[Sequence[Dict[str, Any]]],
+) -> List[List[Dict[str, Any]]]:
+    rank_count = max(1, len(list(gathered_rollout_groups or [])))
+    assigned_groups: List[List[Dict[str, Any]]] = [[] for _ in range(rank_count)]
+    assigned_sample_counts: List[int] = [0 for _ in range(rank_count)]
+    ordered_groups: List[Dict[str, Any]] = []
+    for source_rank, groups in enumerate(list(gathered_rollout_groups or [])):
+        for source_local_group_index, rollout_group in enumerate(list(groups or [])):
+            normalized_group = copy.deepcopy(dict(rollout_group or {}))
+            normalized_group["source_rank"] = int(source_rank)
+            normalized_group["source_local_group_index"] = int(source_local_group_index)
+            normalized_group["sample_count"] = int(_rollout_group_sample_count(normalized_group))
+            ordered_groups.append(normalized_group)
+    for rollout_group in ordered_groups:
+        target_rank = min(range(rank_count), key=lambda rank: (assigned_sample_counts[rank], rank))
+        assigned_groups[target_rank].append(rollout_group)
+        assigned_sample_counts[target_rank] += int(rollout_group.get("sample_count") or 0)
+    return assigned_groups
 
 
 def _patch_flash_attention_packed_sequence_check_for_active_rl() -> bool:
@@ -1093,7 +1213,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         video_id = str(item.get("video_id") or "")
         rollout_metrics = self._new_rollout_metric_lists()
         runtime_stats = self._new_runtime_stats()
-        episode_entries: List[Dict[str, Any]] = []
+        rollout_groups: List[Dict[str, Any]] = []
         num_episode_candidates_before_min_weight = 0
         num_episode_candidates_after_min_weight = 0
         num_invalid_action_turns = 0
@@ -1106,7 +1226,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         missing_feature_traced_valid_turn_count = 0
         missing_feature_invalid_attempt_count = 0
         first_missing_feature_example = ""
-        for rollout in list(scored_rollouts or []):
+        for rollout_index, rollout in enumerate(list(scored_rollouts or [])):
             if bool(rollout.get("fecv_failed")):
                 runtime_stats["local_fecv_failure_count"] += 1
             reward_summary = dict(rollout.get("reward_summary") or {})
@@ -1155,6 +1275,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                     )
             if rollout_advantage < float(self.min_weight):
                 continue
+            rollout_episode_inputs: List[Dict[str, Any]] = []
             for pack in raw_packs:
                 num_episode_candidates_after_min_weight += 1
                 result = self._build_episode_input_from_feature(pack)
@@ -1169,20 +1290,30 @@ class TimesearchAlignedGRPOTrainerMixin:
                         num_truncated_completion_after_budgeting += 1
                     self._zero_response_dropped += 1
                     continue
-                episode_entries.append(
+                rollout_episode_inputs.append(
+                    dict(result.batch or {})
+                )
+            if rollout_episode_inputs:
+                rollout_groups.append(
                     {
-                        "episode_input": result.batch,
+                        "video_id": video_id,
+                        "group_id": str(rollout.get("group_id") or video_id),
+                        "generation_id": int(rollout.get("generation_id") if rollout.get("generation_id") is not None else -1),
+                        "source_item_index": None,
+                        "source_rollout_index": int(rollout_index),
+                        "episode_inputs": rollout_episode_inputs,
+                        "sample_count": int(
+                            sum(self._episode_input_sample_count(episode_input) for episode_input in rollout_episode_inputs)
+                        ),
                     }
                 )
-        episode_inputs: List[Dict[str, Any]] = []
-        for entry in episode_entries:
-            episode_input = dict(entry["episode_input"] or {})
-            episode_inputs.append(episode_input)
+        episode_inputs = _flatten_rollout_groups_to_episode_inputs(rollout_groups)
         runtime_stats["raw_local_episode_input_count"] = int(len(episode_inputs))
         runtime_log(
             "rl episode payload built: "
             f"video_id={video_id} "
             f"scored_rollouts={len(scored_rollouts)} "
+            f"num_rollout_groups={len(rollout_groups)} "
             f"num_rollouts_dropped_by_min_weight={num_rollouts_dropped_by_min_weight} "
             f"num_episode_candidates_before_min_weight={num_episode_candidates_before_min_weight} "
             f"num_episode_candidates_after_min_weight={num_episode_candidates_after_min_weight} "
@@ -1207,6 +1338,7 @@ class TimesearchAlignedGRPOTrainerMixin:
             )
         return {
             "video_id": video_id,
+            "rollout_groups": rollout_groups,
             "episode_inputs": episode_inputs,
             "rollout_metric_values": rollout_metrics,
             "runtime_stats": runtime_stats,
@@ -1877,22 +2009,63 @@ class TimesearchAlignedGRPOTrainerMixin:
         self,
         item_payloads: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        episode_inputs: List[Dict[str, Any]] = []
+        local_rollout_groups: List[Dict[str, Any]] = []
         rollout_metric_values = self._new_rollout_metric_lists()
         runtime_stats = self._new_runtime_stats()
         video_ids: List[str] = []
-        for payload in item_payloads:
+        local_rank = int(_distributed_rank())
+        for item_index, payload in enumerate(item_payloads):
             video_ids.append(str(payload.get("video_id") or ""))
-            episode_inputs.extend(list(payload.get("episode_inputs") or []))
+            payload_rollout_groups = list(payload.get("rollout_groups") or [])
+            if not payload_rollout_groups and payload.get("episode_inputs"):
+                payload_rollout_groups = [
+                    {
+                        "video_id": str(payload.get("video_id") or ""),
+                        "group_id": str(payload.get("video_id") or ""),
+                        "generation_id": -1,
+                        "source_item_index": int(item_index),
+                        "source_rollout_index": 0,
+                        "episode_inputs": [dict(episode_input or {}) for episode_input in list(payload.get("episode_inputs") or [])],
+                    }
+                ]
+            for rollout_group in payload_rollout_groups:
+                normalized_group = copy.deepcopy(dict(rollout_group or {}))
+                normalized_group["video_id"] = str(normalized_group.get("video_id") or payload.get("video_id") or "")
+                normalized_group["source_rank"] = int(local_rank)
+                normalized_group["source_item_index"] = int(
+                    normalized_group.get("source_item_index") if normalized_group.get("source_item_index") is not None else item_index
+                )
+                normalized_group["sample_count"] = int(_rollout_group_sample_count(normalized_group))
+                local_rollout_groups.append(normalized_group)
             for key, values in dict(payload.get("rollout_metric_values") or {}).items():
                 rollout_metric_values.setdefault(key, [])
                 rollout_metric_values[key].extend([_safe_float(value) for value in (values or [])])
             for key, value in dict(payload.get("runtime_stats") or {}).items():
                 runtime_stats[key] = int(runtime_stats.get(key, 0)) + int(value or 0)
+        runtime_log(
+            f"rl rank rollout_group summary: rows={[_summarize_rollout_group_for_rank_debug(group) for group in local_rollout_groups]}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        gathered_rollout_groups = _distributed_gather_object(local_rollout_groups)
+        balanced_rollout_groups = _stable_balance_rollout_groups_across_ranks(gathered_rollout_groups)
+        local_assigned_rollout_groups = balanced_rollout_groups[local_rank] if local_rank < len(balanced_rollout_groups) else []
+        runtime_log(
+            "rl global rollout_group slice summary: "
+            f"total_groups={sum(len(groups) for groups in balanced_rollout_groups)} "
+            f"assigned_groups={len(local_assigned_rollout_groups)} "
+            f"assigned_samples={sum(int(group.get('sample_count') or 0) for group in local_assigned_rollout_groups)} "
+            f"rows={[_summarize_rollout_group_for_rank_debug(group) for group in local_assigned_rollout_groups]}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        episode_inputs = _flatten_rollout_groups_to_episode_inputs(local_assigned_rollout_groups)
         aggregated_metrics = {
             key: (sum(values) / float(len(values)) if values else 0.0)
             for key, values in rollout_metric_values.items()
         }
+        runtime_stats["raw_local_rollout_group_count_before_slice"] = int(len(local_rollout_groups))
+        runtime_stats["raw_local_rollout_group_count_after_slice"] = int(len(local_assigned_rollout_groups))
         runtime_stats["raw_local_episode_input_count"] = int(len(episode_inputs))
         runtime_stats["raw_local_episode_input_count_after_aggregate"] = int(len(episode_inputs))
         return {
@@ -2226,6 +2399,292 @@ class TimesearchAlignedGRPOTrainerMixin:
         self._skip_empty_training_steps += 1
         return torch.zeros((), dtype=torch.float32, device=target_device)
 
+    def _should_use_immediate_microbatch_backward(self) -> bool:
+        return True
+
+    def _backward_loss_scalar(
+        self,
+        loss: torch.Tensor,
+        *,
+        optimizer: Any,
+        num_items_in_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        kwargs: Dict[str, Any] = {}
+        args = getattr(self, "args", None)
+        if isinstance(loss, torch.Tensor):
+            if int(loss.numel()) != 1:
+                _training_phase_runtime_log(
+                    "rl loss scalarize debug: "
+                    f"shape={tuple(int(v) for v in loss.shape)} "
+                    f"numel={int(loss.numel())} "
+                    f"requires_grad={bool(loss.requires_grad)} "
+                    f"grad_fn={type(loss.grad_fn).__name__ if loss.grad_fn is not None else 'none'}"
+                )
+                loss = loss.sum()
+            if loss.ndim != 0:
+                loss = loss.reshape(())
+        if int(getattr(args, "n_gpu", 1) or 1) > 1:
+            loss = loss.mean()
+
+        if bool(getattr(self, "use_apex", False)):
+            from apex import amp
+
+            _training_phase_runtime_log("rl backward start: backend=apex")
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+            _training_phase_runtime_log("rl backward end: backend=apex")
+            return loss.detach()
+
+        model_accepts_loss_kwargs = bool(getattr(self, "model_accepts_loss_kwargs", False))
+        compute_loss_func = getattr(self, "compute_loss_func", None)
+        distributed_type = getattr(getattr(self, "accelerator", None), "distributed_type", None)
+        is_deepspeed = str(distributed_type).lower().endswith("deepspeed")
+        if (
+            (not model_accepts_loss_kwargs or num_items_in_batch is None)
+            and compute_loss_func is None
+            and not is_deepspeed
+        ):
+            loss = loss / int(getattr(self, "current_gradient_accumulation_steps", 1) or 1)
+        if is_deepspeed:
+            kwargs["scale_wrt_gas"] = False
+        _training_phase_runtime_log(
+            "rl backward start: "
+            f"backend={'deepspeed' if is_deepspeed else 'accelerate'}"
+        )
+        self.accelerator.backward(loss, **kwargs)
+        _training_phase_runtime_log(
+            "rl backward end: "
+            f"backend={'deepspeed' if is_deepspeed else 'accelerate'}"
+        )
+        return loss.detach()
+
+    def _compute_sample_losses_for_device_microbatch(
+        self,
+        model: Any,
+        *,
+        device_microbatch: Dict[str, Any],
+        batch_index: int,
+        batch_count: int,
+        microbatch_index: int,
+        microbatch_count: int,
+    ) -> Optional[torch.Tensor]:
+        liger_unwrapped_model = self._resolve_liger_unwrapped_model(model) if self.use_liger_loss else None
+        if self.use_liger_loss:
+            use_forward_redirection = self._should_use_forward_redirection_for_liger()
+            dispatch_name = (
+                "forward_redirection_zero3"
+                if use_forward_redirection
+                else "direct_unwrapped_model_with_head_gather"
+            )
+            _training_phase_runtime_log(
+                "rl compute_loss liger path dispatch: "
+                f"batch={batch_index}/{batch_count} "
+                f"microbatch={microbatch_index}/{microbatch_count} "
+                f"dispatch={dispatch_name}"
+            )
+            if use_forward_redirection:
+                _training_phase_runtime_log(
+                    "rl compute_loss liger forward_redirection enter: "
+                    f"batch={batch_index}/{batch_count} "
+                    f"microbatch={microbatch_index}/{microbatch_count}"
+                )
+                sample_losses = self._forward_redirection(
+                    model,
+                    liger_unwrapped_model,
+                    self._compute_liger_loss_for_batch,
+                    liger_unwrapped_model,
+                    device_microbatch,
+                )
+                _training_phase_runtime_log(
+                    "rl compute_loss liger forward_redirection exit: "
+                    f"batch={batch_index}/{batch_count} "
+                    f"microbatch={microbatch_index}/{microbatch_count}"
+                )
+                return sample_losses
+            return self._compute_liger_loss_for_batch(
+                unwrapped_model=liger_unwrapped_model,
+                batch=device_microbatch,
+            )
+        return self._compute_sample_losses_for_batch(model=model, batch=device_microbatch)
+
+    def _flatten_loss_microbatch_entries(
+        self,
+        episode_inputs: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        batch_count = int(len(episode_inputs))
+        for batch_index, batch in enumerate(episode_inputs, start=1):
+            microbatches = list(self._iter_loss_microbatches(batch))
+            microbatch_count = int(len(microbatches))
+            for microbatch_index, microbatch in enumerate(microbatches, start=1):
+                entries.append(
+                    {
+                        "batch_index": int(batch_index),
+                        "batch_count": batch_count,
+                        "microbatch_index": int(microbatch_index),
+                        "microbatch_count": microbatch_count,
+                        "is_last_in_batch": bool(microbatch_index == microbatch_count),
+                        "local_effective_weight_sum": None,
+                        "local_active_samples": None,
+                        "microbatch": microbatch,
+                    }
+                )
+        return entries
+
+    def _local_effective_weight_summary_for_microbatch(
+        self,
+        microbatch: Dict[str, Any],
+    ) -> Tuple[float, int]:
+        completion_mask = microbatch.get("completion_mask")
+        if not isinstance(completion_mask, torch.Tensor) or not bool(torch.any(completion_mask.to(dtype=torch.bool))):
+            return 0.0, 0
+        sample_count = int(self._episode_input_sample_count(microbatch))
+        effective_weight = self._effective_sample_weight(
+            microbatch,
+            device=torch.device("cpu"),
+            sample_count=sample_count,
+        ).to(dtype=torch.float32)
+        return float(effective_weight.sum().item()), int((effective_weight > 0).sum().item())
+
+    def _training_step_with_immediate_microbatch_backward(
+        self,
+        model: Any,
+        inputs: Dict[str, Any],
+        *,
+        optimizer: Any,
+        num_items_in_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        episode_inputs = list(inputs.get("episode_inputs") or [])
+        runtime_stats = dict(inputs.get("runtime_stats") or {})
+        try:
+            target_device = next(model.parameters()).device
+        except StopIteration:
+            target_device = torch.device("cpu")
+        if not episode_inputs:
+            self._maybe_log_empty_batch_rank_summary(
+                reason="all_empty_episode_inputs",
+                runtime_stats=runtime_stats,
+                trainable_samples=0,
+            )
+            zero_loss = _zero_loss_from_model(model)
+            return self._backward_loss_scalar(
+                zero_loss,
+                optimizer=optimizer,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        self._ensure_liger_runtime_ready(model)
+        compute_loss_start = time.perf_counter()
+        _training_phase_runtime_log(
+            "rl compute_loss start: "
+            f"episode_batches={len(episode_inputs)} "
+            f"use_liger_loss_requested={bool(getattr(self, 'use_liger_loss_requested', False))} "
+            f"use_liger_loss_effective={bool(getattr(self, 'use_liger_loss_effective', False))} "
+            f"liger_disable_reason={str(getattr(self, '_liger_runtime_disable_reason', None) or 'none')} "
+            f"loss_microbatch={int(getattr(self, 'compute_loss_microbatch_size', 1) or 1)} "
+            "immediate_backward=true"
+        )
+        microbatch_entries = self._flatten_loss_microbatch_entries(episode_inputs)
+        local_total_effective_weight = 0.0
+        total_active_samples = 0
+        for entry in microbatch_entries:
+            weight_sum, active_samples = self._local_effective_weight_summary_for_microbatch(entry["microbatch"])
+            entry["local_effective_weight_sum"] = float(weight_sum)
+            entry["local_active_samples"] = int(active_samples)
+            local_total_effective_weight += float(weight_sum)
+            total_active_samples += int(active_samples)
+
+        runtime_stats["raw_local_sample_count"] = int(total_active_samples)
+        global_total_effective_weight = _distributed_sum_float(float(local_total_effective_weight), device=target_device)
+        if global_total_effective_weight <= 0.0:
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+            return self._backward_loss_scalar(
+                loss,
+                optimizer=optimizer,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        world_size = max(1, int(_distributed_world_size()))
+        max_microbatch_count = _distributed_max_int(len(microbatch_entries), device=target_device)
+        padded_microbatch_backwards = max(0, int(max_microbatch_count) - int(len(microbatch_entries)))
+        reported_loss: Optional[torch.Tensor] = None
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = torch.device("cpu")
+        batch_start_time = 0.0
+        for microbatch_position in range(int(max_microbatch_count)):
+            entry = microbatch_entries[microbatch_position] if microbatch_position < len(microbatch_entries) else None
+            if entry is not None and int(entry["microbatch_index"]) == 1:
+                _training_phase_runtime_log(
+                    "rl compute_loss batch start: "
+                    f"batch={int(entry['batch_index'])}/{int(entry['batch_count'])} "
+                    f"samples={int(self._episode_input_sample_count(entry['microbatch']))} "
+                    f"microbatches={int(entry['microbatch_count'])}"
+                )
+                batch_start_time = time.perf_counter()
+            if entry is not None and int(entry["microbatch_count"]) > 1:
+                _training_phase_runtime_log(
+                    "rl compute_loss microbatch start: "
+                    f"batch={int(entry['batch_index'])}/{int(entry['batch_count'])} "
+                    f"microbatch={int(entry['microbatch_index'])}/{int(entry['microbatch_count'])} "
+                    f"samples={int(self._episode_input_sample_count(entry['microbatch']))}"
+                )
+
+            if entry is None:
+                step_loss = _zero_loss_from_model(model)
+            else:
+                local_effective_weight_sum = float(entry.get("local_effective_weight_sum") or 0.0)
+                local_active_samples = int(entry.get("local_active_samples") or 0)
+                if local_effective_weight_sum <= 0.0 or local_active_samples <= 0:
+                    step_loss = _zero_loss_from_model(model)
+                else:
+                    device_microbatch = self._move_episode_input_to_device(entry["microbatch"], device=model_device)
+                    with self.compute_loss_context_manager():
+                        sample_losses = self._compute_sample_losses_for_device_microbatch(
+                            model,
+                            device_microbatch=device_microbatch,
+                            batch_index=int(entry["batch_index"]),
+                            batch_count=int(entry["batch_count"]),
+                            microbatch_index=int(entry["microbatch_index"]),
+                            microbatch_count=int(entry["microbatch_count"]),
+                        )
+                    if (
+                        sample_losses is None
+                        or sample_losses.numel() <= 0
+                        or not bool(getattr(sample_losses, "requires_grad", False))
+                    ):
+                        step_loss = _zero_loss_from_model(model)
+                    else:
+                        step_loss = sample_losses.sum() * float(world_size) / float(global_total_effective_weight)
+
+            detached_loss = self._backward_loss_scalar(
+                step_loss,
+                optimizer=optimizer,
+                num_items_in_batch=num_items_in_batch,
+            )
+            reported_loss = detached_loss if reported_loss is None else reported_loss + detached_loss
+
+            if entry is not None and bool(entry["is_last_in_batch"]):
+                _training_phase_runtime_log(
+                    "rl compute_loss batch end: "
+                    f"batch={int(entry['batch_index'])}/{int(entry['batch_count'])} "
+                    f"elapsed_sec={time.perf_counter() - batch_start_time:.3f}"
+                )
+
+        _training_phase_runtime_log(
+            "rl compute_loss end: "
+            f"episode_batches={len(episode_inputs)} "
+            f"trainable_samples={int(total_active_samples)} "
+            f"global_effective_weight={float(global_total_effective_weight):.3f} "
+            f"padded_microbatch_backwards={int(padded_microbatch_backwards)} "
+            f"elapsed_sec={time.perf_counter() - compute_loss_start:.3f}"
+        )
+        if reported_loss is None:
+            return _zero_loss_from_model(model).detach()
+        return reported_loss
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         cp_prepare = getattr(self, "_prepare_context_parallel_inputs", None)
         if callable(cp_prepare):
@@ -2246,57 +2705,22 @@ class TimesearchAlignedGRPOTrainerMixin:
             if skipped_loss is not None:
                 return skipped_loss.detach()
 
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-
-            del inputs
-            kwargs: Dict[str, Any] = {}
-            args = getattr(self, "args", None)
-            if isinstance(loss, torch.Tensor):
-                if int(loss.numel()) != 1:
-                    _training_phase_runtime_log(
-                        "rl loss scalarize debug: "
-                        f"shape={tuple(int(v) for v in loss.shape)} "
-                        f"numel={int(loss.numel())} "
-                        f"requires_grad={bool(loss.requires_grad)} "
-                        f"grad_fn={type(loss.grad_fn).__name__ if loss.grad_fn is not None else 'none'}"
-                    )
-                    loss = loss.sum()
-                if loss.ndim != 0:
-                    loss = loss.reshape(())
-            if int(getattr(args, "n_gpu", 1) or 1) > 1:
-                loss = loss.mean()
-
-            if bool(getattr(self, "use_apex", False)):
-                from apex import amp
-
-                _training_phase_runtime_log("rl backward start: backend=apex")
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                _training_phase_runtime_log("rl backward end: backend=apex")
+            if self._should_use_immediate_microbatch_backward():
+                loss = self._training_step_with_immediate_microbatch_backward(
+                    model,
+                    inputs,
+                    optimizer=optimizer,
+                    num_items_in_batch=num_items_in_batch,
+                )
             else:
-                model_accepts_loss_kwargs = bool(getattr(self, "model_accepts_loss_kwargs", False))
-                compute_loss_func = getattr(self, "compute_loss_func", None)
-                distributed_type = getattr(getattr(self, "accelerator", None), "distributed_type", None)
-                is_deepspeed = str(distributed_type).lower().endswith("deepspeed")
-                if (
-                    (not model_accepts_loss_kwargs or num_items_in_batch is None)
-                    and compute_loss_func is None
-                    and not is_deepspeed
-                ):
-                    loss = loss / int(getattr(self, "current_gradient_accumulation_steps", 1) or 1)
-                if is_deepspeed:
-                    kwargs["scale_wrt_gas"] = False
-                _training_phase_runtime_log(
-                    "rl backward start: "
-                    f"backend={'deepspeed' if is_deepspeed else 'accelerate'}"
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                loss = self._backward_loss_scalar(
+                    loss,
+                    optimizer=optimizer,
+                    num_items_in_batch=num_items_in_batch,
                 )
-                self.accelerator.backward(loss, **kwargs)
-                _training_phase_runtime_log(
-                    "rl backward end: "
-                    f"backend={'deepspeed' if is_deepspeed else 'accelerate'}"
-                )
-
+            del inputs
             return loss.detach()
 
     def _prepare_advantages(self, batch: Dict[str, Any], device: torch.device) -> torch.Tensor:

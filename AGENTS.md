@@ -10,10 +10,11 @@
 | Paper | Search-to-Verify: Agentic Event-Chain Search and Evidence-Faithful Learning for VAU |
 | Venue | NeurIPS 2026 |
 | Remote path | `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3` |
+| Paper drafts | `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/docs/paper_drafts` |
 | Conda env | `qwen3-vl` |
 | Policy model | Qwen3-VL-8B (`$DATA_ROOT/Wmh/MLLMs/qwen3-vl-8b-Instruct`) |
 | Teacher model | Qwen3-VL-32B (`$DATA_ROOT/Wmh/MLLMs/Qwen3-VL-32B-Instruct`) |
-| Hardware | 8×H200, 110 CPU cores, 1.1TB RAM |
+| Hardware | 3×H200 GPU server |
 | DATA_ROOT | `/mnt/shared-storage-user/mineru2-shared/zengweijun` |
 | Artifacts | `artifacts/<EXP_NAME>/` under project root |
 | WandB project | `idea2_v3_qwen3_vl_8b` |
@@ -29,14 +30,149 @@ artifacts/         — Experiment outputs (checkpoints, metrics, reports)
 docs/              — Execution documents and task specs
 ```
 
+### Project File Map
+
+Observed from the remote repo on 2026-04-16. Use this section as the fast path-lookup map when locating code.
+
+- `saver_v3/core/` — method semantics and rollout primitives: reward, environment, rollout, counterfactual verification, event chain logic, prompts, tool registry, semantic answer parsing, self verification, proposal utilities.
+- `saver_v3/model/` — Qwen/VLM model loading and generation backends: `qwen_policy.py`, `vllm_generation.py`, `vllm_server.py`, model/runtime helpers.
+- `saver_v3/data/` — dataset and preprocessing internals: `dataset.py`, `runtime_items.py`, `materialized_cache.py`, `prepared_schema.py`, `compact_trace.py`, `training_data.py`.
+- `saver_v3/sft/` — SFT runtime and training implementation.
+- `saver_v3/rl/` — RL runtime and trainers: `timesearch_aligned_grpo_trainer.py`, `trl_grpo_trainer.py`, `grpo_trainer_env.py`, `runtime.py`, `cli_shared.py`.
+- `saver_v3/inference/` — rollout inference/eval entrypoints, policy rollout, fixed-baseline eval.
+- `saver_v3/metrics/` — evaluation, semantic metrics, offline scoring.
+- `saver_v3/teacher/` — teacher judge and teacher-annotation helpers.
+- `saver_v3/cli/` — CLI entrypoints such as prepared-data generation.
+- `saver_v3/rollout/` — rollout compatibility layer.
+- `saver_v3/common/` — shared runtime/logging/budget utilities.
+- `saver_v3/tests/` and top-level `tests/` — package-local and repo-level tests.
+- `third_party_ports/timesearch_r/` — imported reference code/ports from TimeSearch-R kept inside this repo.
+
+### Top-Level Files To Reach First
+
+- `README.md` — current repo overview and official end-to-end pipeline description.
+- `docs/repo_layout.md` — design-level layout explanation.
+- `docs/数据预处理.md` — detailed preprocessing commands and file roles.
+- `convert_to_saver_agent.py` — canonical annotation to runtime JSONL conversion.
+- `prepare_materialized_cache.py` — offline cache materialization for SFT/runtime items.
+- `build_frame_cache.py` — builds required `.frame_cache`.
+- `build_feature_cache.py` — builds required `.feature_cache`.
+- `annotate_teacher_judge_sft.py` — teacher-judge branch generation for SFT prepared data.
+- `train_saver_rl.py` / `train_saver_rl_trl.py` — RL launch entrypoints.
+- `training.py`, `trl_grpo_trainer.py`, `timesearch_aligned_grpo_trainer.py`, `rollout.py` — top-level compatibility wrappers frequently touched during RL/SFT debugging.
+- `run_saver_rollout.py` / `batch_run_saver_rollout.py` — rollout execution helpers.
+
+### Config And Script Map
+
+- `configs/model/` — model and attention backend configs.
+- `configs/deepspeed/` — DeepSpeed configs for SFT and RL.
+- `configs/prepare_sft/qwen3_vl_8b_prepare.yaml` — prepared SFT manifest generation.
+- `configs/sft/` — SFT training configs.
+- `configs/rl/qwen3_vl_8b_grpo_train.yaml` — main RL config.
+- `configs/rollout_eval/` — SFT/RL rollout-eval configs, including `vllm_qwen3_vl_8b.yaml` and `vllm_qwen3_vl_8b_rl_lowmem.yaml`.
+- `configs/inference/` — policy inference rollout configs.
+- `scripts/run_full_pipeline.sh` — official end-to-end pipeline wrapper.
+- `scripts/prepare_sft_manifest.sh` — prepared SFT manifest wrapper.
+- `scripts/train_sft_qwen3_vl_8b_ds8.sh` — SFT launcher.
+- `scripts/train_rl_qwen3_vl_8b_ds8.sh` — RL launcher.
+- `scripts/run_sft_rollout_eval_vllm.sh` — rollout eval launcher.
+- `scripts/run_policy_rollout_vllm.sh` and `scripts/run_policy_inference_vllm.sh` — rollout/inference wrappers.
+- `scripts/run_fixed_baseline_eval_vllm.sh` — fixed baseline evaluation.
+
+### RL Runtime Note
+
+- Active RL with `use_liger_loss=true` must not use `configs/deepspeed/zero3_offload_rl.json`.
+- As of 2026-04-17, the default RL DeepSpeed config should be `configs/deepspeed/zero2_rl.json`.
+- As of 2026-04-17, the default RL `gradient_accumulation_steps` for the current 3-GPU setup should be `8`.
+- As of 2026-04-17, the default RL `compute_loss` microbatch size should be `3`.
+- `scripts/run_full_pipeline.sh` should not auto-derive RL grad accumulation from the old 8-GPU baseline formula when running the current 3-GPU RL path.
+- Optional RL memory-pressure fallback: `configs/deepspeed/zero2_cpuoffload_rl.json`.
+  Use it only when `zero2_rl.json` still exceeds memory; expect it to be slower than plain Zero2 because optimizer state is offloaded to CPU.
+- As of 2026-04-17, the default RL `keep_recent_tool_image_messages` should be `3`, with a special rule:
+  preserve the latest `scan_timeline` image tool message inside this budget, and use the remaining slots for the most recent other image-bearing tool messages.
+- As of 2026-04-17, active RL should not use `severity` or `counterfactual_type` as part of its output contract, reward computation, or FECV semantics.
+  Preserve broad compatibility when reading old artifacts that still contain these fields, but treat them as ignored by active RL training.
+- `configs/rl/qwen3_vl_8b_grpo_train.yaml`, `scripts/run_full_pipeline.sh` (RL path), and `scripts/train_rl_qwen3_vl_8b_ds8.sh` should all point RL to `zero2_rl.json`.
+- The current `idea2_v3` stack should treat ZeRO-2 as the default RL training backend and reserve ZeRO-3 only for explicit debugging or memory-pressure experiments.
+- For the current `idea2_v3` stack (`Qwen3-VL + transformers + FA3 + DeepSpeed + TRL`), `Liger` is currently not a usable acceleration path. It repeatedly stalls in `compute_loss` even after removing param offload and aligning the dispatch path.
+- As of 2026-04-17, active RL should default to `use_liger_loss=false`.
+- If `Liger` is revisited later, treat it as a separate research/debug task rather than the default RL path.
+- Active RL pure-pack episode inputs are not packed sequences. The local RL process may patch `transformers.modeling_flash_attention_utils._is_packed_sequence` to always return `False`, but this is only an auxiliary mitigation and does not by itself make `Liger` workable in the current stack.
+- As of 2026-04-17, the active TRL RL path should recover from all-zero-advantage local payloads using a TimeSearch-R-style **local replay fallback**; if replay misses and the local step still has no trainable signal, the optimizer step should be skipped rather than silently advancing training state.
+
+### Data Prep File Map
+
+Primary raw / canonical inputs under `data_utils/`:
+
+- `msad_saver_with_qwen.jsonl` — primary MSAD canonical annotation source.
+- `ecva_saver_with_qwen235B.jsonl` — ECVA canonical annotation source.
+- `data_utils/splits.py` and `data_utils/video_paths.py` — split and video-path helpers.
+
+Current official preprocessing outputs under `data_utils/`:
+
+- `msad_saver_runtime_train.jsonl` — runtime train input for RL and compact-trace preparation.
+- `msad_saver_runtime_test.jsonl` — runtime test input for rollout eval / RL eval.
+- `sft_train.compact_trace_v2.jsonl` — base prepared SFT file.
+- `sft_train.teacher_rollout_primary.compact_trace_v2.jsonl` — teacher-judge prepared SFT file.
+- `sft_train.compact_trace_v2.materialized_messages_v1.jsonl` — offline SFT messages cache.
+- `msad_saver_runtime_train.materialized_items_v1.jsonl` — offline runtime-items cache for RL train.
+- `msad_saver_runtime_test.materialized_items_v1.jsonl` — offline runtime-items cache for rollout eval / RL eval.
+- `*.meta.json` and `*.summary.json` sidecars next to the prepared/materialized files — provenance, validation, and summary metadata.
+
+### Data Prep Command Ownership
+
+- Runtime-train/test conversion: `convert_to_saver_agent.py`
+- SFT prepared manifest generation: `scripts/prepare_sft_manifest.sh` and `python -m saver_v3.cli.prepare_sft_manifest`
+- Offline materialized cache generation: `prepare_materialized_cache.py`
+- Teacher-judge prepared branch: `annotate_teacher_judge_sft.py`
+- Video cache building: `build_frame_cache.py`
+- Feature cache building: `build_feature_cache.py`
+
+### Cache And Artifact Locations
+
+- `*.frame_cache` and `*.feature_cache` are required runtime inputs for the current SFT/RL/rollout-eval path.
+- These cache files are generated next to the resolved source videos under `DATA_ROOT`, not inside the repo tree.
+- Repo-side summaries and metadata stay in `data_utils/`; the heavyweight frame/feature cache payloads live with the videos.
+
+### Experiment Output Map
+
+- `artifacts/<EXP_NAME>/sft/` — SFT checkpoints.
+- `artifacts/<EXP_NAME>/rl/` — RL checkpoints.
+- `artifacts/<EXP_NAME>/eval/` — rollout eval outputs for SFT/RL.
+- `artifacts/<EXP_NAME>/logs/` — pipeline/runtime logs.
+- Existing observed runs include `artifacts/exp3/`, `artifacts/exp4/`, `artifacts/liger_smoke_fast/`, and fixed-baseline directories.
+- `wandb/` — offline WandB run directories.
+- `docs/tasks/` — execution/task docs.
+- `docs/paper_drafts/` — paper drafts.
+- `refine-logs/EXPERIMENT_PLAN.md` — experiment planning scratch artifact.
+
+### Documentation Sync Rule
+
+- When the server-side code, file layout, training entrypoints, preprocessing flow, or artifact paths change, update the corresponding project documentation in the same round of work.
+- Keep this document aligned with the actual implementation on the server at `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`.
+- Do not leave project docs stale after code changes; otherwise later debugging and code navigation will drift from reality and create avoidable misunderstanding.
+
+### TimeSearch-R Reference
+
+- `TimeSearch-R` is the code foundation for developing this paper.
+- Reference repository path: `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/TimeSearch-R`
+- When modifying this project to follow the `TimeSearch-R` direction or style, first reuse its ideas, design patterns, and code where applicable before introducing project-specific alternatives.
+
+### Paper Draft Rule
+
+- Paper drafts live under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/docs/paper_drafts`.
+- When asked to read the paper, always read the numerically latest `search_to_verify_neurips_v*.md` draft in that directory.
+- Current latest draft observed on 2026-04-15: `search_to_verify_neurips_v10.md`.
+
 ### Server Access
 
 ```bash
 # Step 1: SSH to GPU server (Server 2)
-ssh -CAXY ws-410ca32fa4aae17e-worker-zvlln.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn
+ssh -CAXY ws-410ca32fa4aae17e-worker-mzzbd.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn
 
-# Step 2: Attach to GPU tmux session (may already be active)
-tmux a -t 8H200
+# Step 2: Attach to an existing GPU tmux session if needed
+tmux ls
+tmux a -t <session-name>
 
 # Step 3: Activate environment
 source ~/.bashrc
@@ -45,6 +181,27 @@ cd /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3
 export SAVER_V3_DATA_ROOT=/mnt/shared-storage-user/mineru2-shared/zengweijun
 export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 ```
+
+### Remote Code Reading Rule
+
+- When reading or modifying server-side code over SSH, read the target implementation as completely as practical before drawing conclusions.
+- Do not inspect only a few lines around a symbol and then infer behavior for the whole path; follow the full control flow across the relevant functions, configs, and callsites first.
+- If the issue spans multiple stages, read the entire affected chain end to end before proposing a diagnosis or fix.
+- For code reading, code review, debugging, and profiling in this project, default to **multiple Codex read-only investigation workers** before answering or proposing changes.
+- Preferred split for `idea2_v3`:
+  - **Server 1 worker:** read code, configs, docs, offline artifacts, and historical logs from `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`.
+  - **Server 2 worker:** inspect live training/eval state via `tmux`, `ps`, `nvidia-smi`, `nvidia-smi dmon`, `pidstat`, and currently growing logs under `artifacts/<EXP_NAME>/logs/`.
+- If one server cannot read shared files stably, switch to the other server and continue until the relevant code path and logs are read in full.
+- Do **not** answer code-reading or code-review questions from partial snippets just because one SSH connection is unstable; use shared filesystem failover and keep reading.
+
+### Shared Filesystem Rule
+
+- Server 1 and Server 2 share the same filesystem under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh`.
+- If SSH to one server fails or is unstable, it is valid to switch to the other server and continue working on the same project files.
+- Any code/document/data path under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3` should be treated as shared across both servers unless proven otherwise.
+- Stable shared-filesystem access takes priority over attachment to a specific machine; prefer whichever server currently gives complete reads of code and logs.
+- If Server 2 session is stable, edit and test code there directly for training-related work instead of downloading locally and re-uploading.
+- Avoid local Mac edit → upload loops for server-side code unless remote editing is blocked. If forced to do so, record why and return to direct remote editing as soon as possible.
 
 ### Quick Start: Running Experiments
 
@@ -119,7 +276,7 @@ bash scripts/prepare_sft_manifest.sh --run
 bash scripts/train_sft_qwen3_vl_8b_ds8.sh --run
 ```
 
-- DeepSpeed ZeRO-3, 8×H200
+- DeepSpeed ZeRO-3, 3×H200
 - Assistant-turn-only loss masking
 - Per-epoch checkpoint saved
 - **After each epoch:** run SFT eval (Stage 2) to pick best checkpoint
@@ -160,7 +317,7 @@ R(τ) = 1.0 × R_acc + 0.35 × R_fecv + 0.05 × R_protocol
 ```
 
 - GRPO group size G=8, lr=5e-7, KL=0.01, T_max=14 turns
-- DeepSpeed ZeRO-3, 8×H200
+- DeepSpeed ZeRO-3, 3×H200
 
 #### Stage 4: RL Evaluation
 
@@ -492,6 +649,19 @@ Claude (design/plan) ──→ Codex-pro (implement/challenge) ──→ Claude 
 - Codex calls use `xhigh` effort level for maximum reasoning depth
 - If Claude and Codex disagree, log both perspectives and escalate to user
 - Applies to: training scripts, config changes, reward function modifications, evaluation logic, data processing
+- For code reading/review tasks, start with read-only multi-Codex investigation on shared filesystem before making claims or edits.
+- When runtime behavior matters, pair static code reading with Server 2 live-process inspection (`tmux`, `nvidia-smi dmon`, `pidstat`, logs) before concluding bottleneck or failure cause.
+
+### Default Skill Bundles
+
+When user asks to review, read, inspect, or check code, default to these bundles:
+
+- **Read and understand logic:** `smart-explore` + `systematic-debugging`
+- **Performance / algorithm optimization:** `system-profile` + `test-driven-development` + `karpathy-guidelines`
+- **Research-style algorithm review:** `research-algorithm-checker`
+- **Large redesign / big refactor:** `writing-plans` + `subagent-driven-development` + `requesting-code-review` + `deep-interview`
+
+If an exact skill name is unavailable in the current harness, use the closest equivalent workflow and state the substitution once.
 
 ---
 
@@ -513,6 +683,11 @@ All code modifications can be executed via **two paths**:
 - Dependency installs → remote Codex-pro on Server 1
 - Design docs, experiment plans, paper edits → local Mac Codex
 - Code review of remote changes → either (shared FS)
+
+**Editing preference:**
+- If remote SSH session is stable, modify code directly on shared filesystem from server side.
+- Do not round-trip server code through local Mac unless remote editing is blocked.
+- For live-training issues, prefer Server 2 direct edits so code, logs, processes, and validation stay on same machine.
 
 ---
 

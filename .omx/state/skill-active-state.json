@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "active": true,
+  "skill": "analyze",
+  "keyword": "analyze",
+  "phase": "planning",
+  "activated_at": "2026-04-17T17:58:57.001Z",
+  "updated_at": "2026-04-17T18:01:04.610Z",
+  "source": "keyword-detector",
+  "session_id": "",
+  "thread_id": "019d9c90-5104-7870-a736-aaea032105ef",
+  "turn_id": "019d9c90-511a-7de2-a0ad-a40de7c9b331",
+  "active_skills": [
+    {
+      "skill": "analyze",
+      "phase": "planning",
+      "active": true,
+      "activated_at": "2026-04-17T17:58:57.001Z",
+      "updated_at": "2026-04-17T18:01:04.610Z",
+      "session_id": "",
+      "thread_id": "019d9c90-5104-7870-a736-aaea032105ef",
+      "turn_id": "019d9c90-511a-7de2-a0ad-a40de7c9b331"
+    }
+  ],
+  "input_lock": {
+    "active": false,
+    "scope": "deep-interview-auto-approval",
+    "acquired_at": "2026-04-17T17:14:44.201Z",
+    "blocked_inputs": [
+      "yes",
+      "y",
+      "proceed",
+      "continue",
+      "ok",
+      "sure",
+      "go ahead",
+      "next i should"
+    ],
+    "message": "Deep interview is active; auto-approval shortcuts are blocked until the interview finishes.",
+    "released_at": "2026-04-17T18:01:04.610Z",
+    "exit_reason": "handoff"
+  },
+  "iteration": 10,
+  "last_turn_at": "2026-04-17T19:13:05.756Z"
+}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 _TIMESTAMP_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)?s\s*$")
@@ -10,6 +10,14 @@ _TIMESTAMP_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)?s\s*$")
 
 def is_image_item(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "image" and ("image" in item or "image_ref" in item)
+
+
+def is_video_item(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("type") == "video" and ("video" in item or "video_ref" in item)
+
+
+def is_image_or_video_item(item: Any) -> bool:
+    return is_image_item(item) or is_video_item(item)
 
 
 def is_timestamp_text_item(item: Any) -> bool:
@@ -49,6 +57,68 @@ def _history_turn_spans(messages: List[Dict[str, Any]]) -> Tuple[int, List[Tuple
                 index += 1
         spans.append((start, index))
     return prefix_end, spans
+
+
+def _tool_message_has_multimodal_content(message: Dict[str, Any]) -> bool:
+    return str(message.get("role") or "") == "tool" and any(
+        is_image_or_video_item(item)
+        for item in list(message.get("content", []))
+        if isinstance(item, dict)
+    )
+
+
+def _latest_scan_timeline_tool_message_index(messages: List[Dict[str, Any]]) -> Optional[int]:
+    for message_index in range(len(messages) - 1, -1, -1):
+        message = messages[message_index]
+        if not _tool_message_has_multimodal_content(message):
+            continue
+        if str(message.get("name") or "").strip() == "scan_timeline":
+            return int(message_index)
+    return None
+
+
+def _tool_image_message_keep_indices(
+    messages: List[Dict[str, Any]],
+    *,
+    keep_recent_tool_image_messages: int,
+) -> Set[int]:
+    budget = int(keep_recent_tool_image_messages)
+    if budget <= 0:
+        return set()
+    image_tool_message_indices = [
+        message_index
+        for message_index, message in enumerate(messages)
+        if _tool_message_has_multimodal_content(message)
+    ]
+    if not image_tool_message_indices:
+        return set()
+
+    # The latest scan_timeline view carries global search context, so keep it
+    # ahead of generic recency pruning whenever an image budget is active.
+    keep_indices: List[int] = []
+    latest_scan_timeline_index = _latest_scan_timeline_tool_message_index(messages)
+    if latest_scan_timeline_index is not None:
+        keep_indices.append(latest_scan_timeline_index)
+
+    for message_index in reversed(image_tool_message_indices):
+        if len(keep_indices) >= budget:
+            break
+        if message_index in keep_indices:
+            continue
+        keep_indices.append(message_index)
+    return set(keep_indices)
+
+
+def _protected_scan_timeline_image_positions(messages: List[Dict[str, Any]]) -> Set[Tuple[int, int]]:
+    latest_scan_timeline_index = _latest_scan_timeline_tool_message_index(messages)
+    if latest_scan_timeline_index is None:
+        return set()
+    content = list(messages[latest_scan_timeline_index].get("content", []))
+    return {
+        (int(latest_scan_timeline_index), int(content_index))
+        for content_index, item in enumerate(content)
+        if is_image_item(item)
+    }
 
 
 def drop_oldest_history_turn(messages: List[Dict[str, Any]]) -> bool:
@@ -96,20 +166,12 @@ def prune_stale_tool_images(
     image_tool_message_indices = [
         message_index
         for message_index, message in enumerate(prepared)
-        if message.get("role") == "tool"
-        and any(
-            item.get("type") in {"image", "video"}
-            and (
-                "image" in item
-                or "image_ref" in item
-                or "video" in item
-                or "video_ref" in item
-            )
-            for item in list(message.get("content", []))
-            if isinstance(item, dict)
-        )
+        if _tool_message_has_multimodal_content(message)
     ]
-    keep_indices = set(image_tool_message_indices[-int(keep_recent_tool_image_messages) :])
+    keep_indices = _tool_image_message_keep_indices(
+        prepared,
+        keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+    )
 
     for message_index in image_tool_message_indices:
         if message_index in keep_indices:
@@ -155,8 +217,10 @@ def cap_total_images(
     if overflow <= 0:
         return prepared
 
+    protected_positions = _protected_scan_timeline_image_positions(prepared)
     removals_by_message: Dict[int, set[int]] = {}
-    for message_index, content_index in image_positions[:overflow]:
+    removable_positions = [position for position in image_positions if position not in protected_positions]
+    for message_index, content_index in removable_positions[:overflow]:
         content = list(prepared[message_index].get("content", []))
         removals_by_message.setdefault(message_index, set()).update(
             paired_multimodal_removal_indices(content, content_index)

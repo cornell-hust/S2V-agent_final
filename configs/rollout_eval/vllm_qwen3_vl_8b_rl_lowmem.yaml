@@ -15,7 +15,7 @@ client:
   max_total_images: 28
   max_seq_length: 8192
   keep_recent_text_messages: 20
-  keep_recent_tool_image_messages: 0
+  keep_recent_tool_image_messages: 3
   max_image_side: 640
   max_image_pixels: 0
   temperature: 0.0

@@ -1,0 +1,6 @@
+{
+  "last_turn_at": "2026-04-17T19:13:05.825Z",
+  "turn_count": 17,
+  "last_progress_at": "2026-04-17T19:13:05.825Z",
+  "last_agent_output": "结论：不是。TimeSearch-R 没有把 `reference model` 手动移动到另一张独立 GPU 上；它把 reference model 留在 trainer 内部，交给 DeepSp"
+}

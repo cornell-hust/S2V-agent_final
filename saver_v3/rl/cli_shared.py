@@ -193,7 +193,7 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--max-image-side", type=int, default=640, help="Optional training-time max image side length in pixels for RL.")
     parser.add_argument("--max-image-pixels", type=int, default=0, help="Optional training-time max image area in pixels for RL.")
     parser.add_argument("--max-seq-length", type=int, default=DEFAULT_RECOMMENDED_MAX_SEQ_LENGTH, help="Explicit tokenizer/processor max_length for RL update examples.")
-    parser.add_argument("--keep-recent-tool-image-messages", type=int, default=0, help="If >0, keep images only for the N most recent tool messages during RL.")
+    parser.add_argument("--keep-recent-tool-image-messages", type=int, default=3, help="If >0, keep images only for the N most recent tool messages during RL.")
     parser.add_argument("--keep-recent-text-messages", type=int, default=DEFAULT_RECOMMENDED_KEEP_RECENT_TEXT_MESSAGES, help="If >0, keep full text only for the N most recent non-initial history messages during RL.")
     parser.add_argument("--max-total-images", type=int, default=DEFAULT_RECOMMENDED_MAX_TOTAL_IMAGES, help="Optional hard cap on total images kept in each RL example.")
     parser.add_argument("--num-preview-frames", type=int, default=8, help="Preview frames for initial prompt.")

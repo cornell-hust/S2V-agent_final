@@ -36,6 +36,130 @@ def _write_yaml(path: Path, payload: dict) -> None:
 
 
 class RLRuntimeTests(unittest.TestCase):
+    def test_aggregate_generation_step_payload_balances_rollout_groups_across_ranks(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._new_rollout_metric_lists = lambda: {"reward_total": []}
+        trainer._new_runtime_stats = lambda: {}
+        trainer.get_budget_drop_metrics = lambda: {"rl_zero_response_dropped": 0}
+        trainer._aggregate_generation_step_payload = (
+            TimesearchAlignedGRPOTrainerMixin._aggregate_generation_step_payload.__get__(trainer)
+        )
+
+        def _episode(token_id: int) -> dict:
+            return {
+                "prompt_ids": torch.tensor([[token_id]], dtype=torch.long),
+                "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                "completion_ids": torch.tensor([[token_id + 100]], dtype=torch.long),
+                "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                "advantages": torch.tensor([1.0], dtype=torch.float32),
+            }
+
+        local_payload = {
+            "video_id": "local",
+            "rollout_groups": [
+                {
+                    "video_id": "local",
+                    "generation_id": 0,
+                    "source_item_index": 0,
+                    "source_rollout_index": 0,
+                    "episode_inputs": [_episode(1), _episode(2), _episode(3), _episode(4)],
+                }
+            ],
+            "rollout_metric_values": {"reward_total": [1.0]},
+            "runtime_stats": {"foo": 1},
+        }
+        gathered_rollout_groups = [
+            list(local_payload["rollout_groups"]),
+            [
+                {
+                    "video_id": "remote_a",
+                    "generation_id": 1,
+                    "source_item_index": 0,
+                    "source_rollout_index": 0,
+                    "episode_inputs": [_episode(11), _episode(12), _episode(13), _episode(14)],
+                },
+                {
+                    "video_id": "remote_b",
+                    "generation_id": 2,
+                    "source_item_index": 0,
+                    "source_rollout_index": 1,
+                    "episode_inputs": [_episode(21), _episode(22), _episode(23), _episode(24)],
+                },
+            ],
+        ]
+        logged_messages = []
+        with mock.patch.object(aligned_grpo_module, "_distributed_rank", return_value=0), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_gather_object",
+            return_value=gathered_rollout_groups,
+        ), mock.patch.object(
+            aligned_grpo_module,
+            "runtime_log",
+            side_effect=lambda message, **kwargs: logged_messages.append(str(message)),
+        ):
+            payload = trainer._aggregate_generation_step_payload([local_payload])
+
+        self.assertEqual(payload["runtime_stats"]["raw_local_rollout_group_count_before_slice"], 1)
+        self.assertEqual(payload["runtime_stats"]["raw_local_rollout_group_count_after_slice"], 2)
+        self.assertEqual(len(payload["episode_inputs"]), 8)
+        prompt_first_tokens = [int(batch["prompt_ids"][0, 0].item()) for batch in payload["episode_inputs"]]
+        self.assertIn(1, prompt_first_tokens)
+        self.assertIn(21, prompt_first_tokens)
+        self.assertTrue(any("assigned_groups=2" in message for message in logged_messages))
+        self.assertTrue(any("assigned_samples=8" in message for message in logged_messages))
+
+    def test_aggregate_generation_step_payload_wraps_episode_inputs_without_rollout_groups(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer._new_rollout_metric_lists = lambda: {"reward_total": []}
+        trainer._new_runtime_stats = lambda: {}
+        trainer.get_budget_drop_metrics = lambda: {}
+        trainer._aggregate_generation_step_payload = (
+            TimesearchAlignedGRPOTrainerMixin._aggregate_generation_step_payload.__get__(trainer)
+        )
+
+        payload = {
+            "video_id": "vid1",
+            "episode_inputs": [
+                {
+                    "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+                    "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[2]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                    "advantages": torch.tensor([1.0], dtype=torch.float32),
+                },
+                {
+                    "prompt_ids": torch.tensor([[3]], dtype=torch.long),
+                    "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+                    "completion_ids": torch.tensor([[4]], dtype=torch.long),
+                    "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+                    "advantages": torch.tensor([1.0], dtype=torch.float32),
+                },
+            ],
+            "rollout_metric_values": {"reward_total": [0.5]},
+            "runtime_stats": {"foo": 2},
+        }
+
+        with mock.patch.object(aligned_grpo_module, "_distributed_rank", return_value=0), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_gather_object",
+            return_value=[[
+                {
+                    "video_id": "vid1",
+                    "group_id": "vid1",
+                    "generation_id": -1,
+                    "source_item_index": 0,
+                    "source_rollout_index": 0,
+                    "episode_inputs": payload["episode_inputs"],
+                }
+            ]],
+        ):
+            aggregated = trainer._aggregate_generation_step_payload([payload])
+
+        self.assertEqual(aggregated["runtime_stats"]["raw_local_rollout_group_count_before_slice"], 1)
+        self.assertEqual(aggregated["runtime_stats"]["raw_local_rollout_group_count_after_slice"], 1)
+        self.assertEqual(len(aggregated["episode_inputs"]), 2)
+        self.assertEqual(aggregated["video_ids"], ["vid1"])
+
     def test_save_loadable_hf_authority_checkpoint_uses_accelerator_state_dict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -420,7 +544,14 @@ class RLRuntimeTests(unittest.TestCase):
         trainer.compute_loss_context_manager = lambda: contextlib.nullcontext()
         trainer._prepare_inputs = lambda inputs: inputs
         trainer._maybe_skip_empty_training_step = mock.Mock(return_value=None)
-        trainer.compute_loss = mock.Mock(return_value=torch.tensor(22.0))
+        trainer._ensure_liger_runtime_ready = lambda model: None
+        trainer._iter_loss_microbatches = lambda batch: [batch]
+        trainer._compute_sample_losses_for_batch = mock.Mock(return_value=torch.tensor([22.0], dtype=torch.float32, requires_grad=True))
+        trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
         trainer.args = type("Args", (), {"n_gpu": 1})()
         trainer.current_gradient_accumulation_steps = 22
         trainer.model_accepts_loss_kwargs = False
@@ -432,7 +563,15 @@ class RLRuntimeTests(unittest.TestCase):
                 self.weight = torch.nn.Parameter(torch.tensor([1.0]))
 
         model = TinyModel()
-        loss = trainer.training_step(model, {"episode_inputs": [{"completion_mask": torch.tensor([[1]])}], "runtime_stats": {}})
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        }
+        loss = trainer.training_step(model, {"episode_inputs": [batch], "runtime_stats": {}})
 
         trainer.accelerator.backward.assert_called_once()
         backward_loss = trainer.accelerator.backward.call_args.args[0]
@@ -690,7 +829,14 @@ class RLRuntimeTests(unittest.TestCase):
         trainer.compute_loss_context_manager = lambda: contextlib.nullcontext()
         trainer._prepare_inputs = lambda inputs: inputs
         trainer._maybe_skip_empty_training_step = mock.Mock(return_value=None)
-        trainer.compute_loss = mock.Mock(return_value=torch.tensor(22.0, requires_grad=True))
+        trainer._ensure_liger_runtime_ready = lambda model: None
+        trainer._iter_loss_microbatches = lambda batch: [batch]
+        trainer._compute_sample_losses_for_batch = mock.Mock(return_value=torch.tensor([22.0], dtype=torch.float32, requires_grad=True))
+        trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
         trainer.args = type("Args", (), {"n_gpu": 1})()
         trainer.current_gradient_accumulation_steps = 1
         trainer.model_accepts_loss_kwargs = False
@@ -702,12 +848,127 @@ class RLRuntimeTests(unittest.TestCase):
                 self.weight = torch.nn.Parameter(torch.tensor([1.0]))
 
         model = TinyModel()
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        }
         logged_messages = []
         with mock.patch.object(aligned_grpo_module, "runtime_log", side_effect=lambda message, **kwargs: logged_messages.append(str(message))):
-            trainer.training_step(model, {"episode_inputs": [{"completion_mask": torch.tensor([[1]])}], "runtime_stats": {}})
+            trainer.training_step(model, {"episode_inputs": [batch], "runtime_stats": {}})
 
         self.assertTrue(any("rl backward start:" in message for message in logged_messages))
         self.assertTrue(any("rl backward end:" in message for message in logged_messages))
+
+    def test_training_step_immediate_microbatch_backward_pads_to_shared_max_count(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.accelerator = mock.Mock()
+        trainer.accelerator.distributed_type = "DEEPSPEED"
+        trainer.use_liger_loss = False
+        trainer.compute_loss_context_manager = lambda: contextlib.nullcontext()
+        trainer._prepare_inputs = lambda inputs: inputs
+        trainer._maybe_skip_empty_training_step = mock.Mock(return_value=None)
+        trainer._ensure_liger_runtime_ready = lambda model: None
+        trainer._iter_loss_microbatches = lambda batch: [batch]
+        trainer._compute_sample_losses_for_batch = mock.Mock(return_value=torch.tensor([5.0], dtype=torch.float32, requires_grad=True))
+        trainer._move_episode_input_to_device = lambda episode_input, device: episode_input
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer.args = type("Args", (), {"n_gpu": 1})()
+        trainer.current_gradient_accumulation_steps = 1
+        trainer.model_accepts_loss_kwargs = False
+        trainer.compute_loss_func = None
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        }
+        with mock.patch.object(aligned_grpo_module, "_distributed_world_size", return_value=2), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_sum_float",
+            return_value=2.0,
+        ), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_max_int",
+            return_value=2,
+        ):
+            loss = trainer.training_step(model, {"episode_inputs": [batch], "runtime_stats": {}})
+
+        self.assertEqual(trainer.accelerator.backward.call_count, 2)
+        first_backward_loss = trainer.accelerator.backward.call_args_list[0].args[0]
+        second_backward_loss = trainer.accelerator.backward.call_args_list[1].args[0]
+        self.assertAlmostEqual(float(first_backward_loss.item()), 5.0, places=6)
+        self.assertAlmostEqual(float(second_backward_loss.item()), 0.0, places=6)
+        self.assertAlmostEqual(float(loss.item()), 5.0, places=6)
+
+    def test_training_step_immediate_microbatch_backward_skips_inactive_microbatch_forward(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.accelerator = mock.Mock()
+        trainer.accelerator.distributed_type = "DEEPSPEED"
+        trainer.use_liger_loss = False
+        trainer.compute_loss_context_manager = lambda: contextlib.nullcontext()
+        trainer._prepare_inputs = lambda inputs: inputs
+        trainer._maybe_skip_empty_training_step = mock.Mock(return_value=None)
+        trainer._ensure_liger_runtime_ready = lambda model: None
+        trainer._iter_loss_microbatches = lambda batch: [batch]
+        trainer._compute_sample_losses_for_batch = mock.Mock(side_effect=AssertionError("inactive microbatch should bypass loss compute"))
+        move_calls = []
+        trainer._move_episode_input_to_device = lambda episode_input, device: move_calls.append((episode_input, device)) or episode_input
+        trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        trainer._effective_sample_weight = TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        trainer._sample_loss_multiplier = TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        trainer._sample_weight = TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        trainer.args = type("Args", (), {"n_gpu": 1})()
+        trainer.current_gradient_accumulation_steps = 1
+        trainer.model_accepts_loss_kwargs = False
+        trainer.compute_loss_func = None
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        model = TinyModel()
+        batch = {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[2]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+            "sample_loss_multiplier": torch.tensor([0.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([0.0], dtype=torch.float32),
+        }
+        with mock.patch.object(aligned_grpo_module, "_distributed_world_size", return_value=1), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_sum_float",
+            return_value=1.0,
+        ), mock.patch.object(
+            aligned_grpo_module,
+            "_distributed_max_int",
+            return_value=1,
+        ):
+            loss = trainer.training_step(model, {"episode_inputs": [batch], "runtime_stats": {}})
+
+        trainer.accelerator.backward.assert_called_once()
+        backward_loss = trainer.accelerator.backward.call_args.args[0]
+        self.assertAlmostEqual(float(backward_loss.item()), 0.0, places=6)
+        self.assertEqual(move_calls, [])
+        trainer._compute_sample_losses_for_batch.assert_not_called()
+        self.assertAlmostEqual(float(loss.item()), 0.0, places=6)
 
     def test_compute_liger_loss_logs_liger_and_reference_forward(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -928,6 +1189,8 @@ class RLRuntimeTests(unittest.TestCase):
             payload = trainer._build_generation_item_payload_from_rollouts({"video_id": "vid1"}, [rollout])
 
         self.assertEqual(patched_pack_builder.call_count, 1)
+        self.assertEqual(len(payload["rollout_groups"]), 1)
+        self.assertEqual(payload["rollout_groups"][0]["sample_count"], 1)
         self.assertEqual(len(payload["episode_inputs"]), 1)
 
     def test_build_generation_step_payloads_prefetches_old_logprobs(self) -> None:
@@ -1660,6 +1923,42 @@ class RLRuntimeTests(unittest.TestCase):
             self.assertEqual(job.rollout_stage_batch_size, 6)
             self.assertEqual(job.fecv_stage_batch_size, 5)
 
+    def test_rl_job_config_defaults_keep_recent_tool_image_messages_to_three(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / "rl.yaml"
+            model_config_path = tmp_path / "model.yaml"
+            attention_config_path = tmp_path / "attn.yaml"
+            rollout_config_path = tmp_path / "rollout.yaml"
+
+            _write_yaml(rollout_config_path, {"server": {"launcher": "external_launcher"}})
+            _write_yaml(
+                model_config_path,
+                {
+                    "base_model": "/models/qwen3-vl-8b-Instruct",
+                    "attn_implementation": "flash_attention_3",
+                },
+            )
+            _write_yaml(attention_config_path, {"policy_name": "fa3_only"})
+            _write_yaml(
+                config_path,
+                {
+                    "policy_init_from": "/checkpoints/sft/final_hf_model",
+                    "rollout_backend": "vllm",
+                    "rollout_config": str(rollout_config_path),
+                    "data": {"train_manifest": "/data/rl_train.jsonl"},
+                    "optimization": {},
+                },
+            )
+
+            job = RLJobConfig.from_files(
+                config_path=str(config_path),
+                model_config_path=str(model_config_path),
+                attention_config_path=str(attention_config_path),
+            )
+
+            self.assertEqual(job.keep_recent_tool_image_messages, 3)
+
     def test_rl_job_config_parses_vllm_max_num_seqs_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -2129,6 +2428,20 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertTrue(args.use_liger_loss)
         self.assertTrue(args.use_vllm)
         self.assertEqual(args.vllm_mode, "colocate")
+
+    def test_train_saver_rl_trl_parser_defaults_keep_recent_tool_image_messages_to_three(self) -> None:
+        import train_saver_rl_trl
+
+        args = train_saver_rl_trl.parse_args(
+            [
+                "--output-dir",
+                "/tmp/out",
+                "--data",
+                "/tmp/train.jsonl",
+            ]
+        )
+
+        self.assertEqual(args.keep_recent_tool_image_messages, 3)
 
     def test_active_rl_shared_parser_rejects_reference_model_path(self) -> None:
         with self.assertRaisesRegex(ValueError, "reference-model-path"):
