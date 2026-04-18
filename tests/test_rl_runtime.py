@@ -2717,6 +2717,85 @@ class VisionFeatureCacheTests(unittest.TestCase):
             outer.model.visual = original_visual
         self.assertIs(outer.model.visual, original_visual)
 
+    def test_detach_visual_output_handles_model_output_dataclass(self) -> None:
+        import torch
+        import torch.nn as nn
+        from dataclasses import dataclass
+        from typing import Optional as _Optional
+
+        from saver_v3.rl.timesearch_aligned_grpo_trainer import (
+            _CachedVisualStub,
+            _detach_visual_output,
+        )
+
+        # Prefer the real transformers ModelOutput base so the test exercises the
+        # exact code path hit in production. Fall back to a minimal local subclass
+        # if the package is unavailable on the test machine.
+        try:
+            from transformers.utils import ModelOutput  # type: ignore
+        except Exception:  # pragma: no cover - defensive
+            ModelOutput = None  # type: ignore[assignment]
+
+        if ModelOutput is None:
+            self.skipTest("transformers is required to exercise ModelOutput detach path")
+
+        @dataclass
+        class VisionOutput(ModelOutput):
+            last_hidden_state: _Optional[torch.Tensor] = None
+            pooler_output: _Optional[torch.Tensor] = None
+            deepstack_features: _Optional[list] = None
+
+        last_hidden = torch.randn(5, 4, requires_grad=True)
+        pooler = torch.randn(4, requires_grad=True)
+        deepstack = [torch.randn(5, 4, requires_grad=True) for _ in range(2)]
+        original = VisionOutput(
+            last_hidden_state=last_hidden,
+            pooler_output=pooler,
+            deepstack_features=deepstack,
+        )
+
+        detached = _detach_visual_output(original)
+
+        # Post-detach value must remain an instance of the SAME ModelOutput type
+        # (not a tuple, not the unchanged original), so field-name access still works.
+        self.assertIsInstance(detached, VisionOutput)
+        self.assertIsNot(detached, original)
+        # Every tensor field must be detached, including the non-positional ones.
+        self.assertFalse(detached.last_hidden_state.requires_grad)
+        self.assertFalse(detached.pooler_output.requires_grad)
+        self.assertTrue(torch.equal(detached.last_hidden_state, last_hidden.detach()))
+        self.assertTrue(torch.equal(detached.pooler_output, pooler.detach()))
+        self.assertIsInstance(detached.deepstack_features, list)
+        for orig_t, det_t in zip(deepstack, detached.deepstack_features):
+            self.assertFalse(det_t.requires_grad)
+            self.assertTrue(torch.equal(det_t, orig_t.detach()))
+
+        # Verify None fields survive round-trip without being coerced to tensors.
+        none_case = VisionOutput(
+            last_hidden_state=torch.randn(2, 4, requires_grad=True),
+            pooler_output=None,
+            deepstack_features=None,
+        )
+        detached_none = _detach_visual_output(none_case)
+        self.assertIsInstance(detached_none, VisionOutput)
+        self.assertIsNone(detached_none.pooler_output)
+        self.assertIsNone(detached_none.deepstack_features)
+        self.assertFalse(detached_none.last_hidden_state.requires_grad)
+
+        # Stub replay returns an instance of the same ModelOutput type with
+        # identical tensor values (identity comparison via torch.equal).
+        stub = _CachedVisualStub(
+            cached_calls=[detached],
+            dtype=torch.float32,
+            spatial_merge_size=2,
+        )
+        replayed = stub(torch.randn(5, 4))
+        self.assertIsInstance(replayed, VisionOutput)
+        self.assertTrue(torch.equal(replayed.last_hidden_state, detached.last_hidden_state))
+        self.assertTrue(torch.equal(replayed.pooler_output, detached.pooler_output))
+        self.assertFalse(replayed.last_hidden_state.requires_grad)
+        self.assertFalse(replayed.pooler_output.requires_grad)
+
 
 if __name__ == "__main__":
     unittest.main()

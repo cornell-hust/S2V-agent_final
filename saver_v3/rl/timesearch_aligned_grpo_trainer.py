@@ -719,13 +719,29 @@ class _CachedVisualStub(torch.nn.Module):
 
 
 def _detach_visual_output(output: Any) -> Any:
-    """Detach tensors inside a visual-module forward output without copying devices."""
+    """Detach tensors inside a visual-module forward output without copying devices.
+
+    Handles plain tensors, lists, tuples, and ``transformers.utils.ModelOutput``
+    dataclasses. For ``ModelOutput`` we rebuild a new instance of the same type
+    with each field detached field-by-field (preserving ``None`` fields and
+    field-name alignment — reconstructing via ``to_tuple`` would discard keys).
+    """
     if isinstance(output, torch.Tensor):
         return output.detach()
     if isinstance(output, tuple):
         return tuple(_detach_visual_output(item) for item in output)
     if isinstance(output, list):
         return [_detach_visual_output(item) for item in output]
+    try:
+        from transformers.utils import ModelOutput  # type: ignore
+    except Exception:  # pragma: no cover - transformers always present in runtime
+        ModelOutput = None  # type: ignore[assignment]
+    if ModelOutput is not None and isinstance(output, ModelOutput):
+        detached_items = {
+            key: (None if value is None else _detach_visual_output(value))
+            for key, value in output.items()
+        }
+        return type(output)(**detached_items)
     return output
 
 
@@ -2878,6 +2894,23 @@ class TimesearchAlignedGRPOTrainerMixin:
                     "requires_grad=True) — skipping to preserve gradient flow"
                 )
             return None
+        # Defense-in-depth: detect any PEFT LoRA adapter attached to the vision
+        # tower even when currently-inactive adapters would hide their params
+        # from ``requires_grad`` sweeps. Safe no-op when ``peft`` is not installed.
+        try:
+            from peft.tuners.tuners_utils import BaseTunerLayer  # type: ignore
+        except Exception:
+            BaseTunerLayer = None  # type: ignore[assignment]
+        if BaseTunerLayer is not None:
+            for sub in visual_module.modules():
+                if isinstance(sub, BaseTunerLayer):
+                    if getattr(self, "_vision_cache_disabled_reason", None) is None:
+                        self._vision_cache_disabled_reason = "lora_on_visual_tower"
+                        _training_phase_runtime_log(
+                            "rl vision cache disabled: PEFT adapter detected on vision tower "
+                            "— skipping to preserve gradient flow"
+                        )
+                    return None
         return {
             "policy_host": policy_host,
             "policy_visual": visual_module,
@@ -3077,11 +3110,15 @@ class TimesearchAlignedGRPOTrainerMixin:
                 )
             ),
         )
+        # Bypass ``nn.Module.__setattr__`` by writing the ``_modules`` slot
+        # directly: ``setattr`` would re-run parameter/buffer/hook bookkeeping,
+        # which can collide with DeepSpeed's partitioned-parameter state machine
+        # for the brief window we swap the vision tower.
         try:
-            host.visual = stub
+            host._modules["visual"] = stub
             yield
         finally:
-            host.visual = original_visual
+            host._modules["visual"] = original_visual
 
     def _compute_liger_loss_for_batch(self, unwrapped_model: Any, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
         if self.liger_grpo_loss is None:
