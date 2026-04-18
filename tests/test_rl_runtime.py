@@ -2688,3 +2688,280 @@ class ProposalGpuPathTests(unittest.TestCase):
         self.assertIsInstance(metadata["selected_frame_indices"], list)
         self.assertTrue(all(isinstance(v, int) for v in metadata["selected_frame_indices"]))
         self.assertIsInstance(metadata["proposal_candidate_frame_scores"], list)
+
+
+class RefLogprobPrefetchTests(unittest.TestCase):
+    def _make_trainer(
+        self,
+        *,
+        kl_beta: float = 0.1,
+        reference_model: object = None,
+        compute_loss_microbatch_size: int = 2,
+        rl_enable_reference_prefetch_cache: bool = True,
+    ) -> TimesearchAlignedGRPOTrainerMixin:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.kl_beta = float(kl_beta)
+        trainer.reference_model = reference_model
+        trainer.use_lora_reference_disable_adapter = False
+        trainer.policy_temperature = None
+        trainer.ppo_clip_epsilon = 0.2
+        trainer.compute_loss_microbatch_size = int(compute_loss_microbatch_size)
+        trainer.rl_enable_reference_prefetch_cache = bool(rl_enable_reference_prefetch_cache)
+        trainer._episode_input_sample_count = (
+            TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
+        )
+        trainer._sample_loss_multiplier = (
+            TimesearchAlignedGRPOTrainerMixin._sample_loss_multiplier.__get__(trainer)
+        )
+        trainer._sample_weight = (
+            TimesearchAlignedGRPOTrainerMixin._sample_weight.__get__(trainer)
+        )
+        trainer._effective_sample_weight = (
+            TimesearchAlignedGRPOTrainerMixin._effective_sample_weight.__get__(trainer)
+        )
+        trainer._has_trainable_weight = (
+            TimesearchAlignedGRPOTrainerMixin._has_trainable_weight.__get__(trainer)
+        )
+        trainer._zero_reference_token_log_probs_for_episode = (
+            TimesearchAlignedGRPOTrainerMixin._zero_reference_token_log_probs_for_episode.__get__(trainer)
+        )
+        trainer._compute_reference_token_log_probs_for_batch = (
+            TimesearchAlignedGRPOTrainerMixin._compute_reference_token_log_probs_for_batch.__get__(trainer)
+        )
+        trainer._iter_reference_prefetch_batches = (
+            TimesearchAlignedGRPOTrainerMixin._iter_reference_prefetch_batches.__get__(trainer)
+        )
+        trainer._prefetch_reference_log_probs = (
+            TimesearchAlignedGRPOTrainerMixin._prefetch_reference_log_probs.__get__(trainer)
+        )
+        trainer._slice_episode_input_sample_range = (
+            TimesearchAlignedGRPOTrainerMixin._slice_episode_input_sample_range.__get__(trainer)
+        )
+        trainer._slice_multimodal_input_samples = (
+            TimesearchAlignedGRPOTrainerMixin._slice_multimodal_input_samples.__get__(trainer)
+        )
+        trainer._iter_loss_microbatches = (
+            TimesearchAlignedGRPOTrainerMixin._iter_loss_microbatches.__get__(trainer)
+        )
+        trainer._move_episode_input_to_device = lambda batch, device: batch
+        return trainer
+
+    def _make_episode(
+        self,
+        *,
+        sample_count: int = 2,
+        completion_tokens: int = 3,
+        sample_loss_multiplier: float = 1.0,
+    ) -> dict:
+        return {
+            "prompt_ids": torch.zeros((sample_count, 2), dtype=torch.long),
+            "prompt_mask": torch.ones((sample_count, 2), dtype=torch.long),
+            "completion_ids": torch.zeros((sample_count, completion_tokens), dtype=torch.long),
+            "completion_mask": torch.ones((sample_count, completion_tokens), dtype=torch.bool),
+            "old_policy_token_log_probs": torch.zeros((sample_count, completion_tokens), dtype=torch.float32),
+            "advantages": torch.ones(sample_count, dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor(
+                [sample_loss_multiplier] * sample_count, dtype=torch.float32
+            ),
+            "sample_weight": torch.ones(sample_count, dtype=torch.float32),
+        }
+
+    def test_prefetch_zero_fills_inactive_episodes(self) -> None:
+        trainer = self._make_trainer(reference_model=mock.Mock())
+        active_episode = self._make_episode(sample_count=2, completion_tokens=4, sample_loss_multiplier=1.0)
+        inactive_episode = self._make_episode(sample_count=3, completion_tokens=5, sample_loss_multiplier=0.0)
+        trainer.reference_model.parameters = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
+        trainer._compute_reference_token_log_probs_for_batch = mock.Mock(
+            return_value=torch.full((2, 4), 0.5, dtype=torch.float32)
+        )
+        result = trainer._prefetch_reference_log_probs(
+            wrapped_model=None,
+            episode_inputs=[active_episode, inactive_episode],
+        )
+        self.assertIs(result[1], inactive_episode)
+        cached = inactive_episode.get("reference_token_log_probs")
+        self.assertIsInstance(cached, torch.Tensor)
+        self.assertEqual(cached.dtype, torch.float32)
+        self.assertEqual(cached.device.type, "cpu")
+        self.assertEqual(tuple(cached.shape), (3, 5))
+        self.assertTrue(bool(torch.all(cached == 0)))
+
+    def test_prefetch_uses_reference_forward_for_active_episodes(self) -> None:
+        trainer = self._make_trainer(reference_model=mock.Mock())
+        trainer.reference_model.parameters = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
+        active_episode = self._make_episode(sample_count=2, completion_tokens=4, sample_loss_multiplier=1.0)
+        known_tensor = torch.arange(8, dtype=torch.float32).view(2, 4) * 0.1
+        trainer._compute_reference_token_log_probs_for_batch = mock.Mock(return_value=known_tensor)
+        trainer._prefetch_reference_log_probs(
+            wrapped_model=None,
+            episode_inputs=[active_episode],
+        )
+        self.assertEqual(trainer._compute_reference_token_log_probs_for_batch.call_count, 1)
+        cached = active_episode.get("reference_token_log_probs")
+        self.assertIsInstance(cached, torch.Tensor)
+        self.assertEqual(cached.dtype, torch.float32)
+        self.assertEqual(cached.device.type, "cpu")
+        self.assertEqual(tuple(cached.shape), (2, 4))
+        self.assertTrue(torch.allclose(cached, known_tensor))
+
+    def test_compute_loss_uses_cached_reference_logprobs_when_present(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.policy_temperature = None
+        trainer.kl_beta = 0.1
+        trainer.reference_model = object()
+        trainer.use_lora_reference_disable_adapter = False
+        trainer.ppo_clip_epsilon = 0.2
+        trainer._prepare_advantages = lambda batch, device: torch.ones((1,), dtype=torch.float32, device=device)
+        trainer._episode_input_multimodal_inputs = lambda batch: {}
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        cached_ref = torch.full((1, 2), 0.25, dtype=torch.float32)
+        batch = {
+            "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "old_policy_token_log_probs": torch.zeros((1, 2), dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+            "reference_token_log_probs": cached_ref,
+        }
+        policy_logps = torch.zeros((1, 2), dtype=torch.float32, requires_grad=True)
+        response_mask = torch.ones((1, 2), dtype=torch.bool)
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_prepared_inputs",
+            side_effect=[(policy_logps, response_mask)],
+        ) as prepared_helper:
+            sample_losses = trainer._compute_sample_losses_for_batch(model=TinyModel(), batch=batch)
+        self.assertEqual(prepared_helper.call_count, 1)
+        delta = cached_ref - policy_logps.detach()
+        expected_kl = torch.exp(delta) - delta - 1.0
+        expected_per_token = -torch.minimum(torch.ones_like(delta), torch.ones_like(delta)) + trainer.kl_beta * expected_kl
+        expected_sample = expected_per_token.sum(dim=-1) / 2.0
+        self.assertTrue(torch.allclose(sample_losses.detach(), expected_sample, atol=1e-5))
+
+    def test_compute_loss_falls_back_to_inline_when_cache_missing(self) -> None:
+        trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
+        trainer.policy_temperature = None
+        trainer.kl_beta = 0.1
+        trainer.reference_model = object()
+        trainer.use_lora_reference_disable_adapter = False
+        trainer.ppo_clip_epsilon = 0.2
+        trainer._prepare_advantages = lambda batch, device: torch.ones((1,), dtype=torch.float32, device=device)
+        trainer._episode_input_multimodal_inputs = lambda batch: {}
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        batch = {
+            "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "old_policy_token_log_probs": torch.zeros((1, 2), dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        }
+        policy_logps = torch.zeros((1, 2), dtype=torch.float32, requires_grad=True)
+        reference_logps = torch.full((1, 2), 0.25, dtype=torch.float32)
+        response_mask = torch.ones((1, 2), dtype=torch.bool)
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_prepared_inputs",
+            side_effect=[(policy_logps, response_mask), (reference_logps, response_mask)],
+        ) as prepared_helper:
+            sample_losses = trainer._compute_sample_losses_for_batch(model=TinyModel(), batch=batch)
+        self.assertEqual(prepared_helper.call_count, 2)
+        delta = reference_logps - policy_logps.detach()
+        expected_kl = torch.exp(delta) - delta - 1.0
+        expected_per_token = -torch.minimum(torch.ones_like(delta), torch.ones_like(delta)) + trainer.kl_beta * expected_kl
+        expected_sample = expected_per_token.sum(dim=-1) / 2.0
+        self.assertTrue(torch.allclose(sample_losses.detach(), expected_sample, atol=1e-5))
+
+    def test_microbatch_slicing_preserves_reference_cache(self) -> None:
+        trainer = self._make_trainer(compute_loss_microbatch_size=2)
+        episode = self._make_episode(sample_count=4, completion_tokens=3, sample_loss_multiplier=1.0)
+        episode["reference_token_log_probs"] = torch.arange(12, dtype=torch.float32).view(4, 3) * 0.1
+        microbatches = trainer._iter_loss_microbatches(episode)
+        self.assertEqual(len(microbatches), 2)
+        self.assertEqual(tuple(microbatches[0]["reference_token_log_probs"].shape), (2, 3))
+        self.assertEqual(tuple(microbatches[1]["reference_token_log_probs"].shape), (2, 3))
+        self.assertTrue(
+            torch.allclose(
+                microbatches[0]["reference_token_log_probs"],
+                episode["reference_token_log_probs"][0:2],
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                microbatches[1]["reference_token_log_probs"],
+                episode["reference_token_log_probs"][2:4],
+            )
+        )
+
+    def test_prefetch_noop_when_kl_beta_zero(self) -> None:
+        trainer = self._make_trainer(kl_beta=0.0, reference_model=mock.Mock())
+        episode = self._make_episode(sample_count=2, completion_tokens=3, sample_loss_multiplier=1.0)
+        trainer._compute_reference_token_log_probs_for_batch = mock.Mock()
+        trainer._prefetch_reference_log_probs(
+            wrapped_model=None,
+            episode_inputs=[episode],
+        )
+        trainer._compute_reference_token_log_probs_for_batch.assert_not_called()
+        self.assertNotIn("reference_token_log_probs", episode)
+
+    def test_prefetch_noop_when_flag_off(self) -> None:
+        # Flag off: caller (_prepare_inputs) is expected to skip _prefetch_reference_log_probs.
+        # This test asserts that when the flag is False, a manually-simulated skip leaves
+        # no cache on the episode and the inline reference forward path still runs.
+        trainer = self._make_trainer(
+            kl_beta=0.1,
+            reference_model=mock.Mock(),
+            rl_enable_reference_prefetch_cache=False,
+        )
+        episode = self._make_episode(sample_count=1, completion_tokens=2, sample_loss_multiplier=1.0)
+        # Simulate the _prepare_inputs skip guarded by the feature flag:
+        if trainer.rl_enable_reference_prefetch_cache:
+            trainer._prefetch_reference_log_probs(
+                wrapped_model=None,
+                episode_inputs=[episode],
+            )
+        self.assertNotIn("reference_token_log_probs", episode)
+
+        trainer.reference_model = object()
+        trainer.use_lora_reference_disable_adapter = False
+        trainer.ppo_clip_epsilon = 0.2
+        trainer._prepare_advantages = lambda batch, device: torch.ones((1,), dtype=torch.float32, device=device)
+        trainer._episode_input_multimodal_inputs = lambda batch: {}
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        batch = {
+            "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "old_policy_token_log_probs": torch.zeros((1, 2), dtype=torch.float32),
+            "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        }
+        policy_logps = torch.zeros((1, 2), dtype=torch.float32, requires_grad=True)
+        reference_logps = torch.full((1, 2), 0.25, dtype=torch.float32)
+        response_mask = torch.ones((1, 2), dtype=torch.bool)
+        with mock.patch.object(
+            aligned_grpo_module,
+            "compute_completion_only_token_log_probs_from_prepared_inputs",
+            side_effect=[(policy_logps, response_mask), (reference_logps, response_mask)],
+        ) as prepared_helper:
+            trainer._compute_sample_losses_for_batch(model=TinyModel(), batch=batch)
+        self.assertEqual(prepared_helper.call_count, 2)

@@ -720,6 +720,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         self.rollout_use_generation_cache = bool(config["rollout_use_generation_cache"])
         self.fecv_use_generation_cache = bool(config["fecv_use_generation_cache"])
         self.compute_loss_microbatch_size = max(1, int(config["compute_loss_microbatch_size"]))
+        self.rl_enable_reference_prefetch_cache = bool(config.get("rl_enable_reference_prefetch_cache", True))
         self.use_liger_loss = bool(config.get("use_liger_loss", False))
         self.use_liger_loss_requested = bool(self.use_liger_loss)
         self.use_liger_loss_effective = False
@@ -1515,6 +1516,106 @@ class TimesearchAlignedGRPOTrainerMixin:
             sample_count=sample_count,
         )
         return bool(torch.any(effective_weight > 0))
+
+    def _zero_reference_token_log_probs_for_episode(
+        self,
+        episode_input: Dict[str, Any],
+    ) -> torch.Tensor:
+        completion_ids = episode_input.get("completion_ids")
+        if not isinstance(completion_ids, torch.Tensor):
+            return torch.zeros((0, 0), dtype=torch.float32, device=torch.device("cpu"))
+        if completion_ids.ndim == 1:
+            return torch.zeros(
+                (1, int(completion_ids.shape[0])),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+        return torch.zeros(
+            tuple(int(dim) for dim in completion_ids.shape),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+    def _compute_reference_token_log_probs_for_batch(
+        self,
+        reference_model: Any,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        prepared_microbatch = self._prepare_device_microbatch_for_completion_only(batch)
+        with torch.inference_mode():
+            reference_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
+                model=reference_model,
+                model_inputs=prepared_microbatch["model_inputs"],
+                completion_ids=prepared_microbatch["completion_ids"],
+                completion_mask=prepared_microbatch["completion_mask"],
+                logits_to_keep=int(prepared_microbatch["logits_to_keep"]),
+                temperature=self.policy_temperature,
+                log_runtime_details=False,
+            )
+        return reference_token_log_probs.detach().to(dtype=torch.float32).cpu()
+
+    def _iter_reference_prefetch_batches(
+        self,
+        episode_input: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        sample_count = int(self._episode_input_sample_count(episode_input))
+        prefetch_batch_size = max(int(self.compute_loss_microbatch_size), 2)
+        if sample_count <= prefetch_batch_size:
+            return [episode_input]
+        if not all(
+            (not isinstance(value, torch.Tensor))
+            or value.ndim == 0
+            or int(value.shape[0]) == int(sample_count)
+            for value in episode_input.values()
+        ):
+            return [episode_input]
+        return [
+            self._slice_episode_input_sample_range(
+                episode_input,
+                start_index=start_index,
+                end_index=min(sample_count, start_index + prefetch_batch_size),
+            )
+            for start_index in range(0, sample_count, prefetch_batch_size)
+        ]
+
+    def _prefetch_reference_log_probs(
+        self,
+        wrapped_model: Any,
+        episode_inputs: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        del wrapped_model
+        episodes = list(episode_inputs or [])
+        if float(self.kl_beta) == 0.0:
+            return episodes
+        if self.reference_model is None:
+            return episodes
+        try:
+            target_device = next(self.reference_model.parameters()).device
+        except StopIteration:
+            target_device = torch.device("cpu")
+        for episode_input in episodes:
+            if not self._has_trainable_weight(episode_input):
+                episode_input["reference_token_log_probs"] = (
+                    self._zero_reference_token_log_probs_for_episode(episode_input)
+                )
+                continue
+            sub_batches = self._iter_reference_prefetch_batches(episode_input)
+            pieces: List[torch.Tensor] = []
+            for sub_batch in sub_batches:
+                device_sub_batch = self._move_episode_input_to_device(sub_batch, device=target_device)
+                pieces.append(
+                    self._compute_reference_token_log_probs_for_batch(
+                        self.reference_model,
+                        device_sub_batch,
+                    )
+                )
+            if pieces:
+                episode_input["reference_token_log_probs"] = torch.cat(pieces, dim=0)
+            else:
+                episode_input["reference_token_log_probs"] = (
+                    self._zero_reference_token_log_probs_for_episode(episode_input)
+                )
+        return episodes
 
     def _group_items_by_signature(
         self,
@@ -2849,7 +2950,26 @@ class TimesearchAlignedGRPOTrainerMixin:
         per_token_loss = -torch.minimum(per_token_loss_1, per_token_loss_2)
         if self.kl_beta > 0.0:
             reference_token_log_probs = None
-            if self.reference_model is not None:
+            cached_reference_token_log_probs = batch.get("reference_token_log_probs")
+            if isinstance(cached_reference_token_log_probs, torch.Tensor):
+                reference_token_log_probs = cached_reference_token_log_probs.to(
+                    device=policy_token_log_probs.device,
+                    dtype=torch.float32,
+                )
+                if reference_token_log_probs.ndim == 1:
+                    reference_token_log_probs = reference_token_log_probs.view(1, -1)
+                if tuple(reference_token_log_probs.shape) != tuple(policy_token_log_probs.shape):
+                    raise ValueError(
+                        "reference_token_log_probs must align with policy_token_log_probs shape: "
+                        f"{tuple(reference_token_log_probs.shape)} vs {tuple(policy_token_log_probs.shape)}"
+                    )
+                _training_phase_runtime_log(
+                    "rl compute_loss reference kl cached_hit: "
+                    f"samples={sample_count} "
+                    f"completion_tokens={int(batch['completion_ids'].shape[-1])} "
+                    f"elapsed_sec=0.000 source=prefetch"
+                )
+            elif self.reference_model is not None:
                 reference_forward_start = time.perf_counter()
                 _training_phase_runtime_log(
                     "rl compute_loss reference kl forward start: "
@@ -3152,6 +3272,21 @@ class TimesearchAlignedGRPOTrainerMixin:
                     runtime=distributed_runtime_from_env(),
                     main_process_only=True,
                 )
+                if self.rl_enable_reference_prefetch_cache:
+                    prefetch_start = time.perf_counter()
+                    _training_phase_runtime_log(
+                        "rl prepare_inputs stage: before prefetch_reference_log_probs "
+                        f"episode_inputs={len(active_episode_inputs)}"
+                    )
+                    active_episode_inputs = self._prefetch_reference_log_probs(
+                        wrapped_model,
+                        active_episode_inputs,
+                    )
+                    _training_phase_runtime_log(
+                        "rl prepare_inputs stage: after prefetch_reference_log_probs "
+                        f"episode_inputs={len(active_episode_inputs)} "
+                        f"elapsed_sec={time.perf_counter() - prefetch_start:.3f}"
+                    )
             episode_inputs = active_episode_inputs + inactive_episode_inputs
             runtime_stats["raw_local_episode_input_count"] = int(len(episode_inputs))
             runtime_log(
