@@ -234,89 +234,6 @@ def _truncate_error_message(message: Any, *, max_chars: int = 240) -> str:
     return text[: max(0, int(max_chars) - 3)].rstrip() + "..."
 
 
-_DEFAULT_SAMPLE_PARTITION_MULTIPLIERS: Dict[str, float] = {
-    "anomaly": 1.0,
-    "hard_normal": 1.0,
-    "easy_normal": 1.0,
-    "unknown": 1.0,
-}
-
-
-def _normalize_target_existence(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in {"anomaly", "normal"} else ""
-
-
-def _rollout_target_existence(rollout: Dict[str, Any]) -> str:
-    for key in ("scoring_target", "structured_target", "target", "reference_target"):
-        payload = rollout.get(key)
-        if isinstance(payload, dict):
-            normalized = _normalize_target_existence(payload.get("existence"))
-            if normalized:
-                return normalized
-    item = rollout.get("item")
-    if isinstance(item, dict):
-        for key in ("structured_target", "target"):
-            payload = item.get(key)
-            if isinstance(payload, dict):
-                normalized = _normalize_target_existence(payload.get("existence"))
-                if normalized:
-                    return normalized
-        label = item.get("label")
-        if isinstance(label, dict) and "is_anomaly" in label:
-            return "anomaly" if bool(label.get("is_anomaly")) else "normal"
-    label = rollout.get("label")
-    if isinstance(label, dict) and "is_anomaly" in label:
-        return "anomaly" if bool(label.get("is_anomaly")) else "normal"
-    return ""
-
-
-def _normalize_sample_partition_multipliers(raw_value: Any) -> Dict[str, float]:
-    normalized = dict(_DEFAULT_SAMPLE_PARTITION_MULTIPLIERS)
-    if not isinstance(raw_value, dict):
-        return normalized
-    for key, value in raw_value.items():
-        partition = str(key or "").strip().lower()
-        if partition not in normalized:
-            continue
-        try:
-            normalized[partition] = max(0.0, float(value))
-        except Exception:
-            continue
-    return normalized
-
-
-def _resolve_sample_partition(rollout: Dict[str, Any]) -> str:
-    target_existence = _rollout_target_existence(rollout)
-    if target_existence == "anomaly":
-        return "anomaly"
-    if target_existence == "normal":
-        reward_summary = dict(rollout.get("reward_summary") or {})
-        normal_case_type = str(
-            reward_summary.get("fecv_normal_case_type") or reward_summary.get("normal_case_type") or ""
-        ).strip().lower()
-        if normal_case_type == "easy_normal":
-            return "easy_normal"
-        return "hard_normal"
-    return "unknown"
-
-
-def _resolve_sample_partition_multiplier(
-    *,
-    sample_partition: str,
-    reward_summary: Dict[str, Any],
-    sample_partition_multipliers: Optional[Dict[str, float]] = None,
-) -> float:
-    normalized_partition = str(sample_partition or "unknown").strip().lower() or "unknown"
-    multipliers = _DEFAULT_SAMPLE_PARTITION_MULTIPLIERS
-    if isinstance(sample_partition_multipliers, dict):
-        multipliers = {**multipliers, **sample_partition_multipliers}
-    multiplier = float(multipliers.get(normalized_partition, 1.0) or 1.0)
-    if normalized_partition == "easy_normal":
-        multiplier *= float(reward_summary.get("fecv_easy_normal_sample_loss_multiplier") or 1.0)
-    return max(0.0, float(multiplier))
-
-
 def _degrade_reward_summary_for_fecv_failure(
     reward_summary: Dict[str, Any],
     *,
@@ -831,8 +748,6 @@ def _build_rl_authority_checkpoint_callback(
                                 processor=self.processor,
                                 max_new_tokens=int(self.rollout_eval_config.policy_max_new_tokens),
                                 max_total_images=int(self.rollout_eval_config.max_total_images),
-                                max_tool_message_frames=int(getattr(self.rollout_eval_config, "max_tool_message_frames", 0)),
-                                max_total_video_frames=int(getattr(self.rollout_eval_config, "max_total_video_frames", 0)),
                                 max_seq_length=int(self.rollout_eval_config.max_seq_length),
                                 keep_recent_tool_image_messages=int(
                                     self.rollout_eval_config.keep_recent_tool_image_messages
@@ -910,18 +825,14 @@ def _compute_group_relative_advantages(
     *,
     clip_value: Optional[float] = None,
     eps: float = 1e-6,
-    sample_partition_multipliers: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     rewards = [float(((rollout.get("reward_summary") or {}).get("total_reward")) or 0.0) for rollout in rollouts]
-    sample_partitions = [_resolve_sample_partition(rollout) for rollout in rollouts]
     mean_reward = sum(rewards) / float(len(rewards)) if rewards else 0.0
     variance = sum((reward - mean_reward) ** 2 for reward in rewards) / float(len(rewards)) if rewards else 0.0
     std_reward = math.sqrt(max(variance, 0.0))
     updated: List[Dict[str, Any]] = []
-    for rollout, reward, sample_partition in zip(rollouts, rewards, sample_partitions):
-        reward_summary = dict(rollout.get("reward_summary") or {})
+    for rollout, reward in zip(rollouts, rewards):
         advantage = 0.0 if std_reward <= eps else (reward - mean_reward) / (std_reward + eps)
-        advantage_source = "zero_advantage" if std_reward <= eps else "group_relative"
         if clip_value is not None:
             advantage = max(-float(clip_value), min(float(clip_value), float(advantage)))
         enriched = copy.deepcopy(rollout)
@@ -929,18 +840,6 @@ def _compute_group_relative_advantages(
         enriched["group_reward_mean"] = float(mean_reward)
         enriched["group_reward_std"] = float(std_reward)
         enriched["group_advantage"] = round(float(advantage), 6)
-        enriched["advantage_source"] = str(advantage_source)
-        enriched["sample_partition"] = str(sample_partition)
-        enriched["sample_partition_multiplier"] = round(
-            float(
-                _resolve_sample_partition_multiplier(
-                    sample_partition=str(sample_partition),
-                    reward_summary=reward_summary,
-                    sample_partition_multipliers=sample_partition_multipliers,
-                )
-            ),
-            6,
-        )
         updated.append(enriched)
     return updated
 
@@ -960,8 +859,6 @@ def _log_rollout_reward_diagnostics(
         return
     reward_values = [round(float(((rollout.get("reward_summary") or {}).get("total_reward")) or 0.0), 6) for rollout in rollouts]
     advantage_values = [round(float(rollout.get("group_advantage", 0.0) or 0.0), 6) for rollout in rollouts]
-    advantage_sources = [str(rollout.get("advantage_source") or "") for rollout in rollouts]
-    sample_partitions = [str(rollout.get("sample_partition") or "") for rollout in rollouts]
     reward_mean = sum(reward_values) / float(len(reward_values))
     reward_variance = sum((value - reward_mean) ** 2 for value in reward_values) / float(len(reward_values))
     reward_std = math.sqrt(max(reward_variance, 0.0))
@@ -981,9 +878,7 @@ def _log_rollout_reward_diagnostics(
         f"reward_mean={float(reward_mean):.6f} "
         f"reward_std={float(reward_std):.6f} "
         f"reward_values={[f'{value:.6f}' for value in reward_values]} "
-        f"advantages={[f'{value:.6f}' for value in advantage_values]} "
-        f"advantage_sources={advantage_sources} "
-        f"sample_partitions={sample_partitions}",
+        f"advantages={[f'{value:.6f}' for value in advantage_values]}",
         runtime=distributed_runtime_from_env(),
         main_process_only=False,
     )
@@ -1021,12 +916,6 @@ def _log_rollout_reward_diagnostics(
                 "fecv_specificity_reward": round(float(components.get("fecv_specificity_reward") or 0.0), 6),
                 "fecv_branch_profile": str(reward_summary.get("fecv_branch_profile") or ""),
                 "fecv_profile_source": str(reward_summary.get("fecv_profile_source") or ""),
-                "advantage_source": str(rollout.get("advantage_source") or ""),
-                "sample_partition": str(rollout.get("sample_partition") or ""),
-                "sample_partition_multiplier": round(
-                    float(rollout.get("sample_partition_multiplier") or 1.0),
-                    6,
-                ),
                 "fecv_full_selected_available": bool(reward_summary.get("fecv_full_selected_available")),
                 "fecv_normal_case_type": str(reward_summary.get("fecv_normal_case_type") or ""),
                 "fecv_easy_normal_sample_loss_multiplier": round(
@@ -1037,11 +926,6 @@ def _log_rollout_reward_diagnostics(
                     float(reward_summary.get("fecv_selected_support_score") or 0.0),
                     6,
                 ),
-                "sample_partition_type": str(rollout.get("sample_partition_type") or ""),
-                "advantage_source": str(rollout.get("advantage_source") or "group_relative"),
-                "fallback_partition": str(rollout.get("fallback_partition") or ""),
-                "fallback_baseline_mean": round(float(rollout.get("fallback_baseline_mean") or 0.0), 6),
-                "fallback_baseline_std": round(float(rollout.get("fallback_baseline_std") or 0.0), 6),
                 "fecv_trigger_necessity_delta": round(
                     float(reward_summary.get("fecv_trigger_necessity_delta") or 0.0),
                     6,
@@ -1076,24 +960,8 @@ def _log_rollout_reward_diagnostics(
                     float(reward_summary.get("fecv_normal_continuous_verifier_score_after_action") or 0.0),
                     6,
                 ),
-                "fecv_normal_verifier_trace_score": round(
-                    float(reward_summary.get("fecv_normal_verifier_trace_score") or 0.0),
-                    6,
-                ),
-                "fecv_normal_selected_duration_ratio": round(
-                    float(reward_summary.get("fecv_normal_selected_duration_ratio") or 0.0),
-                    6,
-                ),
                 "fecv_normal_grounded_local_score": round(
                     float(reward_summary.get("fecv_normal_grounded_local_score") or 0.0),
-                    6,
-                ),
-                "fecv_verifier_trace_score": round(
-                    float(reward_summary.get("fecv_verifier_trace_score") or 0.0),
-                    6,
-                ),
-                "fecv_stage_coverage_score": round(
-                    float(reward_summary.get("fecv_stage_coverage_score") or 0.0),
                     6,
                 ),
                 "fecv_normal_provenance_score": round(
@@ -1159,8 +1027,6 @@ class _NativeGRPOTrainerMixin:
         self.max_image_side = int(config["max_image_side"])
         self.max_image_pixels = int(config["max_image_pixels"])
         self.max_total_images = int(config["max_total_images"])
-        self.max_tool_message_frames = int(config.get("max_tool_message_frames", 0))
-        self.max_total_video_frames = int(config.get("max_total_video_frames", 0))
         self.keep_recent_tool_image_messages = int(config["keep_recent_tool_image_messages"])
         self.keep_recent_text_messages = int(config["keep_recent_text_messages"])
         self.max_seq_length = int(config["max_seq_length"])
@@ -1189,9 +1055,6 @@ class _NativeGRPOTrainerMixin:
         self.reward_config = dict(config["reward_config"] or {})
         self.reward_config.setdefault("reward_version", self.reward_version)
         self.reward_judge = build_open_ended_reward_judge(reward_config=self.reward_config)
-        self._sample_partition_multipliers = _normalize_sample_partition_multipliers(
-            self.reward_config.get("sample_partition_multipliers")
-        )
         self._native_visual_tensor_dtype = (
             torch.bfloat16
             if bool(config.get("bf16"))
@@ -1212,13 +1075,6 @@ class _NativeGRPOTrainerMixin:
         self._groups_filtered_by_min_weight = 0
         self._fecv_failure_count = 0
         self._fecv_degraded_rollout_count = 0
-        self._advantage_source_counts: Dict[str, int] = {}
-        self._sample_partition_counts: Dict[str, int] = {}
-        self._advantage_partition_decay = 0.90
-        self._advantage_partition_min_history = 8
-        self._reward_partition_baselines: Dict[str, Dict[str, float]] = {
-            "__global__": {"count": 0.0, "mean": 0.0, "sq_mean": 0.0},
-        }
         self._native_rl_skip_next_optimizer_step = False
         self._native_rl_last_skip_reason = ""
         self.replay_buffer = get_replay_buffer(
@@ -1245,115 +1101,6 @@ class _NativeGRPOTrainerMixin:
             self.reference_model.eval()
             for parameter in self.reference_model.parameters():
                 parameter.requires_grad_(False)
-
-    def _classify_rollout_partition(self, rollout: Dict[str, Any]) -> str:
-        return _resolve_sample_partition(rollout)
-
-    def _partition_loss_multiplier(
-        self,
-        partition: str,
-        *,
-        reward_summary: Dict[str, Any],
-    ) -> float:
-        return _resolve_sample_partition_multiplier(
-            sample_partition=str(partition),
-            reward_summary=reward_summary,
-            sample_partition_multipliers=getattr(self, "_sample_partition_multipliers", None),
-        )
-
-    def _reward_baseline_stats(self, partition: str) -> Tuple[float, float, int]:
-        state = dict(self._reward_partition_baselines.get(partition) or {})
-        count = int(state.get("count") or 0)
-        if count <= 0:
-            return 0.0, 0.0, 0
-        mean = float(state.get("mean") or 0.0)
-        sq_mean = float(state.get("sq_mean") or (mean * mean))
-        variance = max(sq_mean - (mean * mean), 0.0)
-        return mean, math.sqrt(variance), count
-
-    def _update_reward_partition_baseline(self, partition: str, reward: float) -> None:
-        decay = float(self._advantage_partition_decay)
-        for key in ("__global__", str(partition or "__global__")):
-            state = self._reward_partition_baselines.setdefault(
-                key,
-                {"count": 0.0, "mean": 0.0, "sq_mean": 0.0},
-            )
-            count = int(state.get("count") or 0)
-            reward_f = float(reward)
-            if count <= 0:
-                mean = reward_f
-                sq_mean = reward_f * reward_f
-            else:
-                mean = decay * float(state.get("mean") or 0.0) + (1.0 - decay) * reward_f
-                sq_mean = decay * float(state.get("sq_mean") or 0.0) + (1.0 - decay) * (reward_f * reward_f)
-            state["count"] = float(count + 1)
-            state["mean"] = float(mean)
-            state["sq_mean"] = float(sq_mean)
-
-    def _apply_zero_variance_advantage_fallback(
-        self,
-        rollouts: Sequence[Dict[str, Any]],
-        *,
-        eps: float = 1e-6,
-    ) -> List[Dict[str, Any]]:
-        updated: List[Dict[str, Any]] = []
-        if not rollouts:
-            return updated
-        group_std = float((rollouts[0] or {}).get("group_reward_std") or 0.0)
-        for rollout in rollouts:
-            enriched = copy.deepcopy(rollout)
-            reward_summary = dict(enriched.get("reward_summary") or {})
-            partition = str(enriched.get("sample_partition") or self._classify_rollout_partition(enriched))
-            reward = float(reward_summary.get("total_reward") or 0.0)
-            advantage = float(enriched.get("group_advantage") or 0.0)
-            advantage_source = str(enriched.get("advantage_source") or "group_relative")
-            fallback_partition = ""
-            fallback_mean = 0.0
-            fallback_std = 0.0
-            if group_std <= float(eps):
-                if partition == "easy_normal":
-                    advantage = 0.0
-                    advantage_source = "zero_easy_normal"
-                else:
-                    baseline_partition = partition
-                    baseline_mean, baseline_std, baseline_count = self._reward_baseline_stats(partition)
-                    if baseline_count < int(self._advantage_partition_min_history):
-                        baseline_partition = "__global__"
-                        baseline_mean, baseline_std, baseline_count = self._reward_baseline_stats("__global__")
-                    if baseline_count <= 0:
-                        baseline_mean = 0.0
-                        baseline_std = 1.0
-                        advantage = float(reward)
-                        advantage_source = "ema_fallback"
-                        fallback_partition = baseline_partition
-                        fallback_mean = float(baseline_mean)
-                        fallback_std = float(baseline_std)
-                    else:
-                        denom = max(float(baseline_std), 0.05)
-                        advantage = (float(reward) - float(baseline_mean)) / float(denom)
-                        if abs(float(advantage)) <= float(eps):
-                            advantage = 0.0
-                            advantage_source = "ema_fallback"
-                        else:
-                            if self.advantage_clip is not None:
-                                advantage = max(-float(self.advantage_clip), min(float(self.advantage_clip), float(advantage)))
-                            advantage_source = "ema_fallback"
-                            fallback_partition = baseline_partition
-                            fallback_mean = float(baseline_mean)
-                            fallback_std = float(baseline_std)
-            enriched["group_advantage"] = round(float(advantage), 6)
-            enriched["sample_partition"] = str(partition)
-            enriched["sample_partition_type"] = str(partition)
-            enriched["advantage_source"] = str(advantage_source)
-            enriched["fallback_partition"] = str(fallback_partition)
-            enriched["fallback_baseline_mean"] = round(float(fallback_mean), 6)
-            enriched["fallback_baseline_std"] = round(float(fallback_std), 6)
-            updated.append(enriched)
-        for enriched in updated:
-            partition = str(enriched.get("sample_partition_type") or "__global__")
-            reward = float(((enriched.get("reward_summary") or {}).get("total_reward")) or 0.0)
-            self._update_reward_partition_baseline(partition, reward)
-        return updated
 
     def _prepare_for_training(self, max_steps, train_dataloader, resume_from_checkpoint):
         model, train_dataloader = super()._prepare_for_training(
@@ -1547,18 +1294,6 @@ class _NativeGRPOTrainerMixin:
         for rollout in scored_rollouts:
             if bool(rollout.get("fecv_failed")):
                 runtime_stats["local_fecv_failure_count"] += 1
-            sample_partition = str(
-                rollout.get("sample_partition")
-                or rollout.get("sample_partition_type")
-                or self._classify_rollout_partition(rollout)
-            )
-            advantage_source = str(rollout.get("advantage_source") or "group_relative")
-            sample_partition_counts = getattr(self, "_sample_partition_counts", None)
-            if isinstance(sample_partition_counts, dict):
-                sample_partition_counts[sample_partition] = int(sample_partition_counts.get(sample_partition, 0)) + 1
-            advantage_source_counts = getattr(self, "_advantage_source_counts", None)
-            if isinstance(advantage_source_counts, dict):
-                advantage_source_counts[advantage_source] = int(advantage_source_counts.get(advantage_source, 0)) + 1
             reward_summary = dict(rollout.get("reward_summary") or {})
             components = dict(reward_summary.get("components") or {})
             rollout_metrics["reward_total"].append(_safe_float(reward_summary.get("total_reward")))
@@ -1707,8 +1442,6 @@ class _NativeGRPOTrainerMixin:
             processor=self.processor,
             max_new_tokens=self.policy_max_new_tokens,
             max_total_images=self.max_total_images,
-            max_tool_message_frames=self.max_tool_message_frames,
-            max_total_video_frames=self.max_total_video_frames,
             max_seq_length=self.max_seq_length,
             keep_recent_tool_image_messages=self.keep_recent_tool_image_messages,
             keep_recent_text_messages=self.keep_recent_text_messages,
@@ -1837,12 +1570,10 @@ class _NativeGRPOTrainerMixin:
                         stage="score",
                     )
             rollouts.append(rollout)
-        rollouts = _compute_group_relative_advantages(
+        return _compute_group_relative_advantages(
             rollouts,
             clip_value=self.advantage_clip,
-            sample_partition_multipliers=getattr(self, "_sample_partition_multipliers", None),
         )
-        return self._apply_zero_variance_advantage_fallback(rollouts)
 
     def _build_episode_spec(
         self,
@@ -1855,8 +1586,6 @@ class _NativeGRPOTrainerMixin:
             max_image_pixels=self.max_image_pixels,
             keep_recent_tool_image_messages=self.keep_recent_tool_image_messages,
             max_total_images=self.max_total_images,
-            max_tool_message_frames=self.max_tool_message_frames,
-            max_total_video_frames=self.max_total_video_frames,
             max_seq_length=self.max_seq_length,
             keep_recent_text_messages=self.keep_recent_text_messages,
         )
@@ -1888,19 +1617,12 @@ class _NativeGRPOTrainerMixin:
             )
         feature = dict(message_feature)
         reward_summary = dict(rollout.get("reward_summary") or {})
-        partition = str(
-            rollout.get("sample_partition")
-            or rollout.get("sample_partition_type")
-            or self._classify_rollout_partition(rollout)
+        easy_normal_sample_loss_multiplier = float(
+            reward_summary.get("fecv_easy_normal_sample_loss_multiplier") or 1.0
         )
-        partition_loss_multiplier = self._partition_loss_multiplier(
-            partition,
-            reward_summary=reward_summary,
-        )
-        effective_loss_multiplier = float(partition_loss_multiplier)
         feature["sample_weight"] = float(rollout_advantage)
         feature["advantage"] = float(rollout_advantage)
-        feature["sample_loss_multiplier"] = float(effective_loss_multiplier)
+        feature["sample_loss_multiplier"] = float(easy_normal_sample_loss_multiplier)
         result = self._build_episode_spec(feature)
         self._budgeting_stats.record(result)
         if result.batch is None:
@@ -1909,10 +1631,8 @@ class _NativeGRPOTrainerMixin:
                 f"video_id={str(rollout.get('video_id') or '') or 'unknown'} "
                 f"generation_id={int(rollout.get('generation_id', -1) or -1)} "
                 f"group_advantage={float(rollout_advantage):.6f} "
-                f"sample_partition_type={partition} "
-                f"advantage_source={str(rollout.get('advantage_source') or 'group_relative')} "
                 f"normal_case_type={str(reward_summary.get('fecv_normal_case_type') or '')} "
-                f"sample_loss_multiplier={float(effective_loss_multiplier):.6f} "
+                f"easy_normal_sample_loss_multiplier={float(easy_normal_sample_loss_multiplier):.6f} "
                 f"drop_reason={str(result.drop_reason or 'unknown')} "
                 f"completion_token_count={int(getattr(result, 'completion_token_count', 0) or 0)} "
                 f"has_messages={bool(isinstance(feature.get('messages'), list) and feature.get('messages'))} "
@@ -1928,10 +1648,6 @@ class _NativeGRPOTrainerMixin:
             "group_id": str(rollout.get("group_id") or rollout.get("video_id") or ""),
             "generation_id": int(rollout.get("generation_id", -1) or -1),
             "advantage": float(rollout_advantage),
-            "sample_partition": partition,
-            "sample_partition_type": partition,
-            "sample_partition_multiplier": float(effective_loss_multiplier),
-            "advantage_source": str(rollout.get("advantage_source") or "group_relative"),
             "reward_summary": copy.deepcopy(rollout.get("reward_summary") or {}),
             "fecv_failed": bool(rollout.get("fecv_failed")),
             "fecv_failure_message": str(rollout.get("fecv_failure_message") or ""),
@@ -2194,9 +1910,7 @@ class _NativeGRPOTrainerMixin:
 
     def _multimodal_inputs_signature(self, value: Any) -> Tuple[Any, ...]:
         if isinstance(value, torch.Tensor):
-            if value.ndim <= 0:
-                return ("tensor_scalar", str(value.dtype))
-            return ("tensor_cat_dim0", str(value.dtype), int(value.ndim), tuple(value.shape[1:]))
+            return ("tensor", str(value.dtype), tuple(value.shape))
         if isinstance(value, dict):
             return (
                 "dict",
@@ -2718,10 +2432,6 @@ class _NativeGRPOTrainerMixin:
                 "rl_compute_loss_microbatch_size_effective": int(self.compute_loss_microbatch_size),
             }
         )
-        for key, value in sorted(dict(getattr(self, "_advantage_source_counts", {})).items()):
-            metrics[f"rl_advantage_source_{str(key)}"] = int(value)
-        for key, value in sorted(dict(getattr(self, "_sample_partition_counts", {})).items()):
-            metrics[f"rl_sample_partition_{str(key)}"] = int(value)
         return metrics
 
     def get_budgeting_stats(self) -> BudgetingStats:
@@ -2923,8 +2633,6 @@ def create_native_grpo_trainer(
     max_image_side: int,
     max_image_pixels: int,
     max_total_images: int,
-    max_tool_message_frames: int = 0,
-    max_total_video_frames: int = 0,
     keep_recent_tool_image_messages: int = 0,
     keep_recent_text_messages: int = 0,
     max_seq_length: int = 0,
@@ -3024,8 +2732,6 @@ def create_native_grpo_trainer(
         "max_image_side": int(max_image_side),
         "max_image_pixels": int(max_image_pixels),
         "max_total_images": int(max_total_images),
-        "max_tool_message_frames": int(max_tool_message_frames),
-        "max_total_video_frames": int(max_total_video_frames),
         "keep_recent_tool_image_messages": int(keep_recent_tool_image_messages),
         "keep_recent_text_messages": int(keep_recent_text_messages),
         "max_seq_length": int(max_seq_length),
@@ -3346,8 +3052,6 @@ def run_trainer_native_grpo(
             max_image_side=args.max_image_side,
             max_image_pixels=args.max_image_pixels,
             max_total_images=args.max_total_images,
-            max_tool_message_frames=int(getattr(args, "max_tool_message_frames", 0) or 0),
-            max_total_video_frames=int(getattr(args, "max_total_video_frames", 0) or 0),
             keep_recent_tool_image_messages=args.keep_recent_tool_image_messages,
             keep_recent_text_messages=args.keep_recent_text_messages,
             max_seq_length=args.max_seq_length,

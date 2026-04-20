@@ -164,6 +164,15 @@ def _summarize_microbatch_layout_for_rank_debug(episode_inputs: Sequence[Dict[st
     return rows
 
 
+def _summarize_episode_input_bucket_for_rank_debug(episode_inputs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = [_summarize_episode_input_for_rank_debug(episode_input) for episode_input in list(episode_inputs or [])]
+    return {
+        "items": int(len(rows)),
+        "samples": int(sum(int(row.get("samples") or 0) for row in rows)),
+        "rows": rows,
+    }
+
+
 def _rollout_group_sample_count(rollout_group: Dict[str, Any]) -> int:
     sample_count = 0
     for episode_input in list(rollout_group.get("episode_inputs") or []):
@@ -583,6 +592,80 @@ def _log_rollout_reward_components(
         runtime=distributed_runtime_from_env(),
         main_process_only=True,
     )
+
+
+def _log_rollout_sample_reward_details(
+    *,
+    video_id: str,
+    rollouts: Sequence[Dict[str, Any]],
+) -> None:
+    def _generation_id(rollout: Dict[str, Any]) -> int:
+        value = rollout.get("generation_id")
+        return -1 if value is None else int(value)
+
+    for rollout in list(rollouts or []):
+        reward_summary = dict(rollout.get("reward_summary") or {})
+        components = dict(reward_summary.get("components") or {})
+        weighted_components = dict(reward_summary.get("weighted_components") or {})
+        turns = [dict(turn) for turn in list(rollout.get("turns") or []) if isinstance(turn, dict)]
+        invalid_attempts = [dict(turn) for turn in list(rollout.get("invalid_attempts") or []) if isinstance(turn, dict)]
+        state = dict(rollout.get("state") or {})
+        final_answer = rollout.get("final_answer")
+        if not isinstance(final_answer, dict):
+            final_answer = state.get("finalized_case")
+        tool_sequence = [
+            str(turn.get("tool_name") or turn.get("action") or "assistant")
+            for turn in turns
+        ]
+        runtime_log(
+            "rl sample reward debug: "
+            f"video_id={video_id} "
+            f"generation_id={_generation_id(rollout)} "
+            f"total_reward={float(reward_summary.get('total_reward') or 0.0):.6f} "
+            f"group_advantage={float(rollout.get('group_advantage') or 0.0):.6f} "
+            f"below_min_weight={bool(rollout.get('below_min_weight'))} "
+            f"turn_count={len(turns)} "
+            f"invalid_attempt_count={len(invalid_attempts)} "
+            f"terminated_reason={str(rollout.get('terminated_reason') or '')} "
+            f"tool_sequence={tool_sequence} "
+            f"final_answer={final_answer if isinstance(final_answer, dict) else None} "
+            f"accuracy_reward={float(components.get('accuracy_reward') or 0.0):.6f} "
+            f"weighted_accuracy_reward={float(weighted_components.get('accuracy_reward') or 0.0):.6f} "
+            f"fecv_evidence_faithfulness_reward={float(components.get('fecv_evidence_faithfulness_reward') or 0.0):.6f} "
+            f"weighted_fecv_evidence_faithfulness_reward={float(weighted_components.get('fecv_evidence_faithfulness_reward') or 0.0):.6f} "
+            f"protocol_finalize_reward={float(components.get('protocol_finalize_reward') or 0.0):.6f} "
+            f"weighted_protocol_finalize_reward={float(weighted_components.get('protocol_finalize_reward') or 0.0):.6f} "
+            f"fecv_decision_sufficiency_reward={float(components.get('fecv_decision_sufficiency_reward') or 0.0):.6f} "
+            f"fecv_specificity_reward={float(components.get('fecv_specificity_reward') or 0.0):.6f} "
+            f"fecv_branch_profile={str(reward_summary.get('fecv_branch_profile') or '')} "
+            f"fecv_profile_source={str(reward_summary.get('fecv_profile_source') or '')} "
+            f"fecv_full_selected_available={bool(reward_summary.get('fecv_full_selected_available'))} "
+            f"fecv_full_selected_parse_mode={str(reward_summary.get('fecv_full_selected_parse_mode') or '')} "
+            f"fecv_full_selected_unavailable_reason={str(reward_summary.get('fecv_full_selected_unavailable_reason') or '')} "
+            f"fecv_selection_resolution_source={str(reward_summary.get('fecv_selection_resolution_source') or '')} "
+            f"fecv_recovered_from_trace={bool(reward_summary.get('fecv_recovered_from_trace'))} "
+            f"fecv_selected_window_count={int(reward_summary.get('fecv_selected_window_count') or 0)} "
+            f"fecv_selected_record_count={int(reward_summary.get('fecv_selected_record_count') or 0)} "
+            f"fecv_selected_window_ids={list(reward_summary.get('fecv_selected_window_ids') or [])} "
+            f"fecv_full_selected_window_ids={list(reward_summary.get('fecv_full_selected_window_ids') or [])} "
+            f"fecv_selected_by_stage={dict(reward_summary.get('fecv_selected_by_stage') or {})} "
+            f"fecv_hard_negative_reason={str(reward_summary.get('fecv_hard_negative_reason') or '')} "
+            f"fecv_selected_support_score={float(reward_summary.get('fecv_selected_support_score') or 0.0):.6f} "
+            f"fecv_trigger_necessity_delta={float(reward_summary.get('fecv_trigger_necessity_delta') or 0.0):.6f} "
+            f"fecv_negative_resistance_delta={float(reward_summary.get('fecv_negative_resistance_delta') or 0.0):.6f} "
+            f"fecv_normal_reward_mode={str(reward_summary.get('fecv_normal_reward_mode') or '')} "
+            f"fecv_normal_evidence_tool_turn_count={int(reward_summary.get('fecv_normal_evidence_tool_turn_count') or 0)} "
+            f"fecv_normal_search_restraint_score={float(reward_summary.get('fecv_normal_search_restraint_score') or 0.0):.6f} "
+            f"fecv_normal_window_restraint_score={float(reward_summary.get('fecv_normal_window_restraint_score') or 0.0):.6f} "
+            f"fecv_normal_verification_consistency_score={float(reward_summary.get('fecv_normal_verification_consistency_score') or 0.0):.6f} "
+            f"fecv_normal_query_alignment_score={float(reward_summary.get('fecv_normal_query_alignment_score') or 0.0):.6f} "
+            f"fecv_normal_restraint_reward={float(reward_summary.get('fecv_normal_restraint_reward') or 0.0):.6f} "
+            f"latest_verifier_turn_present={bool(reward_summary.get('latest_verifier_turn_present'))} "
+            f"verifier_source={str(reward_summary.get('verifier_source') or '')} "
+            f"uses_reference_conditioned_verifier={bool(reward_summary.get('uses_reference_conditioned_verifier'))}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
 
 
 def _log_rollout_trajectory_signatures(
@@ -1070,7 +1153,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         item_list = [dict(item) for item in list(items or [])]
         if not item_list:
             return []
-        fecv_branch_profile = "structured_oracle_v1"
+        fecv_branch_profile = "online_core"
         rollout_policy = self._build_rollout_policy(model)
         runtime_log(
             "rl rollout policy debug: "
@@ -1082,7 +1165,7 @@ class TimesearchAlignedGRPOTrainerMixin:
             runtime=distributed_runtime_from_env(),
             main_process_only=True,
         )
-        verification_policy = None if fecv_branch_profile == "structured_oracle_v1" else self._build_fecv_policy(model)
+        verification_policy = self._build_fecv_policy(model)
         rollout_items: List[Dict[str, Any]] = []
         rollout_meta: List[Tuple[int, int]] = []
         for item_index, item in enumerate(item_list):
@@ -1194,6 +1277,10 @@ class TimesearchAlignedGRPOTrainerMixin:
                 rollouts=advantaged_rollouts,
             )
             _log_rollout_reward_components(
+                video_id=str(item.get("video_id") or ""),
+                rollouts=advantaged_rollouts,
+            )
+            _log_rollout_sample_reward_details(
                 video_id=str(item.get("video_id") or ""),
                 rollouts=advantaged_rollouts,
             )
@@ -1558,25 +1645,10 @@ class TimesearchAlignedGRPOTrainerMixin:
         self,
         episode_input: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        sample_count = int(self._episode_input_sample_count(episode_input))
-        prefetch_batch_size = max(int(self.compute_loss_microbatch_size), 2)
-        if sample_count <= prefetch_batch_size:
-            return [episode_input]
-        if not all(
-            (not isinstance(value, torch.Tensor))
-            or value.ndim == 0
-            or int(value.shape[0]) == int(sample_count)
-            for value in episode_input.values()
-        ):
-            return [episode_input]
-        return [
-            self._slice_episode_input_sample_range(
-                episode_input,
-                start_index=start_index,
-                end_index=min(sample_count, start_index + prefetch_batch_size),
-            )
-            for start_index in range(0, sample_count, prefetch_batch_size)
-        ]
+        # Keep reference prefetch aligned with the active loss path: score each
+        # merged episode batch in one forward instead of reintroducing tiny
+        # multimodal microbatches during cache population.
+        return [episode_input]
 
     def _prefetch_reference_log_probs(
         self,
@@ -1593,12 +1665,30 @@ class TimesearchAlignedGRPOTrainerMixin:
             target_device = next(self.reference_model.parameters()).device
         except StopIteration:
             target_device = torch.device("cpu")
+        grouped_bucket_count = int(len(episodes))
+        runtime_log(
+            "rl reference prefetch start: "
+            f"episode_inputs={len(episodes)} "
+            f"target_device={target_device} "
+            f"grouped_buckets={grouped_bucket_count}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
         for episode_input in episodes:
             if not self._has_trainable_weight(episode_input):
                 episode_input["reference_token_log_probs"] = (
                     self._zero_reference_token_log_probs_for_episode(episode_input)
                 )
                 continue
+            bucket_summary = _summarize_episode_input_bucket_for_rank_debug([episode_input])
+            bucket_start = time.perf_counter()
+            runtime_log(
+                "rl reference prefetch bucket start: "
+                f"samples={bucket_summary['samples']} "
+                f"rows={bucket_summary['rows']}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=True,
+            )
             sub_batches = self._iter_reference_prefetch_batches(episode_input)
             pieces: List[torch.Tensor] = []
             for sub_batch in sub_batches:
@@ -1615,6 +1705,13 @@ class TimesearchAlignedGRPOTrainerMixin:
                 episode_input["reference_token_log_probs"] = (
                     self._zero_reference_token_log_probs_for_episode(episode_input)
                 )
+            runtime_log(
+                "rl reference prefetch bucket end: "
+                f"samples={bucket_summary['samples']} "
+                f"elapsed_sec={time.perf_counter() - bucket_start:.3f}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=True,
+            )
         return episodes
 
     def _group_items_by_signature(
@@ -1928,7 +2025,28 @@ class TimesearchAlignedGRPOTrainerMixin:
             pending_entries,
             signature_fn=lambda item: self._episode_input_merge_signature(item["episode_input"]),
         )
+        runtime_log(
+            "rl old_policy cache start: "
+            f"episode_inputs={len(pending_entries)} "
+            f"grouped_buckets={len(grouped_episode_inputs)} "
+            f"target_device={target_device}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
         for bucket in grouped_episode_inputs:
+            bucket_summary = _summarize_episode_input_bucket_for_rank_debug(
+                [dict(entry.get("episode_input") or {}) for entry in bucket]
+            )
+            bucket_start = time.perf_counter()
+            merge_mode = "single"
+            runtime_log(
+                "rl old_policy cache bucket start: "
+                f"items={bucket_summary['items']} "
+                f"samples={bucket_summary['samples']} "
+                f"rows={bucket_summary['rows']}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=True,
+            )
             device_episode_inputs = [
                 self._move_episode_input_to_device(entry["episode_input"], device=target_device)
                 for entry in bucket
@@ -1941,14 +2059,25 @@ class TimesearchAlignedGRPOTrainerMixin:
             else:
                 try:
                     merged_episode_input = self._merge_episode_inputs(device_episode_inputs)
+                    merge_mode = "merged"
                 except ValueError as exc:
                     if not self._is_merge_fallback_error(exc):
                         raise
+                    merge_mode = "fallback_per_episode"
                     for entry, episode_input in zip(bucket, device_episode_inputs):
                         entry["old_policy_token_log_probs"] = self._compute_old_policy_token_log_probs_for_episode_input(
                             model,
                             episode_input=episode_input,
                         )
+                    runtime_log(
+                        "rl old_policy cache bucket end: "
+                        f"items={bucket_summary['items']} "
+                        f"samples={bucket_summary['samples']} "
+                        f"merge_mode={merge_mode} "
+                        f"elapsed_sec={time.perf_counter() - bucket_start:.3f}",
+                        runtime=distributed_runtime_from_env(),
+                        main_process_only=True,
+                    )
                     continue
                 batched_log_probs = self._compute_old_policy_token_log_probs_for_episode_input(
                     model,
@@ -1959,6 +2088,15 @@ class TimesearchAlignedGRPOTrainerMixin:
                 entry["old_policy_token_log_probs"] = (
                     batched_log_probs[row_index : row_index + 1, :completion_length].clone()
                 )
+            runtime_log(
+                "rl old_policy cache bucket end: "
+                f"items={bucket_summary['items']} "
+                f"samples={bucket_summary['samples']} "
+                f"merge_mode={merge_mode} "
+                f"elapsed_sec={time.perf_counter() - bucket_start:.3f}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=True,
+            )
         populated: List[Dict[str, Any]] = []
         for entry in pending_entries:
             episode_input = dict(entry["episode_input"] or {})
@@ -2322,6 +2460,123 @@ class TimesearchAlignedGRPOTrainerMixin:
             video_ids=[str(item.get("video_id") or "") for item in generation_items]
         )
 
+    def _resolve_episode_input_replay_config(self) -> Dict[str, Any]:
+        config = getattr(self, "aligned_grpo_config", None)
+
+        def _resolve(name: str, default: Any) -> Any:
+            value = getattr(self, name, None)
+            if value is not None:
+                return value
+            if config is not None:
+                if isinstance(config, dict) and name in config:
+                    return config.get(name, default)
+                config_value = getattr(config, name, None)
+                if config_value is not None:
+                    return config_value
+            args = getattr(self, "args", None)
+            if args is not None:
+                args_value = getattr(args, name, None)
+                if args_value is not None:
+                    return args_value
+            return default
+
+        return {
+            "enabled": bool(_resolve("replay_buffer_enable", False)),
+            "type": str(_resolve("replay_buffer_type", "ssr") or "ssr").strip().lower(),
+            "capacity": max(0, int(_resolve("replay_buffer_capacity", 2) or 0)),
+            "alpha": float(_resolve("replay_buffer_alpha", 1.0) or 1.0),
+        }
+
+    def _ensure_episode_input_replay_state(self) -> Dict[str, Any]:
+        state = getattr(self, "_episode_input_replay_state", None)
+        if isinstance(state, dict):
+            return state
+        state = {
+            "buffer": [],
+            "serial": 0,
+        }
+        self._episode_input_replay_state = state
+        return state
+
+    def _clone_episode_input_batch_for_replay(
+        self,
+        episode_inputs: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        return [
+            self._episode_input_cpu_copy(episode_input)
+            for episode_input in episode_inputs
+        ]
+
+    def _record_materialized_episode_inputs_for_replay(
+        self,
+        episode_inputs: Sequence[Dict[str, Any]],
+    ) -> None:
+        replay_config = self._resolve_episode_input_replay_config()
+        if not replay_config["enabled"] or replay_config["capacity"] <= 0:
+            return
+        trainable_samples = int(self._count_local_trainable_samples(list(episode_inputs)))
+        if trainable_samples <= 0:
+            return
+        state = self._ensure_episode_input_replay_state()
+        state["serial"] = int(state.get("serial", 0)) + 1
+        buffer_entries = list(state.get("buffer") or [])
+        buffer_entries.append(
+            {
+                "episode_inputs": self._clone_episode_input_batch_for_replay(episode_inputs),
+                "trainable_samples": trainable_samples,
+                "serial": int(state["serial"]),
+            }
+        )
+        capacity = int(replay_config["capacity"])
+        if len(buffer_entries) > capacity:
+            buffer_entries = buffer_entries[-capacity:]
+        state["buffer"] = buffer_entries
+
+    def _sample_materialized_episode_inputs_from_replay(self) -> Optional[List[Dict[str, Any]]]:
+        replay_config = self._resolve_episode_input_replay_config()
+        if not replay_config["enabled"] or replay_config["capacity"] <= 0:
+            return None
+        state = self._ensure_episode_input_replay_state()
+        buffer_entries = list(state.get("buffer") or [])
+        if not buffer_entries:
+            return None
+        replay_type = str(replay_config["type"] or "ssr").strip().lower()
+        if replay_type == "dapo":
+            alpha = float(replay_config["alpha"])
+            selected_entry = max(
+                buffer_entries,
+                key=lambda entry: (
+                    float(max(1, int(entry.get("trainable_samples", 0)))) ** alpha,
+                    int(entry.get("serial", 0)),
+                ),
+            )
+        else:
+            selected_entry = buffer_entries[-1]
+        return self._clone_episode_input_batch_for_replay(
+            list(selected_entry.get("episode_inputs") or [])
+        )
+
+    def _maybe_fill_empty_episode_inputs_from_replay(
+        self,
+        inputs: Dict[str, Any],
+        runtime_stats: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        episode_inputs = list(inputs.get("episode_inputs") or [])
+        if episode_inputs and int(self._count_local_trainable_samples(episode_inputs)) > 0:
+            return episode_inputs
+        runtime_stats["replay_fill_attempts"] = int(runtime_stats.get("replay_fill_attempts", 0)) + 1
+        replay_episode_inputs = self._sample_materialized_episode_inputs_from_replay()
+        if not replay_episode_inputs:
+            runtime_stats["replay_fill_misses"] = int(runtime_stats.get("replay_fill_misses", 0)) + 1
+            return []
+        runtime_stats["replay_fill_hits"] = int(runtime_stats.get("replay_fill_hits", 0)) + 1
+        runtime_stats["replay_fill_samples"] = int(
+            runtime_stats.get("replay_fill_samples", 0)
+        ) + int(self._count_local_trainable_samples(replay_episode_inputs))
+        inputs["episode_inputs"] = replay_episode_inputs
+        inputs["runtime_stats"] = runtime_stats
+        return replay_episode_inputs
+
     def _materialize_episode_inputs(
         self,
         episode_inputs: Sequence[Dict[str, Any]],
@@ -2349,6 +2604,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                     raise
                 self._materialize_fallback_batches += 1
                 merged_batches.extend(bucket)
+        self._record_materialized_episode_inputs_for_replay(merged_batches)
         return merged_batches
 
     def _slice_episode_input_sample_range(
@@ -2396,25 +2652,10 @@ class TimesearchAlignedGRPOTrainerMixin:
         self,
         episode_input: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        sample_count = self._episode_input_sample_count(episode_input)
-        microbatch_size = max(1, int(self.compute_loss_microbatch_size))
-        if sample_count <= microbatch_size:
-            return [episode_input]
-        if not all(
-            (not isinstance(value, torch.Tensor))
-            or value.ndim == 0
-            or int(value.shape[0]) == int(sample_count)
-            for value in episode_input.values()
-        ):
-            return [episode_input]
-        return [
-            self._slice_episode_input_sample_range(
-                episode_input,
-                start_index=start_index,
-                end_index=min(sample_count, start_index + microbatch_size),
-            )
-            for start_index in range(0, sample_count, microbatch_size)
-        ]
+        # Active RL now runs each merged episode batch in a single completion-only
+        # forward to avoid the heavy latency penalty from repeated multimodal
+        # microbatch slicing.
+        return [episode_input]
 
     def _align_episode_inputs_across_ranks(
         self,
@@ -2494,6 +2735,13 @@ class TimesearchAlignedGRPOTrainerMixin:
         global_trainable_samples = int(_distributed_sum_int(local_trainable_samples, device=target_device))
         if global_trainable_samples > 0:
             return None
+        replay_episode_inputs = self._maybe_fill_empty_episode_inputs_from_replay(inputs, runtime_stats)
+        if replay_episode_inputs:
+            episode_inputs = list(replay_episode_inputs)
+            local_trainable_samples = int(self._count_local_trainable_samples(episode_inputs))
+            global_trainable_samples = int(_distributed_sum_int(local_trainable_samples, device=target_device))
+            if global_trainable_samples > 0:
+                return None
         reason = "all_empty_episode_inputs" if not episode_inputs else "all_empty_trainable_samples"
         self._maybe_log_empty_batch_rank_summary(
             reason=reason,
@@ -2690,6 +2938,8 @@ class TimesearchAlignedGRPOTrainerMixin:
             target_device = next(model.parameters()).device
         except StopIteration:
             target_device = torch.device("cpu")
+        if not episode_inputs:
+            episode_inputs = self._maybe_fill_empty_episode_inputs_from_replay(inputs, runtime_stats)
         if not episode_inputs:
             self._maybe_log_empty_batch_rank_summary(
                 reason="all_empty_episode_inputs",
@@ -2949,8 +3199,8 @@ class TimesearchAlignedGRPOTrainerMixin:
         per_token_loss_2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.minimum(per_token_loss_1, per_token_loss_2)
         if self.kl_beta > 0.0:
-            reference_token_log_probs = None
             cached_reference_token_log_probs = batch.get("reference_token_log_probs")
+            reference_token_log_probs = None
             if isinstance(cached_reference_token_log_probs, torch.Tensor):
                 reference_token_log_probs = cached_reference_token_log_probs.to(
                     device=policy_token_log_probs.device,
@@ -3272,7 +3522,7 @@ class TimesearchAlignedGRPOTrainerMixin:
                     runtime=distributed_runtime_from_env(),
                     main_process_only=True,
                 )
-                if self.rl_enable_reference_prefetch_cache:
+                if bool(getattr(self, "rl_enable_reference_prefetch_cache", True)):
                     prefetch_start = time.perf_counter()
                     _training_phase_runtime_log(
                         "rl prepare_inputs stage: before prefetch_reference_log_probs "

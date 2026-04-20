@@ -4,7 +4,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from split_utils import parse_include_splits
 
@@ -29,11 +29,11 @@ from saver_v3.model.qwen_policy import DEFAULT_MODEL_PATH, QwenGenerationPolicy
 
 
 REMOVED_ACTIVE_RL_FLAGS: Dict[str, str] = {
-    "--rl-replay-buffer-enable": "replay buffer was removed because active RL now uses trajectory-level batches only.",
-    "--rl-replay-buffer-type": "replay buffer was removed because active RL now uses trajectory-level batches only.",
-    "--rl-replay-buffer-capacity": "replay buffer was removed because active RL now uses trajectory-level batches only.",
-    "--rl-replay-buffer-alpha": "replay buffer was removed because active RL now uses trajectory-level batches only.",
-    "--rl-all-empty-policy": "legacy empty-batch policy was removed because active RL now always uses donor no-op padding on trajectory-level batches.",
+    "--rl-replay-buffer-enable": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "--rl-replay-buffer-type": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "--rl-replay-buffer-capacity": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "--rl-replay-buffer-alpha": "replay buffer was removed because active RL now only supports pure-pack episode_inputs.",
+    "--rl-all-empty-policy": "legacy empty-batch policy was removed because active RL now always uses donor no-op padding on pure-pack episode_inputs.",
 }
 
 
@@ -71,13 +71,13 @@ def fail_on_removed_active_rl_flags(argv: List[str]) -> None:
             if text == flag or text.startswith(f"{flag}="):
                 raise SystemExit(
                     f"{flag} has been removed from active RL; {reason} "
-                    "Migrate to saver_v3.cli.train_rl_ds with the current trajectory-level GRPO route."
+                    "Migrate to saver_v3.cli.train_rl_ds with the current pure-pack GRPO route."
                 )
 
 
 def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
-    parser.set_defaults(_eval_max_total_images_explicit=False, inline_rollout_eval=False, final_rollout_eval=False)
+    parser.set_defaults(_eval_max_total_images_explicit=False, inline_rollout_eval=False)
     parser.add_argument("--data", default="", help="Path to SAVER agent/oracle JSONL data.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data.")
@@ -109,30 +109,6 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
         dest="inline_rollout_eval",
         action="store_false",
         help="Defer RL epoch-end rollout eval to the external recovery path. This is the default behavior.",
-    )
-    parser.add_argument(
-        "--final-rollout-eval",
-        dest="final_rollout_eval",
-        action="store_true",
-        help="After all RL iterations complete, save a terminal checkpoint and run rollout eval once.",
-    )
-    parser.add_argument(
-        "--no-final-rollout-eval",
-        dest="final_rollout_eval",
-        action="store_false",
-        help="Disable the terminal-checkpoint rollout eval triggered at on_train_end.",
-    )
-    parser.add_argument(
-        "--rollout-eval-start-iteration",
-        type=int,
-        default=1,
-        help="1-based iteration index at which inline RL rollout eval/checkpointing first becomes active.",
-    )
-    parser.add_argument(
-        "--rollout-eval-interval-iterations",
-        type=int,
-        default=1,
-        help="Iteration interval for inline RL rollout eval/checkpointing after the start iteration. Use 1 for every iteration.",
     )
     parser.add_argument(
         "--rl-reward-version",
@@ -171,11 +147,9 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--policy-max-new-tokens", type=int, default=DEFAULT_POLICY_MAX_NEW_TOKENS, help="Policy generation length.")
     parser.add_argument("--rl-rollout-use-cache", type=_parse_bool_flag, default=True, help="Enable KV cache during RL rollout generation.")
     parser.add_argument("--rl-fecv-use-cache", type=_parse_bool_flag, default=True, help="Enable KV cache during RL online FECV replay.")
-    parser.add_argument("--max-tool-message-frames", type=int, default=0, help="Maximum image/video frames retained within a single tool message after budgeting.")
-    parser.add_argument("--max-total-video-frames", type=int, default=0, help="Maximum total image/video frames retained across the final model input after budgeting.")
-    parser.add_argument("--rl-compute-loss-microbatch-size", type=int, default=2, help="Deprecated compatibility knob. Active trajectory-level GRPO no longer slices prepared batches into loss microbatches.")
+    parser.add_argument("--rl-compute-loss-microbatch-size", type=int, default=2, help="Deprecated compatibility knob. Active GRPO now computes each merged episode batch in one completion-only forward without loss microbatch slicing.")
     parser.add_argument("--rl-steps-per-generation", type=int, default=1, help="Reuse one rollout generation batch across this many trainer steps.")
-    parser.add_argument("--use-liger-loss", type=_parse_bool_flag, default=False, help="Enable Liger fused GRPO loss on the active trajectory-level path. Disabled by default in idea2_v3 because the current Qwen3-VL RL stack is incompatible/unstable with Liger.")
+    parser.add_argument("--use-liger-loss", type=_parse_bool_flag, default=False, help="Enable Liger fused GRPO loss on the active pure-pack path. Disabled by default in idea2_v3 because the current Qwen3-VL RL stack is incompatible/unstable with Liger.")
     parser.add_argument("--rollout-stage-batch-size", type=int, default=16, help="Chunk size for rollout stage processing.")
     parser.add_argument("--fecv-stage-batch-size", type=int, default=16, help="Chunk size for FECV stage processing.")
     parser.add_argument("--rl-fecv-failure-policy", choices=["degrade", "drop", "fail"], default="degrade", help="How active RL handles online FECV failures.")
@@ -275,53 +249,6 @@ def parse_active_rl_args(argv: Optional[List[str]], *, description: str) -> argp
     return args
 
 
-def _normalize_target_existence_label(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in {"anomaly", "normal"} else ""
-
-
-def _record_target_existence_label(record: Any) -> str:
-    if not isinstance(record, dict):
-        return ""
-    for key in ("structured_target", "target", "reference_target"):
-        payload = record.get(key)
-        if isinstance(payload, dict):
-            normalized = _normalize_target_existence_label(payload.get("existence"))
-            if normalized:
-                return normalized
-    label = record.get("label")
-    if isinstance(label, dict) and "is_anomaly" in label:
-        return "anomaly" if bool(label.get("is_anomaly")) else "normal"
-    return ""
-
-
-def _select_cycle_indices(
-    indices: Sequence[int],
-    *,
-    total_needed: int,
-    absolute_offset: int,
-    seed: int,
-) -> List[int]:
-    ordered_indices = [int(index) for index in list(indices or [])]
-    if not ordered_indices or int(total_needed) <= 0:
-        return []
-    selected: List[int] = []
-    current_cycle = int(absolute_offset // len(ordered_indices))
-    offset_in_cycle = int(absolute_offset % len(ordered_indices))
-    remaining = int(total_needed)
-    while remaining > 0:
-        current_order = list(ordered_indices)
-        rng = random.Random(int(seed) + int(current_cycle))
-        rng.shuffle(current_order)
-        cycle_slice = current_order[offset_in_cycle:]
-        take = min(remaining, len(cycle_slice))
-        selected.extend(cycle_slice[:take])
-        remaining -= take
-        current_cycle += 1
-        offset_in_cycle = 0
-    return selected
-
-
 def select_iteration_indices(
     dataset_size: int,
     rollout_count: int,
@@ -329,59 +256,25 @@ def select_iteration_indices(
     iteration: int,
     *,
     seed: int = 42,
-    records: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[int]:
     if dataset_size <= 0:
         return []
     total_needed = max(0, int(rollout_count))
     absolute_offset = max(0, int(start_index)) + max(0, int(iteration)) * total_needed
-    if records is not None and int(len(records)) == int(dataset_size):
-        anomaly_indices: List[int] = []
-        normal_indices: List[int] = []
-        for index, record in enumerate(records):
-            label = _record_target_existence_label(record)
-            if label == "anomaly":
-                anomaly_indices.append(int(index))
-            elif label == "normal":
-                normal_indices.append(int(index))
-        if anomaly_indices and normal_indices:
-            positions = list(range(int(absolute_offset), int(absolute_offset) + int(total_needed)))
-            anomaly_needed = sum(1 for position in positions if int(position) % 2 == 0)
-            normal_needed = int(total_needed) - int(anomaly_needed)
-            anomaly_offset = (int(absolute_offset) + 1) // 2
-            normal_offset = int(absolute_offset) // 2
-            anomaly_selected = _select_cycle_indices(
-                anomaly_indices,
-                total_needed=int(anomaly_needed),
-                absolute_offset=int(anomaly_offset),
-                seed=int(seed) + 1009,
-            )
-            normal_selected = _select_cycle_indices(
-                normal_indices,
-                total_needed=int(normal_needed),
-                absolute_offset=int(normal_offset),
-                seed=int(seed) + 2003,
-            )
-            selected: List[int] = []
-            anomaly_cursor = 0
-            normal_cursor = 0
-            for position in positions:
-                if int(position) % 2 == 0:
-                    selected.append(int(anomaly_selected[anomaly_cursor]))
-                    anomaly_cursor += 1
-                else:
-                    selected.append(int(normal_selected[normal_cursor]))
-                    normal_cursor += 1
-            return selected
     selected: List[int] = []
-    selected.extend(
-        _select_cycle_indices(
-            list(range(int(dataset_size))),
-            total_needed=int(total_needed),
-            absolute_offset=int(absolute_offset),
-            seed=int(seed),
-        )
-    )
+    current_cycle = int(absolute_offset // int(dataset_size))
+    offset_in_cycle = int(absolute_offset % int(dataset_size))
+    remaining = total_needed
+    while remaining > 0:
+        order = list(range(int(dataset_size)))
+        rng = random.Random(int(seed) + int(current_cycle))
+        rng.shuffle(order)
+        current_order = order[offset_in_cycle:]
+        take = min(remaining, len(current_order))
+        selected.extend(current_order[:take])
+        remaining -= take
+        current_cycle += 1
+        offset_in_cycle = 0
     return selected
 
 
@@ -463,12 +356,9 @@ def build_rollout_eval_config(
         include_splits=parse_include_splits(args.eval_include_splits),
         max_records=args.eval_max_records,
         inline_rollout_eval=bool(args.inline_rollout_eval),
-        final_rollout_eval=bool(getattr(args, "final_rollout_eval", False)),
         rollout_max_turns=args.eval_rollout_max_turns,
         policy_max_new_tokens=args.eval_max_new_tokens_per_turn,
         max_total_images=_resolve_eval_max_total_images(args),
-        max_tool_message_frames=int(getattr(args, "max_tool_message_frames", 0) or 0),
-        max_total_video_frames=int(getattr(args, "max_total_video_frames", 0) or 0),
         max_seq_length=int(args.max_seq_length),
         keep_recent_tool_image_messages=int(args.keep_recent_tool_image_messages),
         keep_recent_text_messages=int(args.keep_recent_text_messages),
@@ -497,8 +387,6 @@ def build_policy(model_path: str | Path, args: argparse.Namespace, *, runtime: A
         attn_implementation=args.attn_implementation or None,
         max_new_tokens=args.policy_max_new_tokens,
         max_total_images=args.max_total_images,
-        max_tool_message_frames=int(getattr(args, "max_tool_message_frames", 0) or 0),
-        max_total_video_frames=int(getattr(args, "max_total_video_frames", 0) or 0),
         max_seq_length=args.max_seq_length,
         keep_recent_tool_image_messages=args.keep_recent_tool_image_messages,
         keep_recent_text_messages=args.keep_recent_text_messages,

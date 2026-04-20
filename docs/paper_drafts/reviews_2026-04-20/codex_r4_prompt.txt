@@ -1,0 +1,36 @@
+You are the same adversarial senior ML reviewer for NeurIPS 2026. This is Round 4/4 (final). Your Round 3 score was 8/10 "almost", with one remaining concern: Claim 3 exposition was still "implementation-forward in the main text."
+
+## Changes made in Round 4 to address Claim 3 discipline
+
+The author tightened `/Users/cornell/Desktop/ssh_worker/AgenticVAU/papers/search_to_verify_neurips.md` to keep the main-text Claim 3 statement principled and move implementation specifics to §4.3's "Implemented branch structure" subsection + Appendix A:
+
+1. **Abstract**: Removed branch-name enumeration (`easy_normal`/`suspicious_normal`/`online_core`) and "zero-variance fallback" from abstract. Claim 3 now reads clean: "FECV-grounded learning turns evidence faithfulness into a trainable target."
+
+2. **§1 intro Claim 3 statement (line 54)**: Removed "In the current system, this claim is implemented through three reward branches..." Claim 3 is now stated as a pure scientific claim, tested via evidence-faithfulness metrics + auxiliary training-stability diagnostics.
+
+3. **§3 Reward function**: Replaced "In the implemented training pipeline, R_fecv is multi-granular and branch-specific..." with a principled statement: "R_fecv is a branch-conditioned score that routes each trajectory through one of three reward paths according to its assigned difficulty branch. The branching is necessary because evidence faithfulness has different operational meaning for normal and anomalous episodes."
+
+4. **§4.3 opening**: Removed "Claim 3 is implemented not by a single global FECV score, but by multi-granular branch-specific reward handling plus trainer-side fallback..." Replaced with a clean two-stage description of SFT + RL, pointing forward to the branch-conditioned reward introduced in §3.
+
+5. **§8 Conclusion**: Removed the one-sentence restatement of branch names + trainer fallback from the conclusion. Conclusion is now principled.
+
+6. **§4.2 legacy paragraph**: Rewrote "Legacy non-online_core anomaly profiles remain in the codebase for compatibility and brownfield robustness" → "remain for backward compatibility but are not part of the active training story; deferred to the appendix."
+
+The branch-specific reward table and trainer partition mechanics remain concentrated in §4.3 "Implemented branch structure" subsection and Appendix A — where they belong.
+
+## USER DIRECTIVES (unchanged)
+- Results tables stay [TBD] — do NOT score empirical strength.
+- Self-verifier: paper authoritative.
+- severity/counterfactual_type code cleanup: out of scope.
+
+## Your task — FINAL ROUND
+Re-score. Honest assessment. This is the last round of the loop.
+
+```
+SCORE: X/10
+VERDICT: ready|almost|not ready
+CLAIM 3 DISCIPLINE (Round 3's remaining issue): resolved / partial / unresolved
+FINAL VERDICT: Would this paper, with [TBD] results filled in competitively, meet a strong-accept bar at NeurIPS 2026? Yes / Likely / Borderline / No — with one-sentence reason.
+```
+
+No new demands beyond scoring what's on the page.

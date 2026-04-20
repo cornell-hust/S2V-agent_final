@@ -73,7 +73,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     vllm_args, remaining = vllm_parser.parse_known_args(raw_argv)
     base_args = cli_shared.parse_active_rl_args(
         remaining,
-        description="SAVER active RL entrypoint for the pure-pack TRL + colocated-vLLM GRPO route.",
+        description="SAVER active RL entrypoint for the trajectory-level TRL + colocated-vLLM GRPO route.",
     )
     merged = argparse.Namespace(**vars(base_args))
     for key, value in vars(vllm_args).items():
@@ -127,6 +127,9 @@ def _write_run_config(
             "resume_from_checkpoint": args.resume_from_checkpoint,
             "resume_rollout_eval_only": bool(args.resume_rollout_eval_only),
             "inline_rollout_eval": bool(args.inline_rollout_eval),
+            "rollout_eval_start_iteration": int(getattr(args, "rollout_eval_start_iteration", 1) or 1),
+            "rollout_eval_interval_iterations": int(getattr(args, "rollout_eval_interval_iterations", 1) or 1),
+            "final_rollout_eval": bool(getattr(args, "final_rollout_eval", False)),
             "model_path": args.model_path,
             "reference_model_mode": "per_iteration_trainer_init",
             "reference_model_source_path": args.model_path,
@@ -150,7 +153,7 @@ def _write_run_config(
             "use_liger_loss_requested": bool(getattr(args, "use_liger_loss", False)),
             "rollout_stage_batch_size": int(args.rollout_stage_batch_size),
             "fecv_stage_batch_size": int(args.fecv_stage_batch_size),
-            "episode_grpo_pure_pack": True,
+            "episode_grpo_trajectory_level": True,
             "rl_replay_buffer_supported": False,
             "rl_replay_buffer_mode": "disabled_episode_grpo",
             "rl_fecv_failure_policy": str(args.rl_fecv_failure_policy),

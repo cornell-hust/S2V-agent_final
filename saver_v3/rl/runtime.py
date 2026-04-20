@@ -185,6 +185,10 @@ class RLJobConfig:
     require_materialized_runtime_cache: bool = False
     reward_version: str = DEFAULT_RL_REWARD_VERSION
     reward_config: Dict[str, Any] = field(default_factory=dict)
+    inline_rollout_eval: bool = False
+    rollout_eval_start_iteration: int = 1
+    rollout_eval_interval_iterations: int = 1
+    final_rollout_eval: bool = False
     num_iterations: int = 1
     num_train_epochs: float = 1.0
     learning_rate: float = 5e-7
@@ -217,6 +221,9 @@ class RLJobConfig:
     keep_recent_text_messages: int = 20
     keep_recent_tool_image_messages: int = 3
     num_preview_frames: int = 8
+    max_tool_message_frames: int = 0
+    max_total_video_frames: int = 0
+    compute_loss_microbatch_size: int = 2
     proposal_model_path: str = ""
     proposal_torch_dtype: str = "auto"
     proposal_device: str = ""
@@ -323,6 +330,10 @@ class RLJobConfig:
             liger_deepspeed_switch_reason=str(liger_deepspeed_switch_reason or ""),
             reward_version=reward_version,
             reward_config=reward_config,
+            inline_rollout_eval=_resolve_bool(logging_cfg, "inline_rollout_eval", False),
+            rollout_eval_start_iteration=int(logging_cfg.get("rollout_eval_start_iteration", 1) or 1),
+            rollout_eval_interval_iterations=int(logging_cfg.get("rollout_eval_interval_iterations", 1) or 1),
+            final_rollout_eval=_resolve_bool(logging_cfg, "final_rollout_eval", False),
             num_iterations=int(optimization.get("num_iterations", optimization.get("num_updates", 1)) or 1),
             num_train_epochs=float(optimization.get("num_train_epochs", optimization.get("num_epochs", 1.0)) or 1.0),
             learning_rate=float(optimization.get("learning_rate", 5e-7) or 5e-7),
@@ -399,6 +410,15 @@ class RLJobConfig:
             keep_recent_text_messages=int(optimization.get("keep_recent_text_messages", 20) or 20),
             keep_recent_tool_image_messages=int(optimization.get("keep_recent_tool_image_messages", 3) or 3),
             num_preview_frames=int(optimization.get("num_preview_frames", 8) or 8),
+            max_tool_message_frames=int(optimization.get("max_tool_message_frames", 0) or 0),
+            max_total_video_frames=int(optimization.get("max_total_video_frames", 0) or 0),
+            compute_loss_microbatch_size=int(
+                optimization.get(
+                    "compute_loss_microbatch_size",
+                    optimization.get("rl_compute_loss_microbatch_size", 2),
+                )
+                or 2
+            ),
             proposal_model_path=str(proposal_cfg.get("model_path") or "").strip(),
             proposal_torch_dtype=str(proposal_cfg.get("torch_dtype") or "auto"),
             proposal_device=str(proposal_cfg.get("device") or "").strip(),
@@ -441,6 +461,8 @@ def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
         "--data", job.train_manifest,
         "--output-dir", job.output_dir,
         "--model-path", job.policy_init_from,
+        "--rollout-eval-start-iteration", str(job.rollout_eval_start_iteration),
+        "--rollout-eval-interval-iterations", str(job.rollout_eval_interval_iterations),
         "--num-iterations", str(job.num_iterations),
         "--rollout-count", str(job.rollout_count),
         "--num-generations", str(job.num_generations),
@@ -465,7 +487,10 @@ def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
         "--keep-recent-text-messages", str(job.keep_recent_text_messages),
         "--keep-recent-tool-image-messages", str(job.keep_recent_tool_image_messages),
         "--num-preview-frames", str(job.num_preview_frames),
+        "--max-tool-message-frames", str(job.max_tool_message_frames),
+        "--max-total-video-frames", str(job.max_total_video_frames),
         "--rl-reward-version", job.reward_version,
+        "--rl-compute-loss-microbatch-size", str(job.compute_loss_microbatch_size),
         "--rl-steps-per-generation", str(job.rl_steps_per_generation),
         "--rollout-stage-batch-size", str(job.rollout_stage_batch_size),
         "--fecv-stage-batch-size", str(job.fecv_stage_batch_size),
@@ -477,6 +502,8 @@ def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
     ]
     if job.gradient_checkpointing:
         argv.append("--gradient-checkpointing")
+    argv.append("--inline-rollout-eval" if job.inline_rollout_eval else "--defer-rollout-eval")
+    argv.append("--final-rollout-eval" if job.final_rollout_eval else "--no-final-rollout-eval")
     if job.bf16:
         argv.append("--bf16")
     if job.fp16:

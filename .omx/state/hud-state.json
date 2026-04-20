@@ -1,6 +1,6 @@
 {
-  "last_turn_at": "2026-04-17T19:13:05.825Z",
-  "turn_count": 17,
-  "last_progress_at": "2026-04-17T19:13:05.825Z",
-  "last_agent_output": "结论：不是。TimeSearch-R 没有把 `reference model` 手动移动到另一张独立 GPU 上；它把 reference model 留在 trainer 内部，交给 DeepSp"
+  "last_turn_at": "2026-04-19T08:09:06.786Z",
+  "turn_count": 23,
+  "last_progress_at": "2026-04-19T08:09:06.786Z",
+  "last_agent_output": "**结论**\n这次 `2026-04-19 15:34:04` 的 RL 失败点，不是“FECV 配置没开”，而是 active RL 里的 `online_core` FECV 在运行时基本没有形成"
 }

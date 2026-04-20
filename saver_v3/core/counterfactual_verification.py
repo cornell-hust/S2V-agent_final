@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from saver_v3.core.adapter import TimeSearchRolloutAdapter
 from saver_v3.core.categories import canonicalize_saver_category
+from saver_v3.core.environment import (
+    _json_brace_balance,
+    _repair_json_object_text,
+    cleanup_llm_response,
+    parse_actions_and_contents,
+)
 from saver_v3.core.proposal import compose_scene_anchored_query, normalize_description_query_phrases
 from saver_v3.core.protocol_guidance import summarize_evidence_ledger
 from saver_v3.core.semantic_answer import (
@@ -37,8 +45,35 @@ BRANCH_ORDER = (
     "drop_confirmation",
     "hard_negative_swap",
 )
-COUNTERFACTUAL_BRANCH_PROFILES = ("full", "offline_full", "online_core", "structured_oracle_v1")
+COUNTERFACTUAL_BRANCH_PROFILES = ("full", "offline_full", "online_core", "online_core")
 FINALIZE_READINESS_THRESHOLD = 0.75
+
+logger = logging.getLogger(__name__)
+
+
+class CounterfactualReplayProtocolError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        video_id: str,
+        generation_id: str,
+        branch_name: str,
+        reason: str,
+        parse_mode: str,
+        response_preview: str,
+    ) -> None:
+        self.video_id = str(video_id or "")
+        self.generation_id = str(generation_id or "")
+        self.branch_name = str(branch_name or "")
+        self.reason = str(reason or "")
+        self.parse_mode = str(parse_mode or "")
+        self.response_preview = str(response_preview or "")
+        super().__init__(
+            "Counterfactual replay protocol violation: "
+            f"video_id={self.video_id} generation_id={self.generation_id} "
+            f"branch_name={self.branch_name} reason={self.reason} "
+            f"parse_mode={self.parse_mode} response_preview={self.response_preview}"
+        )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -56,8 +91,6 @@ def _normalize_counterfactual_branch_profile(value: Any) -> str:
         return "offline_full"
     if normalized == "online_core":
         return "online_core"
-    if normalized == "structured_oracle_v1":
-        return "structured_oracle_v1"
     raise ValueError(
         f"Unsupported counterfactual branch profile: {value!r}. "
         f"Expected one of {COUNTERFACTUAL_BRANCH_PROFILES}."
@@ -77,21 +110,220 @@ def _dedupe_window_ids(values: Sequence[Any] | None) -> List[str]:
 
 
 def infer_counterfactual_window_ids(rollout: Dict[str, Any]) -> List[str]:
-    state = dict(rollout.get("state") or {})
-    active_window_ids = _dedupe_window_ids(state.get("active_evidence_window_ids") or [])
-    if active_window_ids:
-        return active_window_ids
+    verification_record = _latest_verification_record(rollout)
+    authoritative_window_ids = _selected_window_ids_from_verification_record(verification_record)
+    if authoritative_window_ids:
+        return authoritative_window_ids
+    verify_turn = _latest_verify_turn_with_windows(rollout)
+    return _selected_window_ids_from_verify_turn(verify_turn)
 
+
+def _latest_verify_turn_with_windows(rollout: Dict[str, Any]) -> Dict[str, Any]:
     for turn in reversed(list(rollout.get("turns") or [])):
         if str(turn.get("tool_name") or "") != "verify_hypothesis":
             continue
-        verified = _dedupe_window_ids(turn.get("verifier_verified_window_ids") or [])
-        if verified:
-            return verified
-        selected = _dedupe_window_ids(turn.get("self_verification_selected_window_ids") or [])
-        if selected:
-            return selected
+        return dict(turn)
+    return {}
+
+
+def _latest_verification_record(rollout: Dict[str, Any]) -> Dict[str, Any]:
+    state = dict(rollout.get("state") or {})
+    verification_records = list(state.get("verification_records") or [])
+    if not verification_records:
+        return {}
+    latest = verification_records[-1]
+    return dict(latest) if isinstance(latest, dict) else {}
+
+
+def _latest_evidence_anchor_selected_window_ids(rollout: Dict[str, Any]) -> List[str]:
+    for turn in reversed(list(rollout.get("turns") or [])):
+        tags = list(turn.get("counterfactual_anchor_tags") or [])
+        tool_name = str(turn.get("tool_name") or "").strip()
+        if "evidence_anchor" not in tags and tool_name not in {"verify_hypothesis", "finalize_case"}:
+            continue
+        selected_window_ids_after = _dedupe_window_ids(turn.get("selected_window_ids_after") or [])
+        if selected_window_ids_after:
+            return selected_window_ids_after
     return []
+
+
+def _selected_window_ids_from_verification_record(record: Dict[str, Any]) -> List[str]:
+    if not isinstance(record, dict):
+        return []
+    for key in (
+        "selected_window_ids",
+        "selected_window_ids_after",
+        "verifier_verified_window_ids",
+        "self_verification_selected_window_ids",
+        "window_ids",
+    ):
+        window_ids = _dedupe_window_ids(record.get(key) or [])
+        if window_ids:
+            return window_ids
+    return []
+
+
+def _selected_window_ids_from_verify_turn(turn: Dict[str, Any]) -> List[str]:
+    if not isinstance(turn, dict):
+        return []
+    for key in (
+        "verifier_verified_window_ids",
+        "self_verification_selected_window_ids",
+        "selected_window_ids_after",
+        "selected_window_ids",
+    ):
+        window_ids = _dedupe_window_ids(turn.get(key) or [])
+        if window_ids:
+            return window_ids
+    return []
+
+
+def resolve_selected_window_ids_for_fecv(rollout: Dict[str, Any]) -> Dict[str, Any]:
+    state = dict(rollout.get("state") or {})
+    verify_turn = _latest_verify_turn_with_windows(rollout)
+    verification_record = _latest_verification_record(rollout)
+    active_evidence_window_ids = _dedupe_window_ids(state.get("active_evidence_window_ids") or [])
+    evidence_anchor_window_ids = _latest_evidence_anchor_selected_window_ids(rollout)
+    verification_record_selected_window_ids = _selected_window_ids_from_verification_record(verification_record)
+    verification_record_verified_window_ids = _dedupe_window_ids(
+        verification_record.get("verified_window_ids") or []
+    )
+    verification_record_best_effort_window_ids = _dedupe_window_ids(
+        verification_record.get("best_effort_window_ids") or []
+    )
+    latest_verify_turn_selected_window_ids = _selected_window_ids_from_verify_turn(verify_turn)
+    verify_turn_verified_window_ids = _dedupe_window_ids(verify_turn.get("verifier_verified_window_ids") or [])
+    verify_turn_self_verification_selected_window_ids = _dedupe_window_ids(
+        verify_turn.get("self_verification_selected_window_ids") or []
+    )
+    authoritative_window_ids = (
+        verification_record_verified_window_ids
+        or verification_record_selected_window_ids
+        or latest_verify_turn_selected_window_ids
+        or verify_turn_verified_window_ids
+        or verify_turn_self_verification_selected_window_ids
+    )
+    source_conflict_detected = bool(
+        authoritative_window_ids
+        and (
+            (evidence_anchor_window_ids and evidence_anchor_window_ids != authoritative_window_ids)
+            or (active_evidence_window_ids and active_evidence_window_ids != authoritative_window_ids)
+        )
+    )
+
+    candidates: List[Tuple[str, List[str], bool]] = [
+        ("verification_record_verified_window_ids", verification_record_verified_window_ids, True),
+        ("verification_record_selected_window_ids", verification_record_selected_window_ids, True),
+        ("latest_verify_turn_selected_window_ids", latest_verify_turn_selected_window_ids, True),
+        ("verify_turn_verified_window_ids", verify_turn_verified_window_ids, False),
+        (
+            "verify_turn_self_verification_selected_window_ids",
+            verify_turn_self_verification_selected_window_ids,
+            False,
+        ),
+        ("verification_record_best_effort_window_ids", verification_record_best_effort_window_ids, True),
+        ("evidence_anchor_selected_window_ids_after", evidence_anchor_window_ids, True),
+        ("active_evidence_window_ids", active_evidence_window_ids, False),
+    ]
+    discarded_sources = {
+        source_name: {"window_ids": list(window_ids), "used": False}
+        for source_name, window_ids, _ in candidates
+    }
+    compatibility_discarded_sources = {
+        "verification_record": {
+            "window_ids": list(verification_record_selected_window_ids or verification_record_verified_window_ids),
+            "used": False,
+        },
+        "latest_verify_turn": {
+            "window_ids": list(
+                latest_verify_turn_selected_window_ids
+                or verify_turn_verified_window_ids
+                or verify_turn_self_verification_selected_window_ids
+            ),
+            "used": False,
+        },
+        "evidence_anchor": {"window_ids": list(evidence_anchor_window_ids), "used": False},
+        "active_evidence": {"window_ids": list(active_evidence_window_ids), "used": False},
+    }
+    for source_name, window_ids, recovered_from_trace in candidates:
+        if not window_ids:
+            continue
+        discarded_sources[source_name]["used"] = True
+        if source_name.startswith("verification_record_"):
+            compatibility_discarded_sources["verification_record"]["used"] = True
+        elif source_name.startswith("latest_verify_turn_") or source_name.startswith("verify_turn_"):
+            compatibility_discarded_sources["latest_verify_turn"]["used"] = True
+        elif source_name == "evidence_anchor_selected_window_ids_after":
+            compatibility_discarded_sources["evidence_anchor"]["used"] = True
+        elif source_name == "active_evidence_window_ids":
+            compatibility_discarded_sources["active_evidence"]["used"] = True
+        return {
+            "selected_window_ids": list(window_ids),
+            "window_ids": list(window_ids),
+            "selected_window_ids_effective": list(window_ids),
+            "source": str(source_name),
+            "selected_window_ids_source": str(source_name),
+            "selection_resolution_source": str(source_name),
+            "selection_unavailable_reason": "",
+            "available": True,
+            "source_conflict_detected": source_conflict_detected,
+            "discarded_sources": compatibility_discarded_sources,
+            "discarded_sources_detailed": discarded_sources,
+            "candidates": candidates,
+            "verify_turn": verify_turn,
+            "verification_record": verification_record,
+            "verification_record_selected_window_ids": verification_record_selected_window_ids,
+            "verification_record_verified_window_ids": verification_record_verified_window_ids,
+            "verification_record_best_effort_window_ids": verification_record_best_effort_window_ids,
+            "latest_verify_turn_selected_window_ids": latest_verify_turn_selected_window_ids,
+            "verify_turn_verified_window_ids": verify_turn_verified_window_ids,
+            "verify_turn_self_verification_selected_window_ids": verify_turn_self_verification_selected_window_ids,
+            "evidence_anchor_selected_window_ids": evidence_anchor_window_ids,
+            "active_evidence_window_ids": active_evidence_window_ids,
+            "recovered_from_trace": bool(recovered_from_trace),
+        }
+    return {
+        "selected_window_ids": [],
+        "window_ids": [],
+        "selected_window_ids_effective": [],
+        "source": "recovery_failed",
+        "selected_window_ids_source": "recovery_failed",
+        "selection_resolution_source": "recovery_failed",
+        "selection_unavailable_reason": "missing_selected_windows",
+        "available": False,
+        "source_conflict_detected": False,
+        "discarded_sources": compatibility_discarded_sources,
+        "discarded_sources_detailed": discarded_sources,
+        "candidates": candidates,
+        "verify_turn": verify_turn,
+        "verification_record": verification_record,
+        "verification_record_selected_window_ids": verification_record_selected_window_ids,
+        "verification_record_verified_window_ids": verification_record_verified_window_ids,
+        "verification_record_best_effort_window_ids": verification_record_best_effort_window_ids,
+        "latest_verify_turn_selected_window_ids": latest_verify_turn_selected_window_ids,
+        "verify_turn_verified_window_ids": verify_turn_verified_window_ids,
+        "verify_turn_self_verification_selected_window_ids": verify_turn_self_verification_selected_window_ids,
+        "evidence_anchor_selected_window_ids": evidence_anchor_window_ids,
+        "active_evidence_window_ids": active_evidence_window_ids,
+        "recovered_from_trace": False,
+    }
+
+
+def _resolve_selected_window_ids_for_normal_skip(rollout: Dict[str, Any]) -> Dict[str, Any]:
+    resolution = resolve_selected_window_ids_for_fecv(rollout)
+    selected_window_ids = list(resolution.get("selected_window_ids") or [])
+    selection_source = str(resolution.get("selection_resolution_source") or "").strip()
+    if selected_window_ids:
+        return {
+            "selected_window_ids": selected_window_ids,
+            "selection_resolution_source": selection_source or "unknown",
+            "recovered_from_trace": bool(resolution.get("recovered_from_trace", False)),
+        }
+    return {
+        "selected_window_ids": [],
+        "selection_resolution_source": "normal_sample_skipped",
+        "recovered_from_trace": False,
+    }
 
 
 def derive_counterfactual_stage_requirements(
@@ -264,152 +496,62 @@ def _required_stage_list(target: Dict[str, Any], stage_requirements: Dict[str, L
     return [stage for stage in STAGE_ORDER if stage in fallback]
 
 
-def _structured_oracle_profile_entry(
+def _build_normal_skip_profile(
     *,
+    item: Dict[str, Any],
     rollout: Dict[str, Any],
-    reference_record: Dict[str, Any],
 ) -> Dict[str, Any]:
-    target = dict(reference_record.get("structured_target") or {})
-    evidence_moments = ((reference_record.get("evidence") or {}).get("evidence_moments") or [])
-    stage_requirements = derive_counterfactual_stage_requirements(target, evidence_moments=evidence_moments)
-    selected_window_ids = infer_counterfactual_window_ids(rollout)
+    selection_resolution = _resolve_selected_window_ids_for_normal_skip(rollout)
+    selected_window_ids = list(selection_resolution.get("selected_window_ids") or [])
     selected_records = _selected_window_records(rollout, selected_window_ids)
-    stage_moments = _reference_stage_moments(reference_record)
-    decision_scores = _structured_decision_scores(rollout=rollout, target=target)
-    decision_score = _average(list(decision_scores.values()))
-
-    stage_support_scores = {
-        stage: _records_support_against_moments(selected_records, stage_moments.get(stage) or [])
-        for stage in STAGE_ORDER
-    }
-    target_existence = str(target.get("existence") or "").strip().lower()
-    trigger_support_full = float(stage_support_scores.get("trigger", 0.0))
-    if target_existence == "anomaly":
-        selected_support = round(float(decision_score) * float(trigger_support_full), 6)
-    else:
-        selected_support = float(decision_score)
-
-    required_stages = _required_stage_list(target, stage_requirements)
-    if target_existence != "anomaly":
-        required_stage_coverage = 1.0
-    else:
-        required_stage_coverage = _average([stage_support_scores.get(stage, 0.0) for stage in required_stages])
-
-    trigger_aligned_window_ids: List[str] = []
-    for record in selected_records:
-        best_stage = ""
-        best_score = 0.0
-        for stage, moments in stage_moments.items():
-            score = _records_support_against_moments([record], moments)
-            if score > best_score:
-                best_score = score
-                best_stage = stage
-        if best_stage == "trigger" and best_score >= 0.3:
-            window_id = str(record.get("window_id") or "").strip()
-            if window_id:
-                trigger_aligned_window_ids.append(window_id)
-
-    remaining_records = [
-        record for record in selected_records
-        if str(record.get("window_id") or "").strip() not in set(trigger_aligned_window_ids)
-    ]
-    trigger_support_drop = _records_support_against_moments(remaining_records, stage_moments.get("trigger") or [])
-    if target_existence == "anomaly":
-        drop_trigger_necessity = round(max(0.0, float(trigger_support_full) - float(trigger_support_drop)), 6)
-    else:
-        drop_trigger_necessity = 0.0
-
-    full_selected_fields: Dict[str, Dict[str, Any]] = {
-        "existence": {"score": float(decision_scores.get("existence", 0.0)), "supported": bool(decision_scores.get("existence", 0.0) >= 1.0)},
-        "category": {"score": float(decision_scores.get("category", 0.0)), "supported": bool(decision_scores.get("category", 0.0) >= 1.0)},
-        "temporal": {"score": float(decision_scores.get("temporal", 0.0)), "supported": bool(decision_scores.get("temporal", 0.0) >= 0.5)},
-        "trigger": {"score": float(stage_support_scores.get("trigger", 0.0)), "supported": bool(stage_support_scores.get("trigger", 0.0) >= 0.3)},
-        "precursor": {"score": float(stage_support_scores.get("precursor", 0.0)), "supported": bool(stage_support_scores.get("precursor", 0.0) >= 0.3)},
-        "confirmation": {"score": float(stage_support_scores.get("confirmation", 0.0)), "supported": bool(stage_support_scores.get("confirmation", 0.0) >= 0.3)},
-        "finalize_readiness": {"score": float(required_stage_coverage), "supported": bool(required_stage_coverage >= FINALIZE_READINESS_THRESHOLD)},
-    }
-    drop_trigger_fields: Dict[str, Dict[str, Any]] = {
-        "existence": {"score": max(0.0, float(full_selected_fields["existence"]["score"]) - float(drop_trigger_necessity)), "supported": False},
-        "category": {"score": max(0.0, float(full_selected_fields["category"]["score"]) - float(drop_trigger_necessity)), "supported": False},
-        "temporal": {"score": max(0.0, float(full_selected_fields["temporal"]["score"]) - float(drop_trigger_necessity)), "supported": False},
-        "trigger": {"score": float(trigger_support_drop), "supported": bool(trigger_support_drop >= 0.3)},
-        "precursor": {"score": float(stage_support_scores.get("precursor", 0.0)), "supported": bool(stage_support_scores.get("precursor", 0.0) >= 0.3)},
-        "confirmation": {"score": float(stage_support_scores.get("confirmation", 0.0)), "supported": bool(stage_support_scores.get("confirmation", 0.0) >= 0.3)},
-        "finalize_readiness": {"score": float(required_stage_coverage), "supported": bool(required_stage_coverage >= FINALIZE_READINESS_THRESHOLD)},
-    }
-    branch_field_matrix = {
-        "full_selected": {
-            "available": bool(selected_window_ids),
-            "window_ids": list(selected_window_ids),
-            "fields": full_selected_fields,
-            "core_decision_supported": bool(selected_support >= 0.5),
-            "supported_stages": [stage for stage, score in stage_support_scores.items() if score >= 0.3],
-            "missing_required_stages": [stage for stage in required_stages if stage_support_scores.get(stage, 0.0) < 0.3],
-        },
-        "drop_trigger": {
-            "available": bool(trigger_aligned_window_ids),
-            "window_ids": [
-                str(record.get("window_id") or "").strip()
-                for record in remaining_records
-                if str(record.get("window_id") or "").strip()
-            ],
-            "fields": drop_trigger_fields,
-            "core_decision_supported": False,
-            "supported_stages": [stage for stage, score in stage_support_scores.items() if stage != "trigger" and score >= 0.3],
-            "missing_required_stages": [stage for stage in required_stages if (stage == "trigger" or stage_support_scores.get(stage, 0.0) < 0.3)],
-        },
-    }
-    branch_delta_matrix = _build_branch_delta_matrix(branch_field_matrix)
-    summary = {
-        "decision_sufficiency": bool(selected_support >= 0.5),
-        "minimal_subset_sufficiency": False,
-        "negative_specificity_pass": False,
-        "counterfactual_type_supported": True,
-        "stage_necessity": {
-            "trigger": (
-                "decision_critical"
-                if drop_trigger_necessity >= 0.3
-                else ("non_critical" if stage_moments.get("trigger") else "not_observed")
-            )
-        },
-        "oracle_selected_support_score": float(selected_support),
-        "oracle_required_stage_coverage_score": float(required_stage_coverage),
-        "oracle_drop_trigger_necessity_score": float(drop_trigger_necessity),
-    }
+    selected_by_stage = _stage_window_ids(selected_records)
+    profile_source = "normal_skip_v1"
     return {
         "counterfactual_branches": {},
         "counterfactual_profile": {
-            "summary": summary,
-            "branch_field_matrix": branch_field_matrix,
-            "branch_delta_matrix": branch_delta_matrix,
+            "summary": {
+                "decision_sufficiency": False,
+                "minimal_subset_sufficiency": False,
+                "negative_specificity_pass": False,
+                "counterfactual_type_supported": True,
+                "stage_necessity": {},
+            },
+            "branch_field_matrix": {},
+            "branch_delta_matrix": {},
             "stage_packages": {
                 "selected_window_ids": list(selected_window_ids),
-                "selected_by_stage": _stage_window_ids(selected_records),
-                "trigger_aligned_window_ids": list(trigger_aligned_window_ids),
-                "required_stages": list(required_stages),
+                "selected_by_stage": copy.deepcopy(selected_by_stage),
+                "minimal_subset_window_ids": [],
+                "hard_negative_window_ids": [],
             },
             "selection_metadata": {
-                "normalized_branch_profile": "structured_oracle_v1",
-                "stage_requirements": copy.deepcopy(stage_requirements),
+                "normalized_branch_profile": profile_source,
+                "selected_window_count": len(selected_window_ids),
+                "selected_record_count": len(selected_records),
+                "selection_resolution_source": str(
+                    selection_resolution.get("selection_resolution_source") or "normal_sample_skipped"
+                ),
+                "recovered_from_trace": bool(selection_resolution.get("recovered_from_trace", False)),
+                "selected_by_stage": copy.deepcopy(selected_by_stage),
+                "stage_requirements": {
+                    "decision_required_stages": [],
+                    "finalize_required_stages": [],
+                    "narrative_required_stages": [],
+                },
+                "stage_queries": {},
+                "minimal_subset_trace": [],
+                "full_selected_available": False,
+                "full_selected_parse_mode": "skipped_normal",
+                "full_selected_unavailable_reason": "normal_sample_skipped",
+                "full_selected_window_ids": [],
+                "hard_negative_reason": "normal_sample_skipped",
             },
-            "counterfactual_profile_source": "structured_oracle_v1",
-            "counterfactual_branch_profile": "structured_oracle_v1",
+            "counterfactual_profile_source": profile_source,
+            "counterfactual_branch_profile": profile_source,
         },
-        "counterfactual_profile_source": "structured_oracle_v1",
-        "counterfactual_branch_profile": "structured_oracle_v1",
+        "counterfactual_profile_source": profile_source,
+        "counterfactual_branch_profile": profile_source,
     }
-
-
-def _run_structured_oracle_verification_batch(
-    batch_inputs: Sequence[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    return [
-        _structured_oracle_profile_entry(
-            rollout=dict((batch_input.get("rollout") or {})),
-            reference_record=dict((batch_input.get("reference_record") or batch_input.get("item") or {})),
-        )
-        for batch_input in list(batch_inputs or [])
-    ]
 
 
 def _tokenize(text: Any) -> List[str]:
@@ -617,9 +759,41 @@ def _resolve_counterfactual_branch_order(
     if normalized == "online_core":
         return [
             "full_selected",
+            "minimal_subset",
             "drop_trigger",
         ]
     return list(BRANCH_ORDER)
+
+
+def _branch_uses_compact_decision_only(
+    *,
+    normalized_branch_profile: str,
+    branch_name: str,
+) -> bool:
+    normalized_branch_name = str(branch_name or "").strip().lower()
+    if str(normalized_branch_profile or "").strip().lower() != "online_core":
+        return False
+    return normalized_branch_name in {"full_selected", "minimal_subset", "drop_trigger"}
+
+
+def _build_compact_semantic_scaffold(
+    *,
+    target: Dict[str, Any],
+    branch_name: str,
+) -> str:
+    del branch_name
+    scaffold = {
+        "decision": dict(target or {"existence": "normal", "category": "normal"}),
+        "covered_stages": [],
+        "missing_required_stages": [],
+        "stage_selected_moment_ids": {},
+        "event_chain_summary": {
+            "precursor": "",
+            "trigger": "",
+            "confirmation": "",
+        },
+    }
+    return json.dumps(scaffold, ensure_ascii=False, separators=(",", ":"))
 
 
 def _build_reference_payload(reference_record: Dict[str, Any]) -> Dict[str, Any]:
@@ -928,14 +1102,12 @@ def _build_counterfactual_messages(
     multimodal_cache = dict(item.get("multimodal_cache") or {})
     question = str(multimodal_cache.get("question") or "Determine the final structured anomaly decision from the evidence.")
     if compact_decision_only:
-        scaffold = json.dumps(
-            {"decision": dict(target or {"existence": "normal", "category": "normal"})},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        scaffold = _build_compact_semantic_scaffold(target=target, branch_name=branch_name)
         output_instruction = (
             f"Return exactly one <answer></answer> JSON in this compact shape: {scaffold}\n"
-            "Do not add summary, rationale, event_chain_summary, or qa_focus_answers."
+            "Keep only decision, covered_stages, missing_required_stages, stage_selected_moment_ids, and event_chain_summary. "
+            "Populate event_chain_summary for stages supported by this branch and leave unsupported stages as empty strings. "
+            "Do not add summary, rationale, or qa_focus_answers."
         )
     else:
         scaffold = build_semantic_answer_scaffold(finalized_case=target)
@@ -1001,37 +1173,119 @@ def _build_counterfactual_messages(
 
 
 def _run_counterfactual_branch_replay(policy: Any, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not hasattr(policy, "generate_from_messages"):
-        raise AttributeError("Counterfactual verification requires a policy with generate_from_messages(messages).")
-    response_text = str(policy.generate_from_messages(messages) or "")
-    return _parse_counterfactual_branch_replay_response(response_text)
+    result = _run_counterfactual_branch_replay_batch(
+        policy,
+        [
+            {
+                "messages": list(messages or []),
+                "target": {},
+                "compact_decision_only": False,
+                "branch_name": "counterfactual_replay",
+            }
+        ],
+    )
+    return dict(result[0]) if result else _unavailable_branch_payload(window_ids=[], reason="counterfactual_replay_missing")
 
 
-def _parse_counterfactual_branch_replay_response(response_text: str) -> Dict[str, Any]:
-    answer_text = TimeSearchRolloutAdapter.parse_answer_text(response_text)
-    payload: Optional[Dict[str, Any]] = None
-    if answer_text:
-        try:
-            parsed = json.loads(answer_text)
-        except Exception:
-            parsed = None
-        if isinstance(parsed, dict):
-            payload = normalize_semantic_answer_payload(parsed)
-    final_answer = extract_decision_from_semantic_answer(payload) if payload else None
+def _counterfactual_answer_retry_prompt(
+    *,
+    reason: str,
+    target: Dict[str, Any],
+    compact_decision_only: bool,
+) -> str:
+    normalized_reason = str(reason or "").strip() or "invalid_action_format"
+    reason_prefix = {
+        "missing_answer_tag": "The previous response did not contain any <answer></answer> block.",
+        "invalid_answer_json": "The previous <answer> block did not contain valid JSON.",
+        "normalized_payload_empty": (
+            "The previous <answer> block did not contain a usable semantic decision payload."
+        ),
+        "tool_call_not_allowed": "Counterfactual verification replay cannot call tools.",
+        "invalid_action_format": "The previous response did not follow the required structured format.",
+    }.get(normalized_reason, "The previous response violated the counterfactual replay protocol.")
+    if compact_decision_only:
+        scaffold = _build_compact_semantic_scaffold(
+            target=target,
+            branch_name="counterfactual_replay",
+        )
+        shape_instruction = (
+            f"Retry immediately with exactly one <answer></answer> JSON block in this compact shape: {scaffold}. "
+            "Keep only decision and event_chain_summary. "
+            "Leave unsupported stages in event_chain_summary as empty strings. "
+            "Do not add summary, rationale, or qa_focus_answers."
+        )
+    else:
+        scaffold = build_semantic_answer_scaffold(finalized_case=target)
+        shape_instruction = (
+            f"Retry immediately with exactly one <answer></answer> JSON block in this shape: {scaffold}. "
+            "Do not output plain text outside <answer>."
+        )
+    return (
+        f"{reason_prefix} {shape_instruction} "
+        "Do not output <tool_call>. Do not explain the answer in prose."
+    )
+
+
+def _counterfactual_parse_error_message(
+    *,
+    reason: str,
+    target: Dict[str, Any],
+    compact_decision_only: bool,
+) -> Dict[str, Any]:
     return {
-        "response_text": response_text,
-        "semantic_answer": payload,
-        "semantic_answer_text": semantic_answer_to_text(payload),
-        "final_answer": final_answer,
-        "available": bool(payload is not None),
+        "role": "tool",
+        "name": "parse_error",
+        "content": [
+            {
+                "type": "text",
+                "text": _counterfactual_answer_retry_prompt(
+                    reason=reason,
+                    target=target,
+                    compact_decision_only=compact_decision_only,
+                ),
+            }
+        ],
     }
 
 
-def _run_counterfactual_branch_replay_batch(
+def _counterfactual_failure_preview(response_text: str, *, limit: int = 200) -> str:
+    text = " ".join(str(response_text or "").split())
+    if len(text) <= int(limit):
+        return text
+    return text[: max(0, int(limit) - 3)] + "..."
+
+
+def _classify_counterfactual_branch_replay_response(response_text: str) -> Dict[str, Any]:
+    cleaned_response = cleanup_llm_response(str(response_text or ""))
+    actions, contents = parse_actions_and_contents([cleaned_response])
+    action = actions[0]
+    if action == "tool_call":
+        return {
+            "response_text": cleaned_response,
+            "semantic_answer": None,
+            "semantic_answer_text": None,
+            "final_answer": None,
+            "available": False,
+            "unavailable_reason": "tool_call_not_allowed",
+            "parsed_action": "tool_call",
+            "failure_preview": _counterfactual_failure_preview(cleaned_response),
+            "raw_parsed_content": contents[0],
+        }
+    parsed = _parse_counterfactual_branch_replay_response(cleaned_response)
+    parsed["parsed_action"] = str(action or "")
+    parsed["failure_preview"] = (
+        _counterfactual_failure_preview(cleaned_response)
+        if not bool(parsed.get("available"))
+        else ""
+    )
+    return parsed
+
+
+def _generate_counterfactual_branch_replay_text_batch(
     policy: Any,
     messages_batch: Sequence[List[Dict[str, Any]]],
-) -> List[Dict[str, Any]]:
-    message_list = list(messages_batch or [])
+) -> List[str]:
+    message_list = [list(messages or []) for messages in list(messages_batch or [])]
     if not message_list:
         return []
     batch_generate = getattr(policy, "generate_from_messages_batch", None)
@@ -1050,10 +1304,395 @@ def _run_counterfactual_branch_replay_batch(
             "Counterfactual verification batch replay returned an unexpected number of responses: "
             f"{len(response_texts)} vs {len(message_list)}"
         )
-    return [
-        _parse_counterfactual_branch_replay_response(str(response_text or ""))
-        for response_text in response_texts
-    ]
+    return [str(response_text or "") for response_text in response_texts]
+
+
+def _counterfactual_replay_result(
+    *,
+    response_text: str,
+    payload: Optional[Dict[str, Any]],
+    parse_mode: str,
+    unavailable_reason: str,
+) -> Dict[str, Any]:
+    final_answer = extract_decision_from_semantic_answer(payload) if payload else None
+    return {
+        "response_text": response_text,
+        "semantic_answer": payload,
+        "semantic_answer_text": semantic_answer_to_text(payload),
+        "final_answer": final_answer,
+        "available": bool(payload is not None),
+        "unavailable_reason": "" if payload is not None else str(unavailable_reason or ""),
+        "parse_mode": str(parse_mode or ""),
+    }
+
+
+def _extract_balanced_json_object(text: str, *, start_index: int) -> Optional[str]:
+    if start_index < 0 or start_index >= len(text) or text[start_index] != "{":
+        return None
+    balance = 0
+    in_string = False
+    escaped = False
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            balance += 1
+        elif char == "}":
+            balance -= 1
+            if balance == 0:
+                return text[start_index : index + 1]
+    return None
+
+
+def _extract_balanced_json_array(text: str, *, start_index: int) -> Optional[str]:
+    if start_index < 0 or start_index >= len(text) or text[start_index] != "[":
+        return None
+    balance = 0
+    in_string = False
+    escaped = False
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "[":
+            balance += 1
+        elif char == "]":
+            balance -= 1
+            if balance == 0:
+                return text[start_index : index + 1]
+    return None
+
+
+def _extract_json_value_snippet(text: str, *, key: str) -> Optional[str]:
+    match = re.search(rf'"{re.escape(str(key))}"\s*:\s*', text)
+    if match is None:
+        return None
+    index = match.end()
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        return None
+    char = text[index]
+    if char == "{":
+        return _extract_balanced_json_object(text, start_index=index)
+    if char == "[":
+        return _extract_balanced_json_array(text, start_index=index)
+    if char == '"':
+        escaped = False
+        for end in range(index + 1, len(text)):
+            current = text[end]
+            if escaped:
+                escaped = False
+                continue
+            if current == "\\":
+                escaped = True
+                continue
+            if current == '"':
+                return text[index : end + 1]
+        return None
+    end = index
+    while end < len(text) and text[end] not in ",}":
+        end += 1
+    snippet = text[index:end].strip()
+    return snippet or None
+
+
+def _salvage_compact_decision_payload(payload_text: str) -> Optional[Dict[str, Any]]:
+    marker = '"decision"'
+    marker_index = payload_text.find(marker)
+    if marker_index < 0:
+        return None
+    colon_index = payload_text.find(":", marker_index + len(marker))
+    if colon_index < 0:
+        return None
+    brace_index = payload_text.find("{", colon_index + 1)
+    if brace_index < 0:
+        return None
+    decision_object_text = _extract_balanced_json_object(payload_text, start_index=brace_index)
+    candidate_texts: List[str] = []
+    if decision_object_text:
+        candidate_texts.append(decision_object_text)
+    else:
+        fallback_markers = (
+            '},"summary":',
+            '}, "summary":',
+            '},"rationale":',
+            '}, "rationale":',
+            '},"event_chain_summary":',
+            '}, "event_chain_summary":',
+            '},"qa_focus_answers":',
+            '}, "qa_focus_answers":',
+            '},"required_stages":',
+            '}, "required_stages":',
+            '},"available_stages":',
+            '}, "available_stages":',
+            '},"stage_to_moment_ids":',
+            '}, "stage_to_moment_ids":',
+        )
+        marker_positions = [
+            payload_text.find(fallback_marker, brace_index + 1)
+            for fallback_marker in fallback_markers
+        ]
+        marker_positions = [position for position in marker_positions if position > brace_index]
+        if marker_positions:
+            cutoff = min(marker_positions) + 1
+            candidate_texts.append(payload_text[brace_index:cutoff])
+    for candidate_text in candidate_texts:
+        try:
+            parsed = json.loads('{"decision":' + candidate_text + "}")
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _salvage_compact_decision_fields(payload_text: str) -> Optional[Dict[str, Any]]:
+    decision: Dict[str, Any] = {}
+    for key in (
+        "existence",
+        "category",
+        "counterfactual_type",
+        "severity",
+        "hard_normal",
+        "anomaly_interval_sec",
+        "precursor_interval_sec",
+        "earliest_actionable_sec",
+        "evidence_moment_ids",
+    ):
+        snippet = _extract_json_value_snippet(payload_text, key=key)
+        if snippet is None:
+            continue
+        try:
+            decision[key] = json.loads(snippet)
+        except Exception:
+            continue
+    if not str(decision.get("existence") or "").strip():
+        return None
+    if not str(decision.get("category") or "").strip():
+        return None
+    return {"decision": decision}
+
+
+def _parse_counterfactual_payload_text(
+    payload_text: str,
+    *,
+    response_text: str,
+    parse_mode: str,
+    invalid_json_reason: str,
+    compact_decision_only: bool = False,
+) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(payload_text)
+    except Exception:
+        repaired_payload_text = _repair_json_object_text(payload_text)
+        if repaired_payload_text is None or repaired_payload_text == payload_text:
+            repaired_payload_text = None
+        try:
+            parsed = json.loads(repaired_payload_text) if repaired_payload_text is not None else None
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            parse_mode = f"{parse_mode}_repaired"
+        elif compact_decision_only:
+            salvage_source = repaired_payload_text or payload_text
+            parsed = _salvage_compact_decision_payload(salvage_source)
+            if parsed is not None:
+                parse_mode = f"{parse_mode}_decision_extracted"
+            else:
+                parsed = _salvage_compact_decision_fields(salvage_source)
+                if parsed is not None:
+                    parse_mode = f"{parse_mode}_decision_fields_extracted"
+                else:
+                    return _counterfactual_replay_result(
+                        response_text=response_text,
+                        payload=None,
+                        parse_mode=parse_mode,
+                        unavailable_reason=invalid_json_reason,
+                    )
+        else:
+            return _counterfactual_replay_result(
+                response_text=response_text,
+                payload=None,
+                parse_mode=parse_mode,
+                unavailable_reason=invalid_json_reason,
+            )
+    if not isinstance(parsed, dict):
+        return _counterfactual_replay_result(
+            response_text=response_text,
+            payload=None,
+            parse_mode=parse_mode,
+            unavailable_reason=invalid_json_reason,
+        )
+    payload = normalize_semantic_answer_payload(parsed)
+    if payload is None:
+        return _counterfactual_replay_result(
+            response_text=response_text,
+            payload=None,
+            parse_mode=parse_mode,
+            unavailable_reason="normalized_payload_empty",
+        )
+    return _counterfactual_replay_result(
+        response_text=response_text,
+        payload=payload,
+        parse_mode=parse_mode,
+        unavailable_reason="",
+    )
+
+
+def _parse_counterfactual_branch_replay_response(
+    response_text: str,
+    *,
+    compact_decision_only: bool = False,
+) -> Dict[str, Any]:
+    cleaned_response = cleanup_llm_response(str(response_text or ""))
+    actions, contents = parse_actions_and_contents([cleaned_response])
+    action = actions[0]
+    content = contents[0]
+    if action == "tool_call":
+        return _counterfactual_replay_result(
+            response_text=cleaned_response,
+            payload=None,
+            parse_mode="tool_call",
+            unavailable_reason="tool_call_not_allowed",
+        )
+    if action == "answer":
+        return _parse_counterfactual_payload_text(
+            str(content or ""),
+            response_text=cleaned_response,
+            parse_mode="answer_tag",
+            invalid_json_reason="invalid_answer_json",
+            compact_decision_only=bool(compact_decision_only),
+        )
+    if action == "invalid_answer":
+        return _counterfactual_replay_result(
+            response_text=cleaned_response,
+            payload=None,
+            parse_mode="answer_tag",
+            unavailable_reason="invalid_answer_json",
+        )
+    if str(cleaned_response or "").lstrip().startswith("{"):
+        return _parse_counterfactual_payload_text(
+            cleaned_response,
+            response_text=cleaned_response,
+            parse_mode="bare_json",
+            invalid_json_reason="invalid_bare_json",
+            compact_decision_only=bool(compact_decision_only),
+        )
+    return _counterfactual_replay_result(
+        response_text=cleaned_response,
+        payload=None,
+        parse_mode="failed",
+        unavailable_reason="missing_answer_tag",
+    )
+
+
+def _raise_counterfactual_replay_protocol_error(
+    *,
+    request: Dict[str, Any],
+    result: Dict[str, Any],
+) -> None:
+    rollout = dict(request.get("rollout") or {})
+    item = dict(request.get("item") or {})
+    branch_name = str(request.get("branch_name") or "")
+    reason = str(result.get("unavailable_reason") or "")
+    parse_mode = str(result.get("parse_mode") or "")
+    response_text = str(result.get("response_text") or "")
+    response_preview = _counterfactual_failure_preview(response_text)
+    response_suffix = response_text[-200:] if response_text else ""
+    repaired_candidate = _repair_json_object_text(response_text) if response_text.lstrip().startswith("{") else None
+    repaired_candidate_suffix = repaired_candidate[-200:] if repaired_candidate else ""
+    compact_decision_only = bool(request.get("compact_decision_only"))
+    window_ids = list(_dedupe_window_ids(request.get("window_ids") or []))
+    response_char_count = len(response_text)
+    brace_balance = _json_brace_balance(response_text) if response_text.lstrip().startswith("{") else 0
+    ends_with_brace = response_text.rstrip().endswith("}")
+    has_answer_tag = "<answer>" in response_text and "</answer>" in response_text
+    logger.error(
+        "fecv replay protocol error: video_id=%s generation_id=%s branch_name=%s reason=%s parse_mode=%s response_preview=%s",
+        str(rollout.get("video_id") or item.get("video_id") or ""),
+        str(rollout.get("generation_id") or ""),
+        branch_name,
+        reason,
+        parse_mode,
+        response_preview,
+        )
+    if branch_name in {"minimal_subset", "full_selected"}:
+        logger.error(
+            "fecv %s protocol detail: video_id=%s generation_id=%s compact_decision_only=%s "
+            "window_ids=%s stage_requirements=%s response_char_count=%s brace_balance=%s "
+            "ends_with_brace=%s has_answer_tag=%s repaired_candidate_present=%s repaired_candidate_changed=%s "
+            "response_suffix=%s repaired_candidate_suffix=%s",
+            branch_name,
+            str(rollout.get("video_id") or item.get("video_id") or ""),
+            str(rollout.get("generation_id") or ""),
+            compact_decision_only,
+            window_ids,
+            dict(request.get("stage_requirements") or {}),
+            response_char_count,
+            brace_balance,
+            ends_with_brace,
+            has_answer_tag,
+            repaired_candidate is not None,
+            repaired_candidate not in {None, response_text},
+            response_suffix,
+            repaired_candidate_suffix,
+        )
+    raise CounterfactualReplayProtocolError(
+        video_id=str(rollout.get("video_id") or item.get("video_id") or ""),
+        generation_id=str(rollout.get("generation_id") or ""),
+        branch_name=branch_name,
+        reason=reason,
+        parse_mode=parse_mode,
+        response_preview=response_preview,
+    )
+
+
+def _run_counterfactual_branch_replay_batch(
+    policy: Any,
+    requests: Sequence[Dict[str, Any]],
+    *,
+    raise_on_protocol_error: bool = True,
+) -> List[Dict[str, Any]]:
+    request_list = [dict(request or {}) for request in list(requests or [])]
+    if not request_list:
+        return []
+    response_texts = _generate_counterfactual_branch_replay_text_batch(
+        policy,
+        [list(request.get("messages") or []) for request in request_list],
+    )
+    results: List[Dict[str, Any]] = []
+    for request, response_text in zip(request_list, response_texts):
+        result = _parse_counterfactual_branch_replay_response(
+            response_text,
+            compact_decision_only=bool(request.get("compact_decision_only")),
+        )
+        if not bool(result.get("available")):
+            if raise_on_protocol_error:
+                _raise_counterfactual_replay_protocol_error(request=request, result=result)
+            result = dict(result)
+            result["failure_preview"] = _counterfactual_failure_preview(str(result.get("response_text") or ""))
+        results.append(result)
+    return results
 
 
 def _unavailable_branch_payload(
@@ -1091,6 +1730,7 @@ def _evaluate_branch_window_ids(
     window_ids: Sequence[str],
     max_images: int,
     compact_decision_only: bool = False,
+    raise_on_protocol_error: bool = True,
 ) -> Dict[str, Any]:
     normalized_window_ids = list(_dedupe_window_ids(window_ids))
     if not normalized_window_ids:
@@ -1104,7 +1744,24 @@ def _evaluate_branch_window_ids(
         max_images=int(max_images),
         compact_decision_only=compact_decision_only,
     )
-    replay = _run_counterfactual_branch_replay(policy, messages)
+    replay_results = _run_counterfactual_branch_replay_batch(
+        policy,
+        [
+            {
+                "messages": messages,
+                "target": dict(target or {}),
+                "compact_decision_only": bool(compact_decision_only),
+                "branch_name": str(branch_name),
+                "rollout": dict(rollout or {}),
+                "item": dict(item or {}),
+            }
+        ],
+        raise_on_protocol_error=raise_on_protocol_error,
+    )
+    replay = dict(replay_results[0]) if replay_results else _unavailable_branch_payload(
+        window_ids=normalized_window_ids,
+        reason="counterfactual_replay_missing",
+    )
     field_support = _field_support(replay.get("semantic_answer"), reference_payload)
     branch_verification = _branch_finalize_readiness(
         branch_window_ids=normalized_window_ids,
@@ -1123,7 +1780,8 @@ def _evaluate_branch_window_ids(
         "field_support": field_support,
         "branch_verification": branch_verification,
         "branch_pass": False,
-        "unavailable_reason": "",
+        "unavailable_reason": str(replay.get("unavailable_reason") or ""),
+        "parse_mode": str(replay.get("parse_mode") or ""),
     }
 
 
@@ -1138,6 +1796,7 @@ def _build_branch_evaluation_request(
     window_ids: Sequence[str],
     max_images: int,
     compact_decision_only: bool = False,
+    raise_on_protocol_error: bool = True,
 ) -> Dict[str, Any]:
     normalized_window_ids = list(_dedupe_window_ids(window_ids))
     return {
@@ -1148,6 +1807,8 @@ def _build_branch_evaluation_request(
         "stage_requirements": stage_requirements,
         "branch_name": str(branch_name),
         "window_ids": normalized_window_ids,
+        "compact_decision_only": bool(compact_decision_only),
+        "raise_on_protocol_error": bool(raise_on_protocol_error),
         "messages": _build_counterfactual_messages(
             item,
             rollout=rollout,
@@ -1187,7 +1848,8 @@ def _finalize_branch_evaluation_request(
         "field_support": field_support,
         "branch_verification": branch_verification,
         "branch_pass": False,
-        "unavailable_reason": "",
+        "unavailable_reason": str(replay.get("unavailable_reason") or ""),
+        "parse_mode": str(replay.get("parse_mode") or ""),
     }
 
 
@@ -1198,9 +1860,11 @@ def _evaluate_branch_requests_batch(
     request_list = list(requests or [])
     if not request_list:
         return []
+    strict_mode = all(bool(dict(request).get("raise_on_protocol_error", True)) for request in request_list)
     replays = _run_counterfactual_branch_replay_batch(
         policy,
-        [dict(request).get("messages") or [] for request in request_list],
+        request_list,
+        raise_on_protocol_error=bool(strict_mode),
     )
     return [
         _finalize_branch_evaluation_request(request, replay)
@@ -1299,29 +1963,65 @@ def run_counterfactual_verification_batch(
     if not batch_input_list:
         return []
     normalized_branch_profile = _normalize_counterfactual_branch_profile(branch_profile)
-    if normalized_branch_profile == "structured_oracle_v1":
-        return _run_structured_oracle_verification_batch(batch_input_list)
-    if policy is None:
-        raise ValueError(
-            "run_counterfactual_verification_batch requires a non-null policy unless branch_profile='structured_oracle_v1'."
-        )
 
+    outputs: List[Optional[Dict[str, Any]]] = [None for _ in batch_input_list]
     entries: List[Dict[str, Any]] = []
-    for batch_input in batch_input_list:
+    for batch_input_index, batch_input in enumerate(batch_input_list):
         item = dict(batch_input.get("item") or {})
         rollout = dict(batch_input.get("rollout") or {})
         reference_record = dict(batch_input.get("reference_record") or item)
         reference_payload = _build_reference_payload(reference_record)
         target = dict(reference_record.get("structured_target") or {})
+        if str(target.get("existence") or "").strip().lower() != "anomaly":
+            outputs[int(batch_input_index)] = (
+                _build_normal_skip_profile(
+                    item=item,
+                    rollout=rollout,
+                )
+            )
+            continue
         evidence_moments = ((reference_record.get("evidence") or {}).get("evidence_moments") or [])
         stage_requirements = derive_counterfactual_stage_requirements(target, evidence_moments=evidence_moments)
         active_branch_order = _resolve_counterfactual_branch_order(branch_profile, stage_requirements=stage_requirements)
         normalized_branch_profile = _normalize_counterfactual_branch_profile(branch_profile)
-        compact_decision_only = normalized_branch_profile == "online_core"
+        compact_decision_only = False
         stage_queries = _build_stage_query_map(item=item, reference_record=reference_record)
 
-        selected_window_ids = infer_counterfactual_window_ids(rollout)
+        selection_resolution = resolve_selected_window_ids_for_fecv(rollout)
+        selected_window_ids = list(selection_resolution.get("selected_window_ids") or [])
+        selection_resolution_source = str(selection_resolution.get("selection_resolution_source") or "")
+        recovered_from_trace = bool(selection_resolution.get("recovered_from_trace", False))
         selected_records = _selected_window_records(rollout, selected_window_ids)
+        selected_by_stage = _stage_window_ids(selected_records)
+        if not selected_window_ids:
+            logger.info(
+                "fecv selected-window debug: video_id=%s generation_id=%s branch_profile=%s "
+                "selected_window_count=0 selection_resolution_source=%s recovered_from_trace=%s "
+                "selected_by_stage=%s turn_count=%s decision_turn_indices=%s",
+                str(rollout.get("video_id") or item.get("video_id") or ""),
+                str(rollout.get("generation_id") or ""),
+                normalized_branch_profile,
+                selection_resolution_source,
+                recovered_from_trace,
+                selected_by_stage,
+                len(rollout.get("turns") or []),
+                list(rollout.get("decision_turn_indices") or []),
+            )
+        elif len(selected_records) != len(selected_window_ids):
+            logger.info(
+                "fecv selected-window debug: video_id=%s generation_id=%s branch_profile=%s "
+                "selected_window_ids=%s selected_window_count=%s selected_record_count=%s "
+                "selection_resolution_source=%s recovered_from_trace=%s selected_by_stage=%s",
+                str(rollout.get("video_id") or item.get("video_id") or ""),
+                str(rollout.get("generation_id") or ""),
+                normalized_branch_profile,
+                list(selected_window_ids),
+                len(selected_window_ids),
+                len(selected_records),
+                selection_resolution_source,
+                recovered_from_trace,
+                selected_by_stage,
+            )
         drop_precursor_ids, drop_precursor_available = _branch_stage_drop_window_ids(
             selected_window_ids,
             selected_records,
@@ -1353,10 +2053,12 @@ def run_counterfactual_verification_batch(
                 "stage_requirements": stage_requirements,
                 "active_branch_order": active_branch_order,
                 "normalized_branch_profile": normalized_branch_profile,
-                "compact_decision_only": compact_decision_only,
                 "stage_queries": stage_queries,
                 "selected_window_ids": list(selected_window_ids),
+                "selection_resolution_source": selection_resolution_source,
+                "recovered_from_trace": recovered_from_trace,
                 "selected_records": selected_records,
+                "selected_by_stage": copy.deepcopy(selected_by_stage),
                 "branch_specs": {
                     "drop_precursor": {
                         "window_ids": list(drop_precursor_ids),
@@ -1383,7 +2085,15 @@ def run_counterfactual_verification_batch(
                 "minimal_subset_trace": [],
                 "minimal_subset_ids": list(selected_window_ids),
                 "hard_negative_ids": list(hard_negative_ids),
+                "batch_input_index": int(batch_input_index),
             }
+        )
+
+    if not entries:
+        return [dict(entry or {}) for entry in outputs if entry is not None]
+    if policy is None:
+        raise ValueError(
+            "run_counterfactual_verification_batch requires a non-null policy unless branch_profile='online_core' or the target sample is normal."
         )
 
     full_requests: List[Dict[str, Any]] = []
@@ -1400,99 +2110,135 @@ def run_counterfactual_verification_batch(
                     branch_name="full_selected",
                     window_ids=entry["selected_window_ids"],
                     max_images=int(max_images),
-                    compact_decision_only=bool(entry["compact_decision_only"]),
+                    compact_decision_only=_branch_uses_compact_decision_only(
+                        normalized_branch_profile=str(entry["normalized_branch_profile"] or ""),
+                        branch_name="full_selected",
+                    ),
+                    raise_on_protocol_error=True,
                 )
             )
             full_request_indices.append(int(entry_index))
         else:
             entry["branches"]["full_selected"] = _unavailable_branch_payload(
                 window_ids=[],
-                reason="no_selected_windows",
+                reason="contract_violation_empty_selection",
             )
     for entry_index, branch in zip(full_request_indices, _evaluate_branch_requests_batch(policy, full_requests)):
         entries[entry_index]["branches"]["full_selected"] = branch
-
-    minimal_requests: List[Dict[str, Any]] = []
-    minimal_request_indices: List[int] = []
-    for entry_index, entry in enumerate(entries):
-        current_ids = list(entry["selected_window_ids"])
-        if not current_ids:
-            entry["minimal_subset_ids"] = []
-            entry["branches"]["minimal_subset"] = _unavailable_branch_payload(
-                window_ids=[],
-                reason="no_selected_windows",
+        if not bool((branch or {}).get("available")):
+            entry = entries[entry_index]
+            logger.info(
+                "fecv full-selected branch debug: video_id=%s generation_id=%s branch_profile=%s "
+                "selected_window_count=%s selected_window_ids=%s unavailable_reason=%s "
+                "parse_mode=%s selection_resolution_source=%s recovered_from_trace=%s "
+                "full_selected_window_ids=%s failure_preview=%s",
+                str((entry.get("rollout") or {}).get("video_id") or (entry.get("item") or {}).get("video_id") or ""),
+                str((entry.get("rollout") or {}).get("generation_id") or ""),
+                str(entry.get("normalized_branch_profile") or ""),
+                len(entry.get("selected_window_ids") or []),
+                list(entry.get("selected_window_ids") or []),
+                str((branch or {}).get("unavailable_reason") or ""),
+                str((branch or {}).get("parse_mode") or ""),
+                str(entry.get("selection_resolution_source") or ""),
+                bool(entry.get("recovered_from_trace", False)),
+                list((branch or {}).get("window_ids") or []),
+                _counterfactual_failure_preview(str((branch or {}).get("response_text") or "")),
             )
-            continue
-        minimal_requests.append(
-            _build_branch_evaluation_request(
-                item=entry["item"],
-                rollout=entry["rollout"],
-                reference_payload=entry["reference_payload"],
-                target=entry["target"],
-                stage_requirements=entry["stage_requirements"],
-                branch_name="minimal_subset",
-                window_ids=current_ids,
-                max_images=int(max_images),
-                compact_decision_only=bool(entry["compact_decision_only"]),
-            )
-        )
-        minimal_request_indices.append(int(entry_index))
-    for entry_index, branch in zip(minimal_request_indices, _evaluate_branch_requests_batch(policy, minimal_requests)):
-        entries[entry_index]["branches"]["minimal_subset"] = branch
 
-    improved = True
-    while improved:
-        candidate_requests: List[Dict[str, Any]] = []
-        candidate_meta: List[Tuple[int, str, List[str]]] = []
+    if any("minimal_subset" in list(entry.get("active_branch_order") or []) for entry in entries):
+        minimal_requests: List[Dict[str, Any]] = []
+        minimal_request_indices: List[int] = []
         for entry_index, entry in enumerate(entries):
-            current_ids = list((entry["branches"].get("minimal_subset") or {}).get("window_ids") or [])
-            if len(current_ids) <= 1:
+            if "minimal_subset" not in list(entry.get("active_branch_order") or []):
                 continue
-            for removable_window_id in list(current_ids):
-                candidate_ids = [window_id for window_id in current_ids if window_id != removable_window_id]
-                candidate_requests.append(
-                    _build_branch_evaluation_request(
-                        item=entry["item"],
-                        rollout=entry["rollout"],
-                        reference_payload=entry["reference_payload"],
-                        target=entry["target"],
-                        stage_requirements=entry["stage_requirements"],
+            current_ids = list(entry["selected_window_ids"])
+            if not current_ids:
+                entry["minimal_subset_ids"] = []
+                entry["branches"]["minimal_subset"] = _unavailable_branch_payload(
+                    window_ids=[],
+                    reason="no_selected_windows",
+                )
+                continue
+            minimal_requests.append(
+                _build_branch_evaluation_request(
+                    item=entry["item"],
+                    rollout=entry["rollout"],
+                    reference_payload=entry["reference_payload"],
+                    target=entry["target"],
+                    stage_requirements=entry["stage_requirements"],
+                    branch_name="minimal_subset",
+                    window_ids=current_ids,
+                    max_images=int(max_images),
+                    compact_decision_only=_branch_uses_compact_decision_only(
+                        normalized_branch_profile=str(entry["normalized_branch_profile"] or ""),
                         branch_name="minimal_subset",
-                        window_ids=candidate_ids,
-                        max_images=int(max_images),
-                        compact_decision_only=bool(entry["compact_decision_only"]),
+                    ),
+                    raise_on_protocol_error=False,
+                )
+            )
+            minimal_request_indices.append(int(entry_index))
+        for entry_index, branch in zip(minimal_request_indices, _evaluate_branch_requests_batch(policy, minimal_requests)):
+            entries[entry_index]["branches"]["minimal_subset"] = branch
+
+        improved = True
+        while improved:
+            candidate_requests: List[Dict[str, Any]] = []
+            candidate_meta: List[Tuple[int, str, List[str]]] = []
+            for entry_index, entry in enumerate(entries):
+                if "minimal_subset" not in list(entry.get("active_branch_order") or []):
+                    continue
+                current_ids = list((entry["branches"].get("minimal_subset") or {}).get("window_ids") or [])
+                if len(current_ids) <= 1:
+                    continue
+                for removable_window_id in list(current_ids):
+                    candidate_ids = [window_id for window_id in current_ids if window_id != removable_window_id]
+                    candidate_requests.append(
+                        _build_branch_evaluation_request(
+                            item=entry["item"],
+                            rollout=entry["rollout"],
+                            reference_payload=entry["reference_payload"],
+                            target=entry["target"],
+                            stage_requirements=entry["stage_requirements"],
+                            branch_name="minimal_subset",
+                            window_ids=candidate_ids,
+                            max_images=int(max_images),
+                            compact_decision_only=_branch_uses_compact_decision_only(
+                                normalized_branch_profile=str(entry["normalized_branch_profile"] or ""),
+                                branch_name="minimal_subset",
+                            ),
+                            raise_on_protocol_error=False,
+                        )
+                    )
+                    candidate_meta.append((int(entry_index), str(removable_window_id), list(candidate_ids)))
+            candidate_branches = _evaluate_branch_requests_batch(policy, candidate_requests)
+            best_updates: Dict[int, Tuple[List[str], Dict[str, Any], float]] = {}
+            improved = False
+            for (entry_index, removable_window_id, candidate_ids), candidate_branch in zip(candidate_meta, candidate_branches):
+                decision_supported = _branch_supports_decision(candidate_branch, target=entries[entry_index]["target"])
+                objective = (
+                    _safe_float(((candidate_branch.get("branch_verification") or {}).get("finalize_readiness_score")), 0.0)
+                    + sum(
+                        _safe_float(((candidate_branch.get("field_support") or {}).get(field_name) or {}).get("score"), 0.0)
+                        for field_name in CORE_DECISION_FIELDS
                     )
                 )
-                candidate_meta.append((int(entry_index), str(removable_window_id), list(candidate_ids)))
-        candidate_branches = _evaluate_branch_requests_batch(policy, candidate_requests)
-        best_updates: Dict[int, Tuple[List[str], Dict[str, Any], float]] = {}
-        improved = False
-        for (entry_index, removable_window_id, candidate_ids), candidate_branch in zip(candidate_meta, candidate_branches):
-            decision_supported = _branch_supports_decision(candidate_branch, target=entries[entry_index]["target"])
-            objective = (
-                _safe_float(((candidate_branch.get("branch_verification") or {}).get("finalize_readiness_score")), 0.0)
-                + sum(
-                    _safe_float(((candidate_branch.get("field_support") or {}).get(field_name) or {}).get("score"), 0.0)
-                    for field_name in CORE_DECISION_FIELDS
+                entries[entry_index]["minimal_subset_trace"].append(
+                    {
+                        "removed_window_id": removable_window_id,
+                        "candidate_window_ids": list(candidate_ids),
+                        "decision_supported": bool(decision_supported),
+                        "objective": round(float(objective), 6),
+                    }
                 )
-            )
-            entries[entry_index]["minimal_subset_trace"].append(
-                {
-                    "removed_window_id": removable_window_id,
-                    "candidate_window_ids": list(candidate_ids),
-                    "decision_supported": bool(decision_supported),
-                    "objective": round(float(objective), 6),
-                }
-            )
-            if not decision_supported:
-                continue
-            previous = best_updates.get(entry_index)
-            if previous is None or float(objective) > float(previous[2]):
-                best_updates[entry_index] = (list(candidate_ids), candidate_branch, float(objective))
-        for entry_index, (candidate_ids, candidate_branch, _objective) in best_updates.items():
-            entries[entry_index]["branches"]["minimal_subset"] = candidate_branch
-            entries[entry_index]["minimal_subset_ids"] = list(candidate_ids)
-            improved = True
+                if not decision_supported:
+                    continue
+                previous = best_updates.get(entry_index)
+                if previous is None or float(objective) > float(previous[2]):
+                    best_updates[entry_index] = (list(candidate_ids), candidate_branch, float(objective))
+            for entry_index, (candidate_ids, candidate_branch, _objective) in best_updates.items():
+                entries[entry_index]["branches"]["minimal_subset"] = candidate_branch
+                entries[entry_index]["minimal_subset_ids"] = list(candidate_ids)
+                improved = True
 
     branch_requests: List[Dict[str, Any]] = []
     branch_request_meta: List[Tuple[int, str]] = []
@@ -1517,14 +2263,17 @@ def run_counterfactual_verification_batch(
                     branch_name=branch_name,
                     window_ids=spec.get("window_ids") or [],
                     max_images=int(max_images),
-                    compact_decision_only=bool(entry["compact_decision_only"]),
+                    compact_decision_only=_branch_uses_compact_decision_only(
+                        normalized_branch_profile=str(entry["normalized_branch_profile"] or ""),
+                        branch_name=str(branch_name),
+                    ),
+                    raise_on_protocol_error=False,
                 )
             )
             branch_request_meta.append((int(entry_index), str(branch_name)))
     for (entry_index, branch_name), branch in zip(branch_request_meta, _evaluate_branch_requests_batch(policy, branch_requests)):
         entries[entry_index]["branches"][branch_name] = branch
 
-    outputs: List[Dict[str, Any]] = []
     for entry in entries:
         branches = dict(entry["branches"] or {})
         active_branch_order = list(entry["active_branch_order"] or [])
@@ -1586,29 +2335,36 @@ def run_counterfactual_verification_batch(
             "branch_delta_matrix": branch_delta_matrix,
             "stage_packages": {
                 "selected_window_ids": list(entry["selected_window_ids"]),
-                "selected_by_stage": _stage_window_ids(entry["selected_records"]),
+                "selected_by_stage": copy.deepcopy(entry["selected_by_stage"]),
                 "minimal_subset_window_ids": list((branches.get("minimal_subset") or {}).get("window_ids") or []),
                 "hard_negative_window_ids": list(entry["hard_negative_ids"]),
             },
             "selection_metadata": {
                 "normalized_branch_profile": entry["normalized_branch_profile"],
+                "selected_window_count": len(entry["selected_window_ids"]),
+                "selected_record_count": len(entry["selected_records"]),
+                "selection_resolution_source": str(entry.get("selection_resolution_source") or ""),
+                "recovered_from_trace": bool(entry.get("recovered_from_trace", False)),
+                "selected_by_stage": copy.deepcopy(entry["selected_by_stage"]),
                 "stage_requirements": copy.deepcopy(stage_requirements),
                 "stage_queries": copy.deepcopy(entry["stage_queries"]),
                 "minimal_subset_trace": list(entry["minimal_subset_trace"]),
+                "full_selected_available": bool(full_selected_branch.get("available")),
+                "full_selected_parse_mode": str(full_selected_branch.get("parse_mode") or ""),
+                "full_selected_unavailable_reason": str(full_selected_branch.get("unavailable_reason") or ""),
+                "full_selected_window_ids": list(full_selected_branch.get("window_ids") or []),
                 "hard_negative_reason": str(
                     ((entry["branch_specs"].get("hard_negative_swap") or {}).get("reason")) or ""
                 ),
             },
         }
-        outputs.append(
-            {
-                "counterfactual_branches": branches,
-                "counterfactual_profile": profile,
-                "counterfactual_profile_source": entry["normalized_branch_profile"],
-                "counterfactual_branch_profile": entry["normalized_branch_profile"],
-            }
-        )
-    return outputs
+        outputs[int(entry["batch_input_index"])] = {
+            "counterfactual_branches": branches,
+            "counterfactual_profile": profile,
+            "counterfactual_profile_source": entry["normalized_branch_profile"],
+            "counterfactual_branch_profile": entry["normalized_branch_profile"],
+        }
+    return [dict(entry or {}) for entry in outputs if entry is not None]
 
 
 def run_counterfactual_verification(

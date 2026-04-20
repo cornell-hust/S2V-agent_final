@@ -9,6 +9,7 @@ import json
 import math
 import random
 import re
+import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -128,6 +129,156 @@ def _format_budgeting_stats(prefix: str, stats: BudgetingStats) -> str:
     )
 
 
+class _VisualPayloadReuseCache:
+    def __init__(
+        self,
+        *,
+        max_materialized_payloads: int = 4096,
+        max_resized_payloads: int = 8192,
+        max_content_digests: int = 4096,
+        max_candidate_examples: int = 16,
+    ):
+        self.max_materialized_payloads = max(0, int(max_materialized_payloads))
+        self.max_resized_payloads = max(0, int(max_resized_payloads))
+        self.max_content_digests = max(0, int(max_content_digests))
+        self.max_candidate_examples = max(0, int(max_candidate_examples))
+        self._materialized_payloads: "OrderedDict[str, Any]" = OrderedDict()
+        self._resized_payloads: "OrderedDict[str, Any]" = OrderedDict()
+        self._content_digest_to_provenance_keys: "OrderedDict[str, List[str]]" = OrderedDict()
+        self._candidate_examples: List[Dict[str, Any]] = []
+        self._stats: Dict[str, int] = {
+            "materialized_payload_reuse_hits": 0,
+            "materialized_payload_reuse_misses": 0,
+            "resized_payload_reuse_hits": 0,
+            "resized_payload_reuse_misses": 0,
+            "content_identical_candidate_count": 0,
+        }
+
+    def _get_payload(
+        self,
+        storage: "OrderedDict[str, Any]",
+        key: str,
+        *,
+        hit_stat: str,
+        miss_stat: str,
+    ) -> Any:
+        cached = storage.get(key)
+        if cached is None:
+            self._stats[miss_stat] += 1
+            return None
+        storage.move_to_end(key)
+        self._stats[hit_stat] += 1
+        return cached
+
+    def _store_payload(
+        self,
+        storage: "OrderedDict[str, Any]",
+        key: str,
+        value: Any,
+        *,
+        max_entries: int,
+    ) -> None:
+        if max_entries <= 0:
+            return
+        storage[key] = value
+        storage.move_to_end(key)
+        while len(storage) > max_entries:
+            storage.popitem(last=False)
+
+    def get_materialized_payload(self, provenance: Dict[str, Any]) -> Any:
+        provenance_key = _visual_provenance_cache_key(provenance)
+        return self._get_payload(
+            self._materialized_payloads,
+            provenance_key,
+            hit_stat="materialized_payload_reuse_hits",
+            miss_stat="materialized_payload_reuse_misses",
+        )
+
+    def store_materialized_payload(self, provenance: Dict[str, Any], payload: Any) -> None:
+        provenance_key = _visual_provenance_cache_key(provenance)
+        self._store_payload(
+            self._materialized_payloads,
+            provenance_key,
+            payload,
+            max_entries=self.max_materialized_payloads,
+        )
+
+    def resize_image(
+        self,
+        image: Any,
+        *,
+        provenance: Optional[Dict[str, Any]],
+        max_image_side: int = 0,
+        max_image_pixels: int = 0,
+    ) -> Any:
+        if provenance is None:
+            return _resize_image_for_training(
+                image,
+                max_image_side=max_image_side,
+                max_image_pixels=max_image_pixels,
+            )
+
+        resized_key = _hash_json_payload(
+            {
+                "provenance": provenance,
+                "max_image_side": int(max_image_side),
+                "max_image_pixels": int(max_image_pixels),
+            }
+        )
+        cached = self._get_payload(
+            self._resized_payloads,
+            resized_key,
+            hit_stat="resized_payload_reuse_hits",
+            miss_stat="resized_payload_reuse_misses",
+        )
+        if cached is not None:
+            return cached
+
+        resized = _resize_image_for_training(
+            image,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
+        )
+        self._store_payload(
+            self._resized_payloads,
+            resized_key,
+            resized,
+            max_entries=self.max_resized_payloads,
+        )
+        self._record_content_identical_candidate(resized, provenance)
+        return resized
+
+    def _record_content_identical_candidate(self, payload: Any, provenance: Dict[str, Any]) -> None:
+        if self.max_content_digests <= 0:
+            return
+        content_digest = _hash_visual_payload_content(payload)
+        provenance_key = _visual_provenance_cache_key(provenance)
+        existing = list(self._content_digest_to_provenance_keys.get(content_digest) or [])
+        if provenance_key in existing:
+            self._content_digest_to_provenance_keys.move_to_end(content_digest, last=True)
+            return
+        if existing:
+            self._stats["content_identical_candidate_count"] += 1
+            if len(self._candidate_examples) < self.max_candidate_examples:
+                self._candidate_examples.append(
+                    {
+                        "content_digest": content_digest,
+                        "existing_provenance_key": existing[0],
+                        "candidate_provenance_key": provenance_key,
+                    }
+                )
+        existing.append(provenance_key)
+        self._content_digest_to_provenance_keys[content_digest] = existing
+        self._content_digest_to_provenance_keys.move_to_end(content_digest, last=True)
+        while len(self._content_digest_to_provenance_keys) > self.max_content_digests:
+            self._content_digest_to_provenance_keys.popitem(last=False)
+
+    def snapshot_stats(self) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {key: int(value) for key, value in self._stats.items()}
+        stats["content_identical_candidate_examples"] = list(self._candidate_examples)
+        return stats
+
+
 def _frame_cache_path(video_path: Path) -> Path:
     return Path(str(video_path) + ".frame_cache")
 
@@ -138,6 +289,108 @@ def _feature_cache_path(video_path: Path) -> Path:
 
 def _print_cache_warning(message: str) -> None:
     print(f"[cache-warning] {message}", flush=True)
+
+
+def _normalize_visual_provenance_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _strip_private_fields_for_cache_key(payload)
+    if not isinstance(normalized, dict):
+        return {}
+    return {str(key): value for key, value in normalized.items()}
+
+
+def _build_image_ref_provenance(image_ref: Dict[str, Any]) -> Dict[str, Any]:
+    return _normalize_visual_provenance_payload(
+        {
+            "kind": "image_ref",
+            "video_path": str(image_ref.get("video_path") or ""),
+            "sampled_frame_index": image_ref.get("sampled_frame_index"),
+            "raw_frame_index": image_ref.get("raw_frame_index"),
+            "timestamp_sec": image_ref.get("timestamp_sec"),
+        }
+    )
+
+
+def _build_visual_item_provenance(
+    item: Dict[str, Any],
+    *,
+    feature_cache_key: str = "",
+    fallback_message_index: Optional[int] = None,
+    fallback_content_index: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    existing = item.get("_visual_provenance")
+    if isinstance(existing, dict) and existing:
+        return _normalize_visual_provenance_payload(existing)
+
+    image_ref = item.get("image_ref")
+    if isinstance(image_ref, dict) and image_ref:
+        provenance = _build_image_ref_provenance(image_ref)
+        if provenance:
+            return provenance
+
+    provenance: Dict[str, Any] = {}
+    if str(feature_cache_key or "").strip():
+        provenance["feature_cache_key"] = str(feature_cache_key)
+    message_index = item.get("_cache_message_index", fallback_message_index)
+    content_index = item.get("_cache_content_index", fallback_content_index)
+    if message_index is not None:
+        provenance["message_index"] = int(message_index)
+    if content_index is not None:
+        provenance["content_index"] = int(content_index)
+    if item.get("type") == "image":
+        for key in ("video_path", "sampled_frame_index", "raw_frame_index", "timestamp_sec"):
+            if item.get(key) is not None and item.get(key) != "":
+                provenance[key] = item.get(key)
+    normalized = _normalize_visual_provenance_payload(provenance)
+    return normalized or None
+
+
+def _visual_provenance_cache_key(provenance: Dict[str, Any]) -> str:
+    return _hash_json_payload(_normalize_visual_provenance_payload(provenance))
+
+
+def _hash_visual_payload_content(payload: Any) -> str:
+    pil_image = _to_pil_image(payload)
+    if hasattr(pil_image, "size") and hasattr(pil_image, "mode") and hasattr(pil_image, "tobytes"):
+        width, height = pil_image.size
+        digest = hashlib.sha256()
+        digest.update(f"pil:{pil_image.mode}:{int(width)}x{int(height)}".encode("utf-8"))
+        digest.update(pil_image.tobytes())
+        return digest.hexdigest()
+    if isinstance(payload, torch.Tensor):
+        tensor = payload.detach().cpu().contiguous()
+        digest = hashlib.sha256()
+        digest.update(f"tensor:{str(tensor.dtype)}:{list(tensor.shape)}".encode("utf-8"))
+        digest.update(tensor.numpy().tobytes())
+        return digest.hexdigest()
+    if isinstance(payload, np.ndarray):
+        array = np.ascontiguousarray(payload)
+        digest = hashlib.sha256()
+        digest.update(f"ndarray:{str(array.dtype)}:{list(array.shape)}".encode("utf-8"))
+        digest.update(array.tobytes())
+        return digest.hexdigest()
+    return _hash_json_payload(_strip_private_fields_for_cache_key(payload))
+
+
+def _resize_image_for_training_with_cache(
+    image: Any,
+    *,
+    provenance: Optional[Dict[str, Any]] = None,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+) -> Any:
+    if visual_payload_cache is None:
+        return _resize_image_for_training(
+            image,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
+        )
+    return visual_payload_cache.resize_image(
+        image,
+        provenance=provenance,
+        max_image_side=max_image_side,
+        max_image_pixels=max_image_pixels,
+    )
 
 
 def _iter_image_ref_video_paths(messages: Sequence[Dict[str, Any]]) -> Iterable[Path]:
@@ -669,18 +922,32 @@ def _prepare_messages(
     keep_recent_tool_image_messages: int = 0,
     max_total_images: int = 0,
     keep_recent_text_messages: int = 0,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
+    feature_cache_key: str = "",
 ) -> List[Dict[str, Any]]:
     prepared = apply_message_budget(
         messages,
         keep_recent_text_messages=keep_recent_text_messages,
         keep_recent_tool_image_messages=keep_recent_tool_image_messages,
         max_total_images=max_total_images,
+        copy_messages=False,
     )
-    for message in prepared:
-        for item in message.get("content", []):
+    for message_index, message in enumerate(prepared):
+        fallback_message_index = message.get("_cache_message_index", message_index)
+        for content_index, item in enumerate(message.get("content", [])):
             if item.get("type") == "image" and "image" in item:
-                item["image"] = _resize_image_for_training(
+                provenance = _build_visual_item_provenance(
+                    item,
+                    feature_cache_key=feature_cache_key,
+                    fallback_message_index=int(fallback_message_index),
+                    fallback_content_index=int(content_index),
+                )
+                if provenance is not None:
+                    item["_visual_provenance"] = provenance
+                item["image"] = _resize_image_for_training_with_cache(
                     item["image"],
+                    provenance=provenance,
+                    visual_payload_cache=visual_payload_cache,
                     max_image_side=max_image_side,
                     max_image_pixels=max_image_pixels,
                 )
@@ -1021,6 +1288,8 @@ def _apply_cached_message_plan(
     *,
     max_image_side: int = 0,
     max_image_pixels: int = 0,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
+    feature_cache_key: str = "",
 ) -> List[Dict[str, Any]]:
     rebuilt_messages: List[Dict[str, Any]] = []
     for entry in plan:
@@ -1040,8 +1309,18 @@ def _apply_cached_message_plan(
                 continue
             item = copy.deepcopy(source_content[int(content_index)])
             if item.get("type") == "image" and "image" in item:
-                item["image"] = _resize_image_for_training(
+                provenance = _build_visual_item_provenance(
+                    item,
+                    feature_cache_key=feature_cache_key,
+                    fallback_message_index=message_index,
+                    fallback_content_index=int(content_index),
+                )
+                if provenance is not None:
+                    item["_visual_provenance"] = provenance
+                item["image"] = _resize_image_for_training_with_cache(
                     item["image"],
+                    provenance=provenance,
+                    visual_payload_cache=visual_payload_cache,
                     max_image_side=max_image_side,
                     max_image_pixels=max_image_pixels,
                 )
@@ -1177,6 +1456,7 @@ def materialize_example_for_training(
     prepared_example.setdefault("_feature_cache_key", build_sft_tensor_cache_key(example))
     active_resolver = resolver or _FrameReferenceResolver()
     prepared_example["messages"] = active_resolver.materialize_messages(prepared_example["messages"])
+    prepared_example["_multimodal_materialization_stats"] = active_resolver.snapshot_stats()
     return prepared_example
 
 
@@ -1320,6 +1600,7 @@ def _build_episode_batch_from_feature(
     max_total_images: int = 0,
     max_seq_length: int = 0,
     keep_recent_text_messages: int = 0,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
 ) -> BatchBuildResult:
     tagged_messages = _tag_messages_for_cache(feature["messages"])
     prepared_messages = _prepare_messages(
@@ -1329,6 +1610,8 @@ def _build_episode_batch_from_feature(
         keep_recent_tool_image_messages=keep_recent_tool_image_messages,
         max_total_images=max_total_images,
         keep_recent_text_messages=keep_recent_text_messages,
+        visual_payload_cache=visual_payload_cache,
+        feature_cache_key=str(feature.get("_feature_cache_key") or ""),
     )
     fitted_messages, full_text, full_inputs = _fit_episode_messages_to_budget(
         processor,
@@ -1385,105 +1668,158 @@ def _build_pure_grpo_tensor_pack_from_episode_feature(
     max_total_images: int = 0,
     max_seq_length: int = 0,
     keep_recent_text_messages: int = 0,
+    ) -> BatchBuildResult:
+    del processor
+    del feature
+    del max_image_side
+    del max_image_pixels
+    del keep_recent_tool_image_messages
+    del max_total_images
+    del max_seq_length
+    del keep_recent_text_messages
+    raise ValueError(
+        "Active RL trace-only episode features are no longer supported; use message-only `messages` + "
+        "`assistant_supervision` trajectory features."
+    )
+
+
+def _build_message_only_completion_episode_spec_from_feature(
+    processor: Any,
+    feature: Dict[str, Any],
+    *,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+    keep_recent_tool_image_messages: int = 0,
+    max_total_images: int = 0,
+    max_seq_length: int = 0,
+    keep_recent_text_messages: int = 0,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
 ) -> BatchBuildResult:
-    prompt_trace = feature.get("episode_prompt_trace")
-    assistant_traces = list(feature.get("episode_assistant_traces") or [])
-    if not isinstance(prompt_trace, dict) or not assistant_traces:
+    episode_batch_result = _build_episode_batch_from_feature(
+        processor,
+        feature,
+        max_image_side=max_image_side,
+        max_image_pixels=max_image_pixels,
+        keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+        max_total_images=max_total_images,
+        max_seq_length=max_seq_length,
+        keep_recent_text_messages=keep_recent_text_messages,
+        visual_payload_cache=visual_payload_cache,
+    )
+    batch = episode_batch_result.batch
+    if batch is None:
+        return episode_batch_result
+
+    input_ids = batch.get("input_ids")
+    attention_mask = batch.get("attention_mask")
+    labels = batch.get("labels")
+    token_advantages = batch.get("token_advantages")
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or not isinstance(attention_mask, torch.Tensor)
+        or not isinstance(labels, torch.Tensor)
+        or not isinstance(token_advantages, torch.Tensor)
+    ):
         return BatchBuildResult(
             batch=None,
             cached_plan=None,
             completion_token_count=0,
-            drop_reason="missing_pure_pack_materials",
-            budgeting_attempted=False,
+            drop_reason="missing_episode_message_tensors",
+            budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
             is_episode_feature=True,
         )
-    if not isinstance(prompt_trace.get("prompt_ids"), torch.Tensor) or not isinstance(prompt_trace.get("prompt_mask"), torch.Tensor):
-        return BatchBuildResult(
-            batch=None,
-            cached_plan=None,
-            completion_token_count=0,
-            drop_reason="missing_pure_pack_prompt",
-            budgeting_attempted=False,
-            is_episode_feature=True,
-        )
-    completion_ids_list: List[torch.Tensor] = []
-    completion_mask_list: List[torch.Tensor] = []
-    for trace in assistant_traces:
-        if not isinstance(trace, dict):
-            continue
-        completion_ids = trace.get("completion_ids")
-        completion_mask = trace.get("completion_mask")
-        if isinstance(completion_ids, torch.Tensor) and isinstance(completion_mask, torch.Tensor):
-            completion_ids_list.append(completion_ids.detach().cpu())
-            completion_mask_list.append(completion_mask.detach().cpu().to(dtype=torch.bool))
-    if not completion_ids_list:
+
+    response_positions = labels.ne(-100)
+    if not bool(torch.any(response_positions)):
         return BatchBuildResult(
             batch=None,
             cached_plan=None,
             completion_token_count=0,
             drop_reason="zero_response_after_budgeting",
-            budgeting_attempted=False,
+            budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
             is_episode_feature=True,
         )
-    prompt_ids = prompt_trace["prompt_ids"].detach().cpu()
-    prompt_mask = prompt_trace["prompt_mask"].detach().cpu()
-    completion_ids = torch.cat(completion_ids_list, dim=-1)
-    completion_mask = torch.cat(completion_mask_list, dim=-1)
-    pack: Dict[str, Any] = {
-        "prompt_ids": prompt_ids,
-        "prompt_mask": prompt_mask,
-        "completion_ids": completion_ids,
-        "completion_mask": completion_mask,
-        "advantages": torch.tensor([float(feature.get("advantages", feature.get("advantage", feature.get("sample_weight", 1.0))) or 0.0)], dtype=torch.float32),
+
+    response_indices = response_positions.nonzero(as_tuple=False)
+    if response_indices.numel() <= 0:
+        return BatchBuildResult(
+            batch=None,
+            cached_plan=None,
+            completion_token_count=0,
+            drop_reason="zero_response_after_budgeting",
+            budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
+            is_episode_feature=True,
+        )
+    suffix_start = int(response_indices[:, 1].min().item())
+    if suffix_start <= 0:
+        return BatchBuildResult(
+            batch=None,
+            cached_plan=None,
+            completion_token_count=int(response_positions.sum().item()),
+            drop_reason="zero_prompt_after_budgeting",
+            budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
+            is_episode_feature=True,
+        )
+
+    prompt_ids = input_ids[:, :suffix_start].clone()
+    prompt_mask = attention_mask[:, :suffix_start].clone()
+    completion_ids = input_ids[:, suffix_start:].clone()
+    completion_mask = attention_mask[:, suffix_start:].clone().to(dtype=torch.bool)
+
+    if "advantages" in feature:
+        raise ValueError(
+            "Active RL message-only episode features must use singular `advantage`; legacy plural `advantages` is no longer supported."
+        )
+    if "advantage" not in feature:
+        raise ValueError("Active RL message-only episode features must include singular `advantage`.")
+    base_advantage = float(feature.get("advantage") or 0.0)
+    shifted_token_advantages = token_advantages[:, suffix_start:].clone().to(dtype=torch.float32)
+    if abs(base_advantage) > 1e-8:
+        token_loss_weight = (shifted_token_advantages / float(base_advantage)).abs()
+    else:
+        token_loss_weight = labels[:, suffix_start:].ne(-100).to(dtype=torch.float32)
+    token_loss_weight = token_loss_weight * completion_mask.to(dtype=torch.float32)
+
+    episode_spec: Dict[str, Any] = {
+        "prompt_ids": prompt_ids.detach().cpu(),
+        "prompt_mask": prompt_mask.detach().cpu(),
+        "completion_ids": completion_ids.detach().cpu(),
+        "completion_mask": completion_mask.detach().cpu(),
+        "prompt_token_count": torch.tensor([int(prompt_ids.shape[-1])], dtype=torch.long),
+        "completion_token_count": torch.tensor([int(completion_mask.sum().item())], dtype=torch.long),
+        "sample_weight": torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32),
+        "advantage": torch.tensor([float(base_advantage)], dtype=torch.float32),
         "old_policy_token_log_probs": None,
+        "token_loss_weight": token_loss_weight.detach().cpu(),
+        "sample_loss_multiplier": torch.tensor(
+            [float(feature.get("sample_loss_multiplier", 1.0))],
+            dtype=torch.float32,
+        ),
     }
-    for key, value in prompt_trace.items():
-        if key in {"input_ids", "attention_mask"}:
+    for key, value in batch.items():
+        if key in {
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "completion_mask",
+            "completion_token_count",
+            "sample_weight",
+            "advantage",
+            "token_advantages",
+        }:
             continue
         if isinstance(value, torch.Tensor):
-            pack[key] = value.detach().cpu()
+            episode_spec[key] = value.detach().cpu()
+        else:
+            episode_spec[key] = copy.deepcopy(value)
     return BatchBuildResult(
-        batch=pack,
+        batch=episode_spec,
         cached_plan=None,
         completion_token_count=int(completion_mask.sum().item()),
         drop_reason=None,
-        budgeting_attempted=False,
+        budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
         is_episode_feature=True,
     )
-
-
-def _extract_assistant_text(message: Dict[str, Any]) -> str:
-    texts: List[str] = []
-    for item in list(message.get("content") or []):
-        if item.get("type") == "text":
-            texts.append(str(item.get("text") or ""))
-    return "".join(texts).strip()
-
-
-def _coerce_rl_prompt_completion_feature(
-    feature: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], str]:
-    prompt_messages = feature.get("prompt_messages")
-    completion_text = str(feature.get("completion_text") or "").strip()
-    if isinstance(prompt_messages, list) and completion_text:
-        return copy.deepcopy(prompt_messages), completion_text
-
-    messages = copy.deepcopy(list(feature.get("messages") or []))
-    if not messages:
-        raise ValueError("RL completion-native batching requires prompt_messages or legacy messages.")
-
-    target_response = str(feature.get("target_response") or "").strip()
-    last_message = messages[-1]
-    last_role = str(last_message.get("role") or "")
-    last_assistant_text = _extract_assistant_text(last_message) if last_role == "assistant" else ""
-    if not completion_text:
-        completion_text = target_response or last_assistant_text
-    if not completion_text:
-        raise ValueError("RL completion-native batching requires a non-empty completion_text/target_response.")
-
-    if last_role == "assistant" and last_assistant_text == completion_text:
-        messages = messages[:-1]
-    return messages, completion_text
 
 
 def _build_rl_completion_episode_spec_from_feature(
@@ -1496,157 +1832,33 @@ def _build_rl_completion_episode_spec_from_feature(
     max_total_images: int = 0,
     max_seq_length: int = 0,
     keep_recent_text_messages: int = 0,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
 ) -> BatchBuildResult:
-    if isinstance(feature.get("episode_prompt_trace"), dict) and isinstance(feature.get("episode_assistant_traces"), list):
-        return _build_pure_grpo_tensor_pack_from_episode_feature(
-            processor,
-            feature,
-            max_image_side=max_image_side,
-            max_image_pixels=max_image_pixels,
-            keep_recent_tool_image_messages=keep_recent_tool_image_messages,
-            max_total_images=max_total_images,
-            max_seq_length=max_seq_length,
-            keep_recent_text_messages=keep_recent_text_messages,
+    if "advantages" in feature:
+        raise ValueError(
+            "Active RL completion episode specs must use singular `advantage`; legacy plural `advantages` is no longer supported."
         )
-
-    token_trace_spec = feature.get("rl_token_trace_spec")
-    if isinstance(token_trace_spec, dict):
-        required_tensor_keys = (
-            "prompt_ids",
-            "prompt_mask",
-            "completion_ids",
-            "completion_mask",
+    if not _is_episode_feature(feature):
+        raise ValueError(
+            "Active RL completion episode specs require message-only `messages` + `assistant_supervision`; "
+            "trace-only episode features are no longer supported."
         )
-        if not all(isinstance(token_trace_spec.get(key), torch.Tensor) for key in required_tensor_keys):
-            return BatchBuildResult(
-                batch=None,
-                cached_plan=None,
-                completion_token_count=0,
-                drop_reason="missing_token_trace_spec",
-                budgeting_attempted=False,
-                is_episode_feature=True,
-            )
-        completion_token_count = int(token_trace_spec["completion_ids"].shape[-1])
-        episode_spec: Dict[str, Any] = {
-            "sample_weight": torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32),
-            "advantage": torch.tensor(
-                [float(feature.get("advantage", feature.get("sample_weight", 1.0)) or 0.0)],
-                dtype=torch.float32,
-            ),
-        }
-        for key, value in token_trace_spec.items():
-            if isinstance(value, torch.Tensor):
-                episode_spec[key] = value.detach().cpu()
-            else:
-                episode_spec[key] = copy.deepcopy(value)
-        episode_spec.setdefault(
-            "prompt_token_count",
-            torch.tensor([int(token_trace_spec["prompt_ids"].shape[-1])], dtype=torch.long),
+    if not list(feature.get("messages") or []) or not list(feature.get("assistant_supervision") or []):
+        raise ValueError(
+            "Active RL completion episode specs require non-empty `messages` and `assistant_supervision`."
         )
-        episode_spec.setdefault(
-            "completion_token_count",
-            torch.tensor([int(completion_token_count)], dtype=torch.long),
-        )
-        return BatchBuildResult(
-            batch=episode_spec,
-            cached_plan=None,
-            completion_token_count=int(completion_token_count),
-            drop_reason=None,
-            budgeting_attempted=False,
-            is_episode_feature=True,
-        )
-
-    prompt_messages_raw, completion_text = _coerce_rl_prompt_completion_feature(feature)
-    tagged_messages = _tag_messages_for_cache(prompt_messages_raw)
-    prompt_messages = _prepare_messages(
-        tagged_messages,
+    if "advantage" not in feature:
+        raise ValueError("Active RL message-only episode features must include singular `advantage`.")
+    return _build_message_only_completion_episode_spec_from_feature(
+        processor,
+        feature,
         max_image_side=max_image_side,
         max_image_pixels=max_image_pixels,
         keep_recent_tool_image_messages=keep_recent_tool_image_messages,
         max_total_images=max_total_images,
-        keep_recent_text_messages=keep_recent_text_messages,
-    )
-    prompt_messages, full_messages, prompt_text, full_text, full_inputs = _fit_messages_to_budget(
-        processor,
-        prompt_messages,
-        target_response=completion_text,
         max_seq_length=max_seq_length,
-        truncation_side="left",
-    )
-
-    retained_prompt_tokens, retained_completion_tokens, completion_token_count_total = (
-        _resolve_retained_prompt_completion_lengths(
-            processor=processor,
-            prompt_messages=prompt_messages,
-            full_messages=full_messages,
-            prompt_text=prompt_text,
-            full_text=full_text,
-            retained_full_inputs=full_inputs,
-        )
-    )
-
-    if retained_completion_tokens <= 0:
-        return BatchBuildResult(
-            batch=None,
-            cached_plan=None,
-            completion_token_count=0,
-            drop_reason="zero_response_after_budgeting",
-            budgeting_attempted=True,
-            is_episode_feature=True,
-        )
-    if retained_prompt_tokens <= 0:
-        return BatchBuildResult(
-            batch=None,
-            cached_plan=None,
-            completion_token_count=int(retained_completion_tokens),
-            drop_reason="zero_prompt_after_budgeting",
-            budgeting_attempted=True,
-            is_episode_feature=True,
-        )
-    if retained_completion_tokens < completion_token_count_total:
-        return BatchBuildResult(
-            batch=None,
-            cached_plan=None,
-            completion_token_count=int(retained_completion_tokens),
-            drop_reason="truncated_completion_after_budgeting",
-            budgeting_attempted=True,
-            is_episode_feature=True,
-        )
-
-    input_ids = full_inputs["input_ids"]
-    attention_mask = full_inputs["attention_mask"]
-    prompt_ids = input_ids[:, :retained_prompt_tokens].clone()
-    prompt_mask = attention_mask[:, :retained_prompt_tokens].clone()
-    completion_ids = input_ids[:, retained_prompt_tokens:].clone()
-    completion_mask = attention_mask[:, retained_prompt_tokens:].clone()
-
-    episode_spec: Dict[str, Any] = {
-        "prompt_ids": prompt_ids.detach().cpu(),
-        "prompt_mask": prompt_mask.detach().cpu(),
-        "completion_ids": completion_ids.detach().cpu(),
-        "completion_mask": completion_mask.detach().cpu(),
-        "prompt_token_count": torch.tensor([int(retained_prompt_tokens)], dtype=torch.long),
-        "completion_token_count": torch.tensor([int(retained_completion_tokens)], dtype=torch.long),
-        "sample_weight": torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32),
-        "advantage": torch.tensor(
-            [float(feature.get("advantage", feature.get("sample_weight", 1.0)) or 0.0)],
-            dtype=torch.float32,
-        ),
-    }
-    for key, value in full_inputs.items():
-        if key in {"input_ids", "attention_mask"}:
-            continue
-        if isinstance(value, torch.Tensor):
-            episode_spec[key] = value.detach().cpu()
-        else:
-            episode_spec[key] = copy.deepcopy(value)
-    return BatchBuildResult(
-        batch=episode_spec,
-        cached_plan=None,
-        completion_token_count=int(retained_completion_tokens),
-        drop_reason=None,
-        budgeting_attempted=True,
-        is_episode_feature=True,
+        keep_recent_text_messages=keep_recent_text_messages,
+        visual_payload_cache=visual_payload_cache,
     )
 
 
@@ -1661,6 +1873,7 @@ def _build_batch_from_feature(
     max_seq_length: int = 0,
     keep_recent_text_messages: int = 0,
     cached_plan: Optional[Dict[str, Any]] = None,
+    visual_payload_cache: Optional[_VisualPayloadReuseCache] = None,
 ) -> BatchBuildResult:
     if _is_episode_feature(feature):
         return _build_episode_batch_from_feature(
@@ -1672,6 +1885,7 @@ def _build_batch_from_feature(
             max_total_images=max_total_images,
             max_seq_length=max_seq_length,
             keep_recent_text_messages=keep_recent_text_messages,
+            visual_payload_cache=visual_payload_cache,
         )
     if cached_plan is not None:
         prompt_messages = _apply_cached_message_plan(
@@ -1679,6 +1893,8 @@ def _build_batch_from_feature(
             list(cached_plan.get("message_plan") or []),
             max_image_side=max_image_side,
             max_image_pixels=max_image_pixels,
+            visual_payload_cache=visual_payload_cache,
+            feature_cache_key=str(feature.get("_feature_cache_key") or ""),
         )
         target_message = {"role": "assistant", "content": [{"type": "text", "text": feature["target_response"]}]}
         full_messages = prompt_messages + [target_message]
@@ -1701,6 +1917,8 @@ def _build_batch_from_feature(
             keep_recent_tool_image_messages=keep_recent_tool_image_messages,
             max_total_images=max_total_images,
             keep_recent_text_messages=keep_recent_text_messages,
+            visual_payload_cache=visual_payload_cache,
+            feature_cache_key=str(feature.get("_feature_cache_key") or ""),
         )
         prompt_messages, full_messages, prompt_text, full_text, full_inputs = _fit_messages_to_budget(
             processor,
@@ -1768,6 +1986,8 @@ class _FrameReferenceResolver:
         self._frame_cache_tensors: "OrderedDict[str, Optional[torch.Tensor]]" = OrderedDict()
         self._frame_cache_status: "OrderedDict[str, str]" = OrderedDict()
         self._decord_readers: "OrderedDict[str, Any]" = OrderedDict()
+        self._resolved_image_ref_tensors: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        self._resolved_image_ref_digest_to_provenance: Dict[str, str] = {}
         self._logged_raw_frame_fallbacks: set[tuple[str, str, str]] = set()
         self._stats: Dict[str, int] = {
             "frame_cache_hits": 0,
@@ -1777,6 +1997,8 @@ class _FrameReferenceResolver:
             "sampled_frame_index_out_of_range": 0,
             "cache_load_error": 0,
             "cache_invalid": 0,
+            "provenance_reuse_hits": 0,
+            "content_identical_candidate_count": 0,
         }
 
     def snapshot_stats(self) -> Dict[str, int]:
@@ -1789,8 +2011,55 @@ class _FrameReferenceResolver:
                 image_ref = item.pop("image_ref", None)
                 if item.get("type") != "image" or image_ref is None:
                     continue
-                item["image"] = self._resolve_image_ref(image_ref)
+                provenance = _build_image_ref_provenance(image_ref)
+                if provenance:
+                    item["_visual_provenance"] = provenance
+                item["image"] = self._resolve_image_ref_with_provenance_cache(image_ref)
         return materialized
+
+    def _resolve_image_ref_with_provenance_cache(self, image_ref: Dict[str, Any]) -> torch.Tensor:
+        provenance_key = self._image_ref_provenance_key(image_ref)
+        cached_tensor = self._resolved_image_ref_tensors.get(provenance_key)
+        if cached_tensor is not None:
+            self._resolved_image_ref_tensors.move_to_end(provenance_key)
+            self._stats["provenance_reuse_hits"] += 1
+            return cached_tensor
+
+        resolved_tensor = self._resolve_image_ref(image_ref)
+        self._resolved_image_ref_tensors[provenance_key] = resolved_tensor
+        self._resolved_image_ref_tensors.move_to_end(provenance_key)
+        if len(self._resolved_image_ref_tensors) > 512:
+            self._resolved_image_ref_tensors.popitem(last=False)
+        self._record_content_identical_candidate(provenance_key, resolved_tensor)
+        return resolved_tensor
+
+    def _image_ref_provenance_key(self, image_ref: Dict[str, Any]) -> str:
+        provenance = _build_image_ref_provenance(image_ref)
+        if provenance:
+            return _visual_provenance_cache_key(provenance)
+        try:
+            return json.dumps(dict(image_ref or {}), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        except Exception:
+            return repr(dict(image_ref or {}))
+
+    def _record_content_identical_candidate(self, provenance_key: str, tensor: torch.Tensor) -> None:
+        tensor_digest = self._tensor_content_digest(tensor)
+        previous_provenance = self._resolved_image_ref_digest_to_provenance.get(tensor_digest)
+        if previous_provenance is not None and previous_provenance != provenance_key:
+            self._stats["content_identical_candidate_count"] += 1
+            return
+        self._resolved_image_ref_digest_to_provenance[tensor_digest] = provenance_key
+
+    def _tensor_content_digest(self, tensor: torch.Tensor) -> str:
+        materialized = tensor.detach()
+        if materialized.device.type != "cpu":
+            materialized = materialized.cpu()
+        materialized = materialized.contiguous()
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str(materialized.dtype).encode("utf-8"))
+        digest.update(repr(tuple(int(dim) for dim in materialized.shape)).encode("utf-8"))
+        digest.update(materialized.numpy().tobytes())
+        return digest.hexdigest()
 
     def _resolve_image_ref(self, image_ref: Dict[str, Any]) -> torch.Tensor:
         video_path = Path(str(image_ref.get("video_path") or ""))
@@ -2997,6 +3266,32 @@ def compute_completion_only_token_log_probs_from_ids(
             "completion-only forward requires the current model forward() to accept logits_to_keep."
         )
 
+    model_inputs, logits_to_keep = build_completion_only_model_inputs(
+        prompt_ids=prompt_ids,
+        prompt_mask=prompt_mask,
+        completion_ids=completion_ids,
+        completion_mask=completion_mask,
+        multimodal_inputs=multimodal_inputs,
+    )
+    return compute_completion_only_token_log_probs_from_prepared_inputs(
+        model=model,
+        model_inputs=model_inputs,
+        completion_ids=completion_ids,
+        completion_mask=completion_mask,
+        logits_to_keep=logits_to_keep,
+        temperature=temperature,
+        log_runtime_details=True,
+    )
+
+
+def build_completion_only_model_inputs(
+    *,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    multimodal_inputs: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], int]:
     input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
     attention_mask = torch.cat([prompt_mask, completion_mask.to(dtype=prompt_mask.dtype)], dim=-1)
     model_inputs = dict(multimodal_inputs or {})
@@ -3007,16 +3302,93 @@ def compute_completion_only_token_log_probs_from_ids(
         }
     )
     logits_to_keep = int(completion_ids.shape[-1]) + 1
-    outputs = model(**model_inputs, logits_to_keep=logits_to_keep)
+    return model_inputs, logits_to_keep
+
+
+def compute_completion_only_token_log_probs_from_prepared_inputs(
+    *,
+    model: Any,
+    model_inputs: Dict[str, Any],
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    logits_to_keep: int,
+    temperature: Optional[float] = None,
+    log_runtime_details: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    response_mask = completion_mask.to(dtype=torch.bool)
+    empty_token_log_probs = completion_ids.new_zeros(completion_ids.shape, dtype=torch.float32)
+    if not torch.any(response_mask):
+        return empty_token_log_probs, response_mask
+
+    if not _model_supports_logits_to_keep(model):
+        raise RuntimeError(
+            "completion-only forward requires the current model forward() to accept logits_to_keep."
+        )
+
+    input_ids = model_inputs.get("input_ids")
+    attention_mask = model_inputs.get("attention_mask")
+    if not isinstance(input_ids, torch.Tensor) or not isinstance(attention_mask, torch.Tensor):
+        raise ValueError("prepared completion-only forward requires tensor input_ids and attention_mask.")
+
+    prompt_token_count = int(input_ids.shape[-1]) - int(completion_ids.shape[-1])
+    if prompt_token_count <= 0:
+        raise ValueError("prepared completion-only forward requires at least one retained prompt token.")
+
+    if log_runtime_details:
+        def _summarize_value(value):
+            if isinstance(value, torch.Tensor):
+                return {
+                    "shape": tuple(int(v) for v in value.shape),
+                    "dtype": str(value.dtype).replace("torch.", ""),
+                    "device": str(value.device),
+                }
+            if isinstance(value, dict):
+                return {str(k): _summarize_value(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return {"type": "list", "len": len(value)}
+            if isinstance(value, tuple):
+                return {"type": "tuple", "len": len(value)}
+            return type(value).__name__
+
+        multimodal_summary = {
+            str(key): _summarize_value(value)
+            for key, value in model_inputs.items()
+            if str(key) not in {"input_ids", "attention_mask"}
+        }
+        helper_forward_start = time.perf_counter()
+        runtime_log(
+            "rl completion_only helper before model forward: "
+            f"batch_size={int(input_ids.shape[0])} "
+            f"prompt_tokens={prompt_token_count} "
+            f"completion_tokens={int(completion_ids.shape[-1])} "
+            f"total_tokens={int(input_ids.shape[-1])} "
+            f"logits_to_keep={int(logits_to_keep)} "
+            f"multimodal_keys={sorted(multimodal_summary.keys())} "
+            f"multimodal_summary={multimodal_summary}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
+    else:
+        helper_forward_start = None
+
+    outputs = model(**model_inputs, logits_to_keep=int(logits_to_keep))
+    if log_runtime_details:
+        runtime_log(
+            "rl completion_only helper after model forward: "
+            f"batch_size={int(input_ids.shape[0])} "
+            f"elapsed_sec={time.perf_counter() - helper_forward_start:.3f}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise RuntimeError("completion-only forward expected model outputs to expose `.logits`.")
-    if int(logits.shape[-2]) < logits_to_keep:
+    if int(logits.shape[-2]) < int(logits_to_keep):
         raise RuntimeError(
             "completion-only forward expected the model to honor logits_to_keep="
-            f"{logits_to_keep}, but received logits with seq_len={int(logits.shape[-2])}."
+            f"{int(logits_to_keep)}, but received logits with seq_len={int(logits.shape[-2])}."
         )
-    logits = logits[:, -logits_to_keep:, :]
+    logits = logits[:, -int(logits_to_keep) :, :]
     shift_logits = logits[:, :-1, :]
     if int(shift_logits.shape[-2]) != int(completion_ids.shape[-1]):
         raise RuntimeError("completion-only forward produced logits that do not align with completion_ids.")
@@ -3910,9 +4282,9 @@ def create_trainer(
                         if token_advantages is not None:
                             outputs.token_advantages = token_advantages
                         return (loss, outputs) if return_outputs else loss
-                    effective_advantage = advantage if advantage is not None else sample_weight
+                    effective_advantage = advantage
                     if effective_advantage is None:
-                        raise ValueError("GRPO training requires `advantage` or `sample_weight` in each batch.")
+                        raise ValueError("GRPO training requires singular `advantage` in each batch.")
                     if self.old_policy_model is None:
                         raise ValueError("GRPO training requires a frozen old_policy_model.")
                     model_inputs = {key: value for key, value in inputs.items() if key != "labels"}

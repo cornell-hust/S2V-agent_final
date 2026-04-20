@@ -39,4 +39,5 @@ hf_home/
 .DS_Store
 tests/
 wandb/
-AGENTS.md
+/AGENTS.md
+/.omx

@@ -4,6 +4,11 @@ import copy
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+try:
+    import torch
+except Exception:  # pragma: no cover - torch is available in training runtimes
+    torch = None  # type: ignore[assignment]
+
 
 _TIMESTAMP_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)?s\s*$")
 
@@ -119,6 +124,295 @@ def _protected_scan_timeline_image_positions(messages: List[Dict[str, Any]]) -> 
         for content_index, item in enumerate(content)
         if is_image_item(item)
     }
+
+
+def _content_frame_count(item: Dict[str, Any]) -> int:
+    if is_image_item(item):
+        return 1
+    if not is_video_item(item):
+        return 0
+    if "video_ref" in item and isinstance(item.get("video_ref"), dict):
+        video_ref = dict(item.get("video_ref") or {})
+        for key in ("nframes", "num_frames", "max_frames"):
+            value = video_ref.get(key)
+            if value is None:
+                continue
+            try:
+                return max(1, int(value))
+            except Exception:
+                continue
+        return 1
+    video = item.get("video")
+    if isinstance(video, (list, tuple)):
+        return max(1, len(video))
+    if torch is not None and isinstance(video, torch.Tensor):
+        if video.ndim <= 0:
+            return 1
+        return max(1, int(video.shape[0]))
+    if isinstance(video, dict):
+        for key in ("nframes", "num_frames", "max_frames"):
+            value = video.get(key)
+            if value is None:
+                continue
+            try:
+                return max(1, int(value))
+            except Exception:
+                continue
+    for key in ("nframes", "num_frames", "max_frames"):
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            return max(1, int(value))
+        except Exception:
+            continue
+    return 1
+
+
+def _uniform_keep_positions(total_count: int, keep_count: int) -> Set[int]:
+    total_count = max(0, int(total_count))
+    keep_count = max(0, min(int(keep_count), total_count))
+    if keep_count >= total_count:
+        return set(range(total_count))
+    if keep_count <= 0:
+        return set()
+    if keep_count == 1:
+        return {total_count - 1}
+    selected: Set[int] = set()
+    for slot in range(keep_count):
+        position = int(round(slot * (total_count - 1) / float(keep_count - 1)))
+        selected.add(max(0, min(total_count - 1, position)))
+    while len(selected) < keep_count:
+        for position in range(total_count - 1, -1, -1):
+            selected.add(position)
+            if len(selected) >= keep_count:
+                break
+    return selected
+
+
+def _trim_video_item_frames(item: Dict[str, Any], keep_subindices: List[int]) -> Dict[str, Any]:
+    trimmed = dict(item)
+    keep_subindices = sorted({int(index) for index in keep_subindices if int(index) >= 0})
+    if not keep_subindices:
+        return trimmed
+    if "video_ref" in trimmed and isinstance(trimmed.get("video_ref"), dict):
+        video_ref = dict(trimmed.get("video_ref") or {})
+        kept_count = len(keep_subindices)
+        video_ref["nframes"] = int(kept_count)
+        max_frames_value = video_ref.get("max_frames")
+        if max_frames_value is not None:
+            try:
+                video_ref["max_frames"] = min(int(max_frames_value), int(kept_count))
+            except Exception:
+                video_ref["max_frames"] = int(kept_count)
+        trimmed["video_ref"] = video_ref
+        return trimmed
+    video = trimmed.get("video")
+    if isinstance(video, list):
+        trimmed["video"] = [video[index] for index in keep_subindices if 0 <= index < len(video)]
+        return trimmed
+    if isinstance(video, tuple):
+        trimmed["video"] = tuple(video[index] for index in keep_subindices if 0 <= index < len(video))
+        return trimmed
+    if torch is not None and isinstance(video, torch.Tensor) and video.ndim > 0:
+        index_tensor = torch.tensor(
+            [index for index in keep_subindices if 0 <= index < int(video.shape[0])],
+            dtype=torch.long,
+            device=video.device,
+        )
+        trimmed["video"] = video.index_select(0, index_tensor)
+        return trimmed
+    if isinstance(video, dict):
+        kept_count = len(keep_subindices)
+        copied = dict(video)
+        copied["nframes"] = int(kept_count)
+        max_frames_value = copied.get("max_frames")
+        if max_frames_value is not None:
+            try:
+                copied["max_frames"] = min(int(max_frames_value), int(kept_count))
+            except Exception:
+                copied["max_frames"] = int(kept_count)
+        trimmed["video"] = copied
+        return trimmed
+    kept_count = len(keep_subindices)
+    trimmed["nframes"] = int(kept_count)
+    if "max_frames" in trimmed:
+        try:
+            trimmed["max_frames"] = min(int(trimmed.get("max_frames") or kept_count), int(kept_count))
+        except Exception:
+            trimmed["max_frames"] = int(kept_count)
+    return trimmed
+
+
+def _collect_frame_units(messages: List[Dict[str, Any]]) -> List[Tuple[int, int, int]]:
+    frame_units: List[Tuple[int, int, int]] = []
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_index, item in enumerate(content):
+            if not isinstance(item, dict):
+                continue
+            frame_count = _content_frame_count(item)
+            for subindex in range(frame_count):
+                frame_units.append((int(message_index), int(content_index), int(subindex)))
+    return frame_units
+
+
+def cap_tool_message_frames(
+    messages: List[Dict[str, Any]],
+    *,
+    max_tool_message_frames: int = 0,
+    copy_messages: bool = True,
+) -> List[Dict[str, Any]]:
+    if copy_messages:
+        prepared = copy.deepcopy(messages)
+    else:
+        prepared = messages
+    max_tool_message_frames = int(max_tool_message_frames)
+    if max_tool_message_frames <= 0:
+        return prepared
+
+    for message_index, message in enumerate(prepared):
+        if str(message.get("role") or "") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        frame_units = [
+            (content_index, subindex)
+            for content_index, item in enumerate(content)
+            if isinstance(item, dict)
+            for subindex in range(_content_frame_count(item))
+        ]
+        if len(frame_units) <= max_tool_message_frames:
+            continue
+        keep_unit_positions = _uniform_keep_positions(len(frame_units), max_tool_message_frames)
+        keep_subindices_by_content: Dict[int, List[int]] = {}
+        for unit_position, (content_index, subindex) in enumerate(frame_units):
+            if unit_position in keep_unit_positions:
+                keep_subindices_by_content.setdefault(int(content_index), []).append(int(subindex))
+        removals: Set[int] = set()
+        updated_content = list(content)
+        for content_index, item in enumerate(content):
+            if not isinstance(item, dict):
+                continue
+            frame_count = _content_frame_count(item)
+            if frame_count <= 0:
+                continue
+            kept_subindices = keep_subindices_by_content.get(int(content_index), [])
+            if not kept_subindices:
+                removals.update(paired_multimodal_removal_indices(content, content_index))
+                continue
+            if is_video_item(item) and len(kept_subindices) < frame_count:
+                updated_content[content_index] = _trim_video_item_frames(item, kept_subindices)
+        if removals:
+            updated_content = [item for idx, item in enumerate(updated_content) if idx not in removals]
+        prepared[message_index]["content"] = updated_content
+    return prepared
+
+
+def cap_total_video_frames(
+    messages: List[Dict[str, Any]],
+    *,
+    max_total_video_frames: int = 0,
+    copy_messages: bool = True,
+) -> List[Dict[str, Any]]:
+    if copy_messages:
+        prepared = copy.deepcopy(messages)
+    else:
+        prepared = messages
+    max_total_video_frames = int(max_total_video_frames)
+    if max_total_video_frames <= 0:
+        return prepared
+
+    frame_units = _collect_frame_units(prepared)
+    if len(frame_units) <= max_total_video_frames:
+        return prepared
+
+    keep_unit_positions = set(range(len(frame_units) - max_total_video_frames, len(frame_units)))
+    protected_message_index = _latest_scan_timeline_tool_message_index(prepared)
+    if protected_message_index is not None:
+        protected_unit_positions = [
+            position
+            for position, (message_index, _, _) in enumerate(frame_units)
+            if int(message_index) == int(protected_message_index)
+        ]
+        if protected_unit_positions and not any(position in keep_unit_positions for position in protected_unit_positions):
+            removable_positions = [
+                position
+                for position in sorted(keep_unit_positions)
+                if frame_units[position][0] != int(protected_message_index)
+            ]
+            if removable_positions:
+                keep_unit_positions.remove(removable_positions[0])
+                keep_unit_positions.add(protected_unit_positions[-1])
+
+    keep_subindices_by_item: Dict[Tuple[int, int], List[int]] = {}
+    for position, (message_index, content_index, subindex) in enumerate(frame_units):
+        if position in keep_unit_positions:
+            keep_subindices_by_item.setdefault((int(message_index), int(content_index)), []).append(int(subindex))
+
+    for message_index, message in enumerate(prepared):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        removals: Set[int] = set()
+        updated_content = list(content)
+        for content_index, item in enumerate(content):
+            if not isinstance(item, dict):
+                continue
+            frame_count = _content_frame_count(item)
+            if frame_count <= 0:
+                continue
+            kept_subindices = keep_subindices_by_item.get((int(message_index), int(content_index)), [])
+            if not kept_subindices:
+                removals.update(paired_multimodal_removal_indices(content, content_index))
+                continue
+            if is_video_item(item) and len(kept_subindices) < frame_count:
+                updated_content[content_index] = _trim_video_item_frames(item, kept_subindices)
+        if removals:
+            updated_content = [item for idx, item in enumerate(updated_content) if idx not in removals]
+        prepared[message_index]["content"] = updated_content
+    return prepared
+
+
+def summarize_visual_budget(messages: List[Dict[str, Any]]) -> Dict[str, int]:
+    summary = {
+        "message_count": 0,
+        "tool_message_count": 0,
+        "image_item_count": 0,
+        "video_item_count": 0,
+        "total_frame_count": 0,
+        "user_frame_count": 0,
+        "tool_frame_count": 0,
+    }
+    for message in list(messages or []):
+        if not isinstance(message, dict):
+            continue
+        summary["message_count"] += 1
+        role = str(message.get("role") or "")
+        if role == "tool":
+            summary["tool_message_count"] += 1
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            frame_count = _content_frame_count(item)
+            if frame_count <= 0:
+                continue
+            if is_image_item(item):
+                summary["image_item_count"] += 1
+            elif is_video_item(item):
+                summary["video_item_count"] += 1
+            summary["total_frame_count"] += int(frame_count)
+            if role == "tool":
+                summary["tool_frame_count"] += int(frame_count)
+            else:
+                summary["user_frame_count"] += int(frame_count)
+    return summary
 
 
 def drop_oldest_history_turn(messages: List[Dict[str, Any]]) -> bool:
@@ -240,6 +534,8 @@ def apply_message_budget(
     keep_recent_text_messages: int = 0,
     keep_recent_tool_image_messages: int = 0,
     max_total_images: int = 0,
+    max_tool_message_frames: int = 0,
+    max_total_video_frames: int = 0,
     copy_messages: bool = True,
 ) -> List[Dict[str, Any]]:
     prepared = prune_stale_text_history(
@@ -255,6 +551,16 @@ def apply_message_budget(
     prepared = cap_total_images(
         prepared,
         max_total_images=max_total_images,
+        copy_messages=False,
+    )
+    prepared = cap_tool_message_frames(
+        prepared,
+        max_tool_message_frames=max_tool_message_frames,
+        copy_messages=False,
+    )
+    prepared = cap_total_video_frames(
+        prepared,
+        max_total_video_frames=max_total_video_frames,
         copy_messages=False,
     )
     return prepared

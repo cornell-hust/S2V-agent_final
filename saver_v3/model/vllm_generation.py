@@ -1477,16 +1477,6 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
         if not self.vllm_runtime.enabled:
             if self.source_model is None:
                 raise RuntimeError("vLLM generation policy requires a source HF model when runtime is disabled.")
-            runtime_log(
-                "rl trace generate debug: "
-                f"policy_class={self.__class__.__name__} "
-                f"runtime_enabled=false "
-                f"capture_rl_token_traces={bool(self.capture_rl_token_traces)} "
-                f"batch_size={len(messages_batch)} "
-                "route=hf_fallback",
-                runtime=distributed_runtime_from_env(),
-                main_process_only=True,
-            )
             return super().generate_from_messages_batch(messages_batch)
 
         current_step = int(self.step_resolver() or 0)
@@ -1716,25 +1706,6 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
                         trace_spec["prompt_trace"]["multimodal_inputs"][key] = value.detach().cpu()
                 token_traces.append(trace_spec)
             self._last_rl_token_traces = token_traces
-        trace_count = -1 if self._last_rl_token_traces is None else int(len(self._last_rl_token_traces))
-        first_trace_keys = []
-        if isinstance(self._last_rl_token_traces, list) and self._last_rl_token_traces and isinstance(self._last_rl_token_traces[0], dict):
-            first_trace_keys = sorted(str(key) for key in self._last_rl_token_traces[0].keys())
-        runtime_log(
-            "rl trace generate debug: "
-            f"policy_class={self.__class__.__name__} "
-            "runtime_enabled=true "
-            f"capture_rl_token_traces={bool(self.capture_rl_token_traces)} "
-            f"batch_size={len(messages_batch)} "
-            f"base_seed={base_seed} "
-            f"runtime_rank={runtime_rank} "
-            f"prompt_trace_inputs={len(prompt_input_tensors)} "
-            f"output_count={len(output_texts)} "
-            f"trace_count={trace_count} "
-            f"first_trace_keys={first_trace_keys}",
-            runtime=distributed_runtime_from_env(),
-            main_process_only=True,
-        )
         return output_texts
 
 

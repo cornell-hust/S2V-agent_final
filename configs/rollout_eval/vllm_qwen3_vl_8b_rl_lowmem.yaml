@@ -8,7 +8,7 @@ attn_implementation: flash_attention_3
 server:
   mode: colocate
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.20
+  gpu_memory_utilization: 0.15
 
 client:
   max_tokens: 512
@@ -32,7 +32,7 @@ io:
 
 evaluation:
   epoch_index: 0
-  max_turns: 14
+  max_turns: 10
   rollout_batch_size: 4
   progress_every: 10
   enable_semantic_replay: true

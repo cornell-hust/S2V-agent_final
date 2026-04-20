@@ -1,0 +1,22 @@
+{
+  "round": 4,
+  "threadId": null,
+  "status": "completed",
+  "difficulty": "nightmare",
+  "last_score": 9.0,
+  "last_verdict": "ready",
+  "pending_experiments": [],
+  "timestamp": "2026-04-20T22:00:00+08:00",
+  "paper_path": "papers/search_to_verify_neurips.md",
+  "paper_lines": 559,
+  "reviewer_panel": ["codex_exec_gpt5.4", "claude_novelty_skeptic", "claude_experimental_skeptic"],
+  "score_progression": [5.0, 7.0, 8.0, 9.0],
+  "verdict_progression": ["not ready", "almost", "almost", "ready"],
+  "notes": "Loop terminated at Round 4 with 9/10 ready. Final verdict: likely to meet NeurIPS 2026 strong-accept bar if [TBD] results come in competitive. Paper reads as principled scientific paper rather than implementation report. Out-of-scope code cleanups flagged in AUTO_REVIEW.md for future code team follow-up.",
+  "user_directives_honored": [
+    "self-verifier paper-authoritative (code mismatch ignored)",
+    "Table 4/Figure 4 training-stability block deleted pre-loop",
+    "experimental results left as [TBD]",
+    "severity/counterfactual_type code cleanup out of scope"
+  ]
+}

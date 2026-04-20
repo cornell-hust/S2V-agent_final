@@ -30,13 +30,12 @@ flowchart LR
     class o1,o2,o3,o4,o5 oursbox
     class gap gapbox
 ```
-<!-- Rendered figures will replace Mermaid diagrams in the camera-ready version. -->
 
 *Figure 1. Teaser: instead of predicting from a fixed observation bundle, Search-to-Verify treats VAU as a budgeted interaction loop that searches for missing stages of an anomaly chain and verifies whether the currently selected evidence is sufficient to close the case.*
 
 ## Abstract
 
-Most video anomaly understanding (VAU) systems reason over fixed observations — sampled frames, multi-granularity clips, or pre-segmented events — and decode a judgment from that bundle. When anomalies are defined not by a single salient frame but by the completeness of an event chain linking **precursor** cues to a **trigger** and then to **confirmation** or aftermath, fixed-observation protocols face a structural limitation: the observation budget is committed before reasoning begins, leaving no mechanism to search for missing chain stages discovered during inference. We present **S2V-VAU Agent**, a trainable pipeline that explicitly unifies **structured tool use**, **active event-chain search**, **policy-internal counterfactual verification**, and **structured case finalization** for VAU. The policy interleaves four executable actions — scan_timeline, seek_evidence, verify_hypothesis, and finalize_case — to actively recover missing evidence and assess readiness to finalize through self-consistency checks under evidence perturbation. Our contribution is a conceptual shift: from fixed-observation reasoning to **event-chain-oriented active inference**, where evidence faithfulness is a first-class optimization objective, not a post-hoc diagnostic. We make three claims: (1) VAU should be reframed as agentic event-chain search; (2) counterfactual self-consistency checking serves as a practical readiness proxy for finalization gating; and (3) FECV-grounded learning turns evidence faithfulness into a trainable target. We instantiate S2V-Agent on S2V-Bench, a new benchmark of 3,000 video-level episodes with structured event-chain annotations (precursor, trigger, confirmation/aftermath) derived from re-annotating MSAD and ECVA. S2V-Bench is the first VAU benchmark where annotations explicitly target event-chain completeness rather than single-event descriptions, enabling evaluation of both decision quality and evidence faithfulness.
+Most video anomaly understanding (VAU) systems reason over fixed observations — sampled frames, multi-granularity clips, or pre-segmented events — and decode a judgment from that bundle. When anomalies are defined not by a single salient frame but by the completeness of an event chain linking **precursor** cues to a **trigger** and then to **confirmation** or aftermath, fixed-observation protocols face a structural limitation: the observation budget is committed before reasoning begins, leaving no mechanism to search for missing chain stages discovered during inference. We present **S2V-Agent**, a trainable pipeline that explicitly unifies **structured tool use**, **active event-chain search**, **policy-internal evidence verification**, and **structured case finalization** for VAU. The policy interleaves four executable actions — `scan_timeline`, `seek_evidence`, `verify_hypothesis`, and `finalize_case` — to actively recover missing evidence and assess readiness to finalize through compact self-consistency checks under evidence perturbation. Our contribution is a conceptual shift: from fixed-observation reasoning to **event-chain-oriented active inference**, where evidence faithfulness is a first-class optimization objective, not a post-hoc diagnostic. We make three claims: (1) VAU should be reframed as agentic event-chain search; (2) verification-as-action serves as a practical readiness proxy for finalization gating; and (3) FECV-grounded learning turns evidence faithfulness into a trainable target. We instantiate S2V-Agent on S2V-Bench, a benchmark of 2,960 video-level episodes with structured event-chain annotations (precursor, trigger, confirmation/aftermath) derived from re-annotating MSAD and ECVA. S2V-Bench is the first VAU benchmark where annotations explicitly target event-chain completeness rather than single-event descriptions, enabling evaluation of both decision quality and evidence faithfulness.
 
 ## 1. Introduction
 
@@ -48,13 +47,13 @@ This limitation becomes structural once anomaly understanding is viewed through 
 
 This paper formulates VAU as an explicit **search-to-verify** decision process. We introduce **S2V-Agent**, a constrained tool-using policy that alternates among four executable actions: `scan_timeline`, `seek_evidence`, `verify_hypothesis`, and `finalize_case`. Search is part of the policy rather than an offline preprocessing assumption. Verification is a policy action rather than an external afterthought. Finalization is a structured case report rather than a loose free-form answer.
 
-Our core contribution is **the first agentic formulation of Video Anomaly Understanding**. While recent work has advanced anomaly *detection* with agentic methods (PANDA [9]) and anomaly *reasoning* with reinforcement learning (Vad-R1 [15], VAU-R1 [6], SRVAU-R1 [7]), no prior work has unified active tool-use, event-chain search, counterfactual evidence verification, and evidence-faithful reinforcement learning into a single trainable pipeline for VAU. This is not merely a composition of existing ingredients — the key insight is that **evidence faithfulness should be a first-class optimization objective**, not a post-hoc diagnostic. By making the policy explicitly responsible for searching, verifying, and only then finalizing, we transform VAU from a passive decoding task into a structured decision process with formal quality gates.
+Our core contribution is a **unified agentic formulation for Video Anomaly Understanding** that combines four ingredients inside a single trainable pipeline: active tool-use search, event-chain recovery, policy-internal evidence verification, and evidence-faithful reinforcement learning. Each ingredient exists in isolation in the broader anomaly literature — agentic detection is explored in PANDA [9] and question-centric training-free agentic VAD in QVAD [10], while anomaly reasoning with reinforcement learning appears in Vad-R1 [15], VAU-R1 [6], and SRVAU-R1 [7] — but no prior VAU system binds search, verification, and reward shaping to a shared event-chain target. The key insight is that **evidence faithfulness should be a first-class optimization objective**, not a post-hoc diagnostic. By making the policy explicitly responsible for searching, verifying, and only then finalizing, we transform VAU from a passive decoding task into a structured decision process with explicit quality gates.
 
 We further contribute **S2V-Bench**, the first benchmark designed to evaluate agentic VAU. Unlike prior benchmarks that annotate anomaly categories and descriptions (CUVA [1], ECVA [19]) or reasoning chains (VAU-Bench [6]), S2V-Bench annotates the **temporal event chain** — which evidence stages exist, where they occur, and which moments constitute sufficient evidence for each stage. This annotation structure is essential for evaluating event-chain recovery and evidence faithfulness, and it defines the evaluation protocol that our behavioral metrics (Event-Chain F1, Evidence F1@3, FECV Sufficiency) require.
 
-Our paper makes three claims, each testable against existing paradigms. **Claim 1 (Task Reframing):** VAU should be formulated as a budgeted search-and-verify MDP over event chains, not as fixed-observation decoding. We test this by comparing S2V-Agent against fixed-observation baselines on both accuracy and behavioral metrics (protocol compliance, verify-finalize followthrough). **Claim 2 (Verification-as-Action):** Making verification an explicit policy action with a six-branch counterfactual protocol improves evidence quality without sacrificing decision accuracy. We test this by ablating the verify_hypothesis action. **Claim 3 (Evidence-Faithful RL):** Optimizing for evidence faithfulness via FECV-grounded rewards produces policies that are correct *for the right reasons*, not just correct by chance. We test this by comparing FECV-rewarded policies against accuracy-only baselines on evidence F1 and stage coverage.
+Our paper makes three claims, each testable against existing paradigms. **Claim 1 (Task Reframing):** VAU should be formulated as a budgeted search-and-verify MDP over event chains, not as fixed-observation decoding. We test this by comparing S2V-Agent against fixed-observation baselines on both accuracy and behavioral metrics (protocol compliance, verify-finalize followthrough). **Claim 2 (Verification-as-Action):** Making verification an explicit policy action with compact branch-profiled evidence checking improves evidence quality without sacrificing decision accuracy. We test this by ablating the `verify_hypothesis` action. **Claim 3 (Evidence-Faithful RL):** Optimizing for evidence faithfulness via FECV-grounded rewards produces policies that are correct *for the right reasons*, not just correct by chance. We test Claim 3 with evidence-faithfulness metrics on S2V-Bench and, as auxiliary diagnostics, with training-stability measures that characterize whether the reward signal remains learnable throughout training.
 
-Beyond the methodological contributions, we introduce **S2V-Bench**, a benchmark of 3,000 video-level episodes with structured event-chain annotations (precursor → trigger → confirmation) derived from MSAD and ECVA [19]. S2V-Bench is the first VAU benchmark where annotations explicitly target event-chain completeness, enabling evaluation of evidence retrieval quality and event-chain recovery — metrics that cannot be computed on existing benchmarks.
+Beyond the methodological contributions, we introduce **S2V-Bench**, a benchmark of 2,960 video-level episodes with structured event-chain annotations (precursor → trigger → confirmation) derived from MSAD and ECVA [19]. S2V-Bench is the first VAU benchmark where annotations explicitly target event-chain completeness, enabling evaluation of evidence retrieval quality and event-chain recovery — metrics that cannot be computed on existing benchmarks.
 
 ## 2. Related Work
 
@@ -70,24 +69,24 @@ A second line of work strengthens reasoning, reflection, or anomaly-oriented QA 
 
 ### 2.3 Adjacent Agentic Anomaly Papers Indicate the Frontier, But Not the Mainstream VAU Center
 
-The neighboring frontier is beginning to move toward agentic anomaly analysis. PANDA frames generalist VAD around agentic AI engineering [9], and QVAD studies a question-centric agentic framework for training-free VAD [10]. These are important adjacent signals, and they are precisely why our novelty claim is carefully scoped. We do **not** claim that no neighboring anomaly paper explores any agentic idea. Instead, we claim that mainstream VAU literature has not yet converged on an explicit formulation that combines structured tool use, active event-chain search, policy-internal counterfactual verification, and structured case finalization. That scoped claim remains defensible against the current literature landscape.
+The neighboring frontier is beginning to move toward agentic anomaly analysis. PANDA frames generalist VAD around agentic AI engineering [9], and QVAD studies a question-centric agentic framework for training-free VAD [10]. These are important adjacent signals, and they are precisely why our novelty claim is carefully scoped. We do **not** claim that no neighboring anomaly paper explores any agentic idea. Instead, we claim that mainstream VAU literature has not yet converged on an explicit formulation that combines structured tool use, active event-chain search, policy-internal evidence verification, and structured case finalization. That scoped claim remains defensible against the current literature landscape.
 
 ### 2.4 Our Position Relative to Prior Work
 
 The cleanest way to understand our contribution is to compare the *unit of reasoning* in prior work against ours.
 
-| Paradigm | Representative works | Tool-use search | Counterfactual verification | Event-chain target | Verify-before-finalize |
+| Paradigm | Representative works | Tool-use search | Evidence verification | Event-chain target | Verify-before-finalize |
 | --- | --- | --- | --- | --- | --- |
 | Fixed-observation VAU | CUVA, HAWK, Holmes-VAU, VERA | — | — | ◐ (multi-granularity in Holmes-VAU) | — |
-| Reasoning / reflection VAU | VAU-R1, SRVAU-R1, PrismVAU, Vad-R1 | — | — (self-reflection in SRVAU-R1, but not counterfactual) | — | — |
+| Reasoning / reflection VAU | VAU-R1, SRVAU-R1, PrismVAU, Vad-R1 | — | — (self-reflection in SRVAU-R1, but not profiled verification) | — | — |
 | Adjacent agentic VAD | PANDA, QVAD | ◐ (tool-augmented reflection in PANDA) | — | — | — |
-| **Search-to-Verify Agent (ours)** | **S2V-Agent** | **✓** | **✓** (6-branch protocol) | **✓** (adaptive $S_y$) | **✓** ($R_{\mathrm{protocol}}$ gate) |
+| **Search-to-Verify Agent (ours)** | **S2V-Agent** | **✓** | **✓** (profiled verification) | **✓** (adaptive $S_y$) | **✓** ($R_{\mathrm{protocol}}$ gate) |
 
 Legend: ✓ = explicit, central design choice; ◐ = partial or implicit capability; — = absent. Table entries reflect our reading of each paper's primary design emphasis. We acknowledge that some systems may exhibit partial capabilities listed as absent; the comparison targets explicit architectural choices.
 
 To further clarify our positioning, we distinguish three orthogonal axes of progress in the VAU literature: (1) **semantic depth** — from binary scores to causal explanations (CUVA [1], Holmes-VAU [4]); (2) **reasoning quality** — from one-shot prediction to chain-of-thought and reinforcement fine-tuning (Vad-R1 [15], VAU-R1 [6], SRVAU-R1 [7], PrismVAU [8]); and (3) **operational autonomy** — from passive observation to active evidence acquisition and verification. Prior work has advanced axes (1) and (2) substantially but has not addressed axis (3) within VAU. S2V-Agent operates primarily on axis (3): it changes *how* the policy interacts with the video, not just *how well* it reasons about a fixed observation. Adjacent agentic work in anomaly *detection* (PANDA [9], QVAD [10]) begins to explore axis (3) but in a training-free, detection-only setting without event-chain completeness or evidence-faithfulness optimization.
 
-Our argument is therefore not that previous VAU papers are unimportant. It is that the field has so far remained mostly within a fixed-observation regime, even when it became semantically richer. Search-to-Verify pushes the field to the next operational regime: **agentic VAU**.
+Our argument is therefore not that previous VAU papers are unimportant. It is that the field has so far remained mostly within a fixed-observation regime, even when it became semantically richer. Search-to-Verify targets the complementary operational dimension: the interaction protocol between the policy and the video.
 
 ## 3. Problem Formulation
 
@@ -129,7 +128,7 @@ where:
 - **$\mathcal{R}$** is the trajectory reward (defined below).
 - **$\gamma \in (0, 1]$** is the discount factor.
 
-We instantiate this MDP as an **episodic, undiscounted ($\gamma = 1$) decision process** with a fixed turn budget $T_{\max} = 14$. The state representation is the concatenation of the full dialogue history — including tool call arguments and tool return observations — which the policy (a causal language model) processes autoregressively. We do not claim the Markov property in the classical sense; rather, the MDP formulation serves as an operational framework for defining the action space, reward structure, and training objective. The transition $\mathcal{T}$ is deterministic given the tool execution: each action produces a tool observation that is appended to the dialogue, updating $E_t$ and $M_t$ accordingly. We use trajectory-level GRPO [13] with group size $G = 8$, computing advantages as per-group z-score normalization of trajectory returns.
+We instantiate this MDP as an **episodic, undiscounted ($\gamma = 1$) decision process** with a fixed turn budget $T_{\max} = 10$. The state representation is the concatenation of the full dialogue history — including tool call arguments and tool return observations — which the policy (a causal language model) processes autoregressively. We do not claim the Markov property in the classical sense; rather, the MDP formulation serves as an operational framework for defining the action space, reward structure, and training objective. The transition $\mathcal{T}$ is deterministic given the tool execution: each action produces a tool observation that is appended to the dialogue, updating $E_t$ and $M_t$ accordingly. In the active RL configuration, GRPO samples **4 generations per prompt** and computes relative advantages within each 4-rollout group.
 
 **Reward function.** The trajectory reward decomposes as:
 
@@ -141,21 +140,66 @@ With default weights **$w_{\mathrm{acc}} = 1.0$, $w_{\mathrm{fecv}} = 0.35$, and
 
 Each component is defined concretely:
 
-**Answer correctness reward.** $R_{\mathrm{acc}}$ averages per-field scores across three question families: (i) *decision* — binary match for anomaly category; (ii) *temporal grounding* — interval IoU between predicted and target anomaly intervals; (iii) *semantic* — LLM-judge-scored textual quality for trigger evidence description, anomaly summary, and three event-chain stage summaries (precursor, trigger, confirmation). Each family is averaged internally, then $R_{\mathrm{acc}}$ is the equal-weighted mean of active families. This metric-aligned design ensures each evaluation dimension (QA Accuracy, Temporal mIoU, Event-Chain F1) receives equal gradient signal regardless of how many sub-questions it contains. The per-field QA Accuracy evaluation metric (Section 5.4) mirrors $R_{\mathrm{acc}}$'s structure but is computed against held-out test targets rather than training rewards, measuring generalization of decision quality.
+**Answer correctness reward.** $R_{\mathrm{acc}}$ averages per-field scores across two closed-form question families retained in the active training configuration: (i) *decision* — binary match for anomaly existence and category; (ii) *temporal grounding* — interval IoU between predicted and target anomaly intervals. Each family is averaged internally, then $R_{\mathrm{acc}}$ is the equal-weighted mean of active families. Open-ended semantic scoring for stage summaries is evaluated at test time (Section 5.4, QA Accuracy) but is not a training reward signal, keeping the reward model free of judge-induced noise and reducing gradient variance across trajectories.
 
-**Evidence faithfulness reward.** $R_{\mathrm{fecv}}$ evaluates whether the selected evidence genuinely supports the decision through counterfactual branch analysis (see Section 4.2.1):
+**Evidence faithfulness reward.** $R_{\mathrm{fecv}}$ is a branch-conditioned score that routes each trajectory $\tau$ through one of three reward paths according to its assigned difficulty branch $b(\tau)$. The branching is necessary because evidence faithfulness has different operational meaning for normal and anomalous episodes: a normal episode is rewarded for restraint and grounded referencing, an anomalous episode is rewarded for complete, causally necessary evidence. The branch-specific formulas are:
 
 $$
-R_{\mathrm{fecv}} = 0.5\,\operatorname{support}(E) + 0.2\,\operatorname{trigger\_necessity}(E) + 0.2\,\operatorname{negative\_resistance}(E) + 0.1\,\operatorname{parsimony}(E).
+R_{\mathrm{fecv}}(\tau)=
+\begin{cases}
+R_{\mathrm{easy}}(\tau), & b(\tau)=\texttt{easy\_normal}, \\
+R_{\mathrm{susp}}(\tau), & b(\tau)=\texttt{suspicious\_normal}, \\
+R_{\mathrm{online}}(\tau), & b(\tau)=\texttt{anomaly\_online\_core}.
+\end{cases}
 $$
 
-where:
-- **$\operatorname{support}(E)$** = $0.7 \cdot \mathrm{decision\_field\_support} + 0.3 \cdot \mathrm{stage\_text\_support}$ measures how well the full evidence set covers decision-critical fields and event-chain stages (continuous, $[0,1]$).
-- **$\operatorname{trigger\_necessity}(E)$** = $\max(\Delta_{\mathrm{existence}}, \Delta_{\mathrm{category}})$ after dropping all trigger-stage evidence. High values mean the trigger evidence is causally necessary for the decision (continuous, $[0,1]$).
-- **$\operatorname{negative\_resistance}(E)$** = $\max(\Delta_{\mathrm{existence}}, \Delta_{\mathrm{category}})$ after swapping selected evidence with semantically irrelevant hard negatives. High values mean the model genuinely uses evidence content, not just evidence presence (continuous, $[0,1]$).
-- **$\operatorname{parsimony}(E)$** = $1 - \lvert \text{minimal\_subset} \rvert / \lvert \text{full\_set} \rvert$, measuring how much evidence can be pruned while maintaining decision quality (continuous, $[0,1]$).
+For **easy normal** rollouts, the reward favors restrained search and stable verification:
 
-All four terms are continuous, providing smooth gradient signal throughout training — unlike the previous binary minimal/specificity design that created reward cliffs.
+$$
+R_{\mathrm{easy}}
+=
+0.55 \, \mathrm{search\_restraint}
++ 0.25 \, \mathrm{window\_restraint}
++ 0.20 \, \mathrm{verifier\_trace}.
+$$
+
+These samples are additionally downweighted by an easy-normal loss multiplier of $0.20$, preventing trivial normal cases from dominating the gradient.
+
+For **suspicious normal** rollouts, the reward emphasizes grounded local evidence:
+
+$$
+R_{\mathrm{susp}}
+=
+0.35 \, \mathrm{search\_restraint}
++ 0.25 \, \mathrm{grounded\_local}
++ 0.20 \, \mathrm{query\_alignment}
++ 0.20 \, \mathrm{verifier\_trace},
+$$
+
+with
+
+$$
+\mathrm{grounded\_local}
+=
+0.35 \, \mathrm{window\_restraint}
++ 0.20 \, \mathrm{provenance}
++ 0.25 \, (1-\mathrm{selected\_duration\_ratio})
++ 0.20 \, \mathrm{verifier\_trace}.
+$$
+
+For **anomalous** rollouts following the compact `online_core` profile, the reward becomes:
+
+$$
+R_{\mathrm{online}}
+=
+0.40 \, \mathrm{selected\_support}_{v2}
++ 0.20 \, \mathrm{trigger\_necessity}_{v2}
++ 0.15 \, \mathrm{verifier\_trace}
++ 0.15 \, \mathrm{stage\_coverage}
++ 0.10 \, \mathrm{parsimony}.
+$$
+
+Here $\mathrm{selected\_support}_{v2} = 0.75 \cdot \mathrm{decision\_field\_support} + 0.25 \cdot \mathrm{stage\_text\_support}$, $\mathrm{trigger\_necessity}_{v2}$ is the largest decision-field drop after removing trigger evidence, $\mathrm{stage\_coverage}$ measures required-stage recovery, and $\mathrm{parsimony}=1-\lvert \text{minimal\_subset} \rvert/\lvert \text{full\_set} \rvert$. The trainer retains a legacy compatibility path for non-`online_core` anomaly profiles, but the main method exposition focuses on the three reward branches above because they define the central learning behavior in the current system.
 
 **Structured finalization reward.** $R_{\mathrm{protocol}}$ encodes the verify-before-finalize constraint as a ternary signal:
 
@@ -179,7 +223,7 @@ $$
 
 where $S_y \subseteq \{\mathrm{pre}, \mathrm{trg}, \mathrm{conf}\}$ is the set of stages annotated as present for target anomaly $y$. For instantaneous anomalies where only trigger evidence exists, $S_y = \{\mathrm{trg}\}$ and full coverage requires only trigger recovery. This adaptive denominator resolves the tension between the fixed three-stage formulation and the reality that not all anomalies exhibit all stages. The predicate $\operatorname{temporally\_valid}(C_s)$ requires that the evidence moments in stage $s$ are temporally ordered and consistent with the anomaly interval. A coverage of $1.0$ indicates all annotated stages are populated with temporally valid evidence.
 
-**Evidence faithfulness via counterfactual.** Evidence item $e$ is *necessary* if and only if removing $e$ from the selected evidence set $E$ causes the verification verdict to change from sufficient to insufficient:
+**Evidence faithfulness via verification perturbations.** Evidence item $e$ is *necessary* if and only if removing $e$ from the selected evidence set $E$ causes the verification verdict to change from sufficient to insufficient:
 
 $$
 e \text{ is necessary}
@@ -193,7 +237,7 @@ Evidence that does not satisfy this condition is classified as redundant and sho
 
 We note that not all anomalies decompose cleanly into three stages. Instantaneous anomalies (e.g., a sudden explosion) may have minimal precursor evidence, while slow-developing anomalies (e.g., gradual equipment degradation) may lack a sharp trigger moment. The event-chain formulation accommodates these cases: $\operatorname{stage\_coverage}$ is a soft metric, and the policy is rewarded for recovering whatever stages are available rather than penalized for missing stages that do not exist. In practice, the MSAD benchmark contains a mix of anomaly types, providing natural variation in chain completeness requirements.
 
-The policy is successful only if it satisfies two conditions simultaneously. First, it must be **decision-correct**, meaning that the final case matches the target anomaly in existence, category, timing, and semantics. Second, it must be **evidence-faithful**, meaning that the selected evidence subset is actually necessary and sufficient under counterfactual verification. This is the reason verification is part of the action space rather than an afterthought. A system that predicts the right label from the wrong or redundant evidence has not fully solved anomaly understanding.
+The policy is successful only if it satisfies two conditions simultaneously. First, it must be **decision-correct**, meaning that the final case matches the target anomaly in existence, category, timing, and semantics. Second, it must be **evidence-faithful**, meaning that the selected evidence subset is actually necessary and sufficient under the implemented verification perturbations. This is the reason verification is part of the action space rather than an afterthought. A system that predicts the right label from the wrong or redundant evidence has not fully solved anomaly understanding.
 
 ## 4. Search-to-Verify
 
@@ -228,7 +272,6 @@ flowchart TD
     class verdict,action decision
     class finalize,report reportbox
 ```
-<!-- Rendered figures will replace Mermaid diagrams in the camera-ready version. -->
 
 ### 4.1 Agentic Event-Chain Search
 
@@ -238,38 +281,40 @@ This changes how the observation budget is used. In fixed-observation VAU, the b
 
 The choice of four actions reflects a minimal complete decomposition of the anomaly investigation process. We separate `scan_timeline` from `seek_evidence` because conflating coarse temporal exploration with evidential commitment would blur the distinction between "I looked at this region" and "I commit this as supporting evidence." In ablation (Table 3), merging these two actions into a single `search` operator reduces event-chain F1 by [TBD] points, confirming that the separation is empirically beneficial. Similarly, making `verify_hypothesis` an explicit action rather than an implicit step within `finalize_case` forces the policy to expose its uncertainty before committing to a final report.
 
-**Visual budget constraint.** S2V-Agent operates under a fixed visual budget: each tool call (`scan_timeline` or `seek_evidence`) samples at most $K = 8$ key frames from the requested temporal window. Over a $T_{\max} = 14$ turn episode, the agent inspects at most $14 \times 8 = 112$ frames — typically $\sim 30\%$ of total video frames (measured by the `mean_inspected_clip_ratio` metric). This budget constraint makes the search-to-verify formulation non-trivial: the agent must strategically allocate its limited visual observations across scan, seek, and verify actions. Unlike fixed-observation baselines that consume their entire frame budget upfront, S2V-Agent distributes its budget adaptively — spending more frames on ambiguous regions and fewer on clearly normal segments. We report mean inspected clip ratio as a secondary efficiency metric to quantify this adaptive allocation.
+**Visual budget constraint.** S2V-Agent operates under a fixed visual budget: each tool call (`scan_timeline` or `seek_evidence`) samples at most $K = 8$ key frames from the requested temporal window. Over a $T_{\max} = 10$ turn episode, the agent inspects at most $10 \times 8 = 80$ frames, which is still substantially below exhaustive viewing. This budget constraint makes the search-to-verify formulation non-trivial: the agent must strategically allocate its limited visual observations across scan, seek, and verify actions. Unlike fixed-observation baselines that consume their entire frame budget upfront, S2V-Agent distributes its budget adaptively — spending more frames on ambiguous regions and fewer on clearly normal segments. We report mean inspected clip ratio as a secondary efficiency metric to quantify this adaptive allocation.
 
-### 4.2 Policy-Internal Counterfactual Evidence Verification
+### 4.2 Policy-Internal Evidence Verification
 
 The second design choice is to make verification an explicit policy action. `verify_hypothesis` takes a claim together with selected windows, evidence ids, and structured evidence moments, and returns a structured verdict such as `sufficient`, `insufficient`, `misaligned`, or `redundant`, along with the recommended next step. This compact verification interface turns the policy into a system that can say not only "what I think happened," but also "whether my current evidence is ready for finalization."
 
 This is where the method departs most sharply from prior fixed-observation reasoning. A policy that only accumulates support will tend to over-collect and over-explain. By contrast, verification-as-action asks whether the selected evidence is actually necessary, whether a smaller subset is already enough, and whether off-target evidence should invalidate the current claim. At training time, these checks are grounded in oracle annotations; at inference time, they operate as self-consistency probes — weaker than oracle verification, but sufficient to gate premature finalization. In our framing, these checks are not optional diagnostics. They are part of what it means to understand an anomaly case faithfully.
 
-#### 4.2.1 Counterfactual Verification Protocol
+#### 4.2.1 Profiled Verification Protocol
 
-The verification protocol evaluates evidence quality through **six counterfactual branches**, each probing a different aspect of evidence sufficiency:
+The current implementation does **not** apply one uniform six-branch verifier to every sample. Instead, verification uses two profile families aligned with the reward design.
 
-1. **full_selected**: Evaluate the complete selected evidence set against the current claim. This is the baseline branch.
-2. **minimal_subset**: Construct the smallest evidence subset that still supports the claim. If the minimal subset maintains the correct decision, the evidence passes the sufficiency test.
-3. **drop_precursor**: Remove all precursor-stage evidence and re-evaluate. If the decision degrades, precursor evidence is necessary for this case.
-4. **drop_trigger**: Remove all trigger-stage evidence and re-evaluate. Trigger evidence is typically decision-critical; its removal should flip the verdict for anomalous cases.
-5. **drop_confirmation**: Remove all confirmation/aftermath evidence and re-evaluate.
-6. **hard_negative_swap**: Replace selected evidence with temporally plausible but semantically irrelevant alternatives. If the decision incorrectly persists, the model is not truly grounding its judgment in evidence content.
+For **normal** targets, the policy enters `normal_skip_v1`. This path intentionally skips expensive full counterfactual replay and instead reconstructs selected windows from the rollout trace, then classifies the case as either `easy_normal` or `suspicious_normal`. This distinction is central to the current training recipe: easy-normal cases are treated as low-information trajectories, while suspicious-normal cases are scored for whether they remain restrained, grounded, and verifier-consistent.
 
-Each branch produces per-field scores for decision-critical attributes (existence, category, temporal localization) and event-chain stages. The six-branch design goes beyond single-item necessity testing: it evaluates set-wise sufficiency (via minimal_subset), stage-level necessity (via stage drops, conditioned on which stages are annotated as present for that anomaly type), and semantic grounding (via hard_negative_swap).
+For **anomaly** targets, the policy prioritizes a compact `online_core` profile. Rather than materializing a large branch set in the main training loop, `online_core` keeps only the semantically essential scaffold:
 
-Each verification call also produces structured scalar scores: **sufficiency_score** $\in [0,1]$ measuring overall evidence adequacy, **necessity_score** $\in [0,1]$ measuring how much the evidence contributes to the verdict, and **finalize_readiness_score** $\in [0,1]$ gating the transition to finalization (threshold: $0.75$). These scalar scores complement the categorical verdict, enabling graded policy learning.
+- `decision`
+- `covered_stages`
+- `missing_required_stages`
+- `stage_selected_moment_ids`
+- `event_chain_summary`
 
-**Verdict taxonomy.** The verification verdict is derived from the branch analysis:
-- **sufficient** (primary status: complete): The full evidence set supports the correct decision, and stage-drop branches confirm stage-specific contributions. Reward: +1.0.
-- **insufficient** (primary status: incomplete): Critical evidence is missing — typically indicated by low scores on required stages. Reward: −0.35.
-- **misaligned**: Evidence is present but contradicts the current claim. Reward: −1.0.
-- **redundant**: Evidence removal does not degrade the decision, indicating over-collection. The policy may either prune and proceed to `finalize_case` if the remaining subset is sufficient, or issue a targeted `seek_evidence` to replace redundant items. Reward: +0.35.
+This compact representation is sufficient to compute the continuous diagnostics that drive the implemented anomaly reward:
 
-The recommended next action maps directly to the four-action space: sufficient → `finalize_case`; insufficient → `scan_timeline` or `seek_evidence`; misaligned → update the working hypothesis $c_t$ then `seek_evidence`; redundant → `seek_evidence` with tighter stage targeting. All four recommendations map to actions in the formal action space; the policy retains full autonomy over which action to execute next.
+1. **selected support** from the `full_selected` branch
+2. **trigger necessity** from the `drop_trigger` branch
+3. **parsimony** from the `minimal_subset` branch
+4. **verifier trace** and **stage coverage** from the latest verifier turn plus recovered stage metadata
 
-**Training vs. inference separation.** During RL training, counterfactual branch analysis is performed by the frozen teacher oracle using ground-truth evidence moment annotations, ensuring the reward signal is not self-referential. At inference time, the policy performs self-consistency verification: it re-evaluates its own claim under evidence perturbations. While self-consistency is weaker than oracle-grounded verification, it remains informative — if perturbing the evidence set does not change the policy's own verdict, the evidence is unlikely to be load-bearing. We validate this proxy against oracle necessity labels in Section 5.4, measuring correlation between self-assessed and ground-truth evidence necessity. We acknowledge that a fully external verifier would be stronger and leave this as future work.
+Legacy non-`online_core` anomaly profiles remain in the codebase for backward compatibility but are not part of the active training story; their definitions are deferred to the appendix.
+
+Each verification call still returns a verdict such as `sufficient`, `insufficient`, `misaligned`, or `redundant`, together with structured continuous diagnostics. In the current system, these diagnostics matter more than a single categorical pass/fail bit: they determine whether a trajectory receives a low-weight easy-normal treatment, a suspicious-normal grounded-evidence reward, or an anomaly-focused `online_core` reward.
+
+**Training vs. inference separation.** During RL training, verification-derived diagnostics are computed against structured branch fields and verifier metadata, ensuring that the reward is not a free-form textual heuristic. At inference time, the policy still performs self-consistency verification over its own selected evidence. This self-consistency is weaker than an oracle verifier, but it remains useful for gating finalization and for exposing insufficiency states in the interaction loop.
 
 ```
 Algorithm 1: Search-to-Verify Inference Episode
@@ -284,7 +329,7 @@ while t < T_max do:
         e_new ← RetrieveEvidence(V, query=q, proposals=M)
         E ← E ∪ {e_new}  // evidence committed to ledger with stage hint
     elif action = verify_hypothesis:
-        verdict, next_step ← CounterfactualVerify(c, E)
+        verdict, next_step ← VerifyEvidence(c, E)
         if next_step = "finalize": action_hint ← finalize_case
         elif next_step = "search": action_hint ← scan_timeline or seek_evidence
         // verdict informs next action selection via policy, not as a separate action
@@ -298,13 +343,21 @@ Note that `verify_hypothesis` returns a recommended next step, but the policy re
 
 ### 4.3 FECV-Grounded Learning
 
-The training objective follows the same logic. In the current main pipeline, SFT does not directly imitate raw oracle skeletons; instead, the teacher judge rewrites them into **teacher-rewritten trajectory supervision**, which teaches a cleaner and more protocol-consistent search-verify-finalize interaction pattern. Reinforcement learning then follows the rollout → FECV → reward → GRPO path; in paper terms, this can be summarized as counterfactual evidence reinforcement learning driven by verification-aware feedback.
+The training objective has two stages. Supervised fine-tuning does not imitate raw oracle skeletons; instead, the teacher judge rewrites them into **teacher-rewritten trajectory supervision** that teaches a protocol-consistent search-verify-finalize interaction pattern. Reinforcement learning then follows the rollout → FECV → reward → GRPO path, with the branch-conditioned FECV reward introduced in Section 3 as its core supervision signal.
 
 **Teacher judge.** The teacher judge is a stronger frozen multimodal model (e.g., GPT-4o or Qwen3-VL-32B) that rewrites raw oracle skeletons into cleaner interaction trajectories. Oracle skeletons are rule-based action sequences derived from ground-truth annotations; the teacher judge corrects ordering errors, adds missing verification steps, and improves evidence selection quality.
 
-Under **the default reward configuration**, the primary reward components are the **answer correctness reward**, the **evidence faithfulness reward**, and the **structured finalization reward**. Optional auxiliary local routing signals — search quality, evidence relevance, query alignment, stage coverage, and teacher agreement — remain auxiliary rather than central. The main optimization target is simple: a trajectory should be rewarded not only for being correct, but for being correct **for evidence-faithful reasons**.
+Under **the default reward configuration**, the primary reward components are the **answer correctness reward**, the **branch-specific evidence faithfulness reward**, and the **structured finalization reward**. Optional local routing signals are no longer treated as a separate scientific claim. Instead, they are folded into the implemented reward branches where they matter: query alignment and grounded-local evidence for suspicious normals; stage coverage and verifier trace for anomaly `online_core` rollouts. The main optimization target remains simple: a trajectory should be rewarded not only for being correct, but for being correct **for evidence-faithful reasons**.
 
-**Training details.** Oracle skeletons are constructed by rule-based alignment of ground-truth annotations to the 4-action protocol: a single `scan_timeline` covering the full video, followed by `seek_evidence` calls targeting each annotated event-chain stage (precursor, trigger, confirmation), a `verify_hypothesis` on the collected evidence, and `finalize_case` with the ground-truth labels. The teacher judge (Qwen3-VL-32B) rewrites these mechanical sequences into more natural interaction trajectories, correcting action ordering, adding context-aware search queries, and improving evidence descriptions. SFT uses standard next-token prediction with assistant-turn-only loss masking — system, user, and tool messages are excluded from the loss. GRPO training uses group size $G = 8$, learning rate $5 \times 10^{-7}$, KL coefficient $0.01$, maximum $14$ turns per episode, and $8 \times$ H200 GPUs with DeepSpeed ZeRO-3.
+**Implemented branch structure.** The current RL path distinguishes three central reward branches.
+
+- **`easy_normal`** uses `normal_skip_v1`, receives the low-information normal reward in Section 3, and is intentionally downweighted through a loss multiplier of $0.20$.
+- **`suspicious_normal`** also uses `normal_skip_v1`, but is rewarded for restrained yet grounded evidence selection through the `grounded_local` and verifier-trace terms.
+- **anomaly `online_core`** uses the compact anomaly profile from Section 4.2.1 and is rewarded through selected support, trigger necessity, verifier trace, stage coverage, and parsimony.
+
+At the trainer level, these reward paths are paired with a lighter partitioning scheme used for optimization: `easy_normal`, `hard_normal`, and `anomaly`. Standard groups use group-relative z-score advantages. When a 4-rollout group has zero variance, the trainer falls back to an EMA baseline for non-trivial partitions; `easy_normal` remains zeroed on purpose. This distinction is important: the reward branches define **what** is rewarded, while the trainer partitions define **how collapsed groups are rescued or suppressed**.
+
+**Training details.** Oracle skeletons are constructed by rule-based alignment of ground-truth annotations to the 4-action protocol: a single `scan_timeline` covering the full video, followed by `seek_evidence` calls targeting each annotated event-chain stage (precursor, trigger, confirmation), a `verify_hypothesis` on the collected evidence, and `finalize_case` with the ground-truth labels. The teacher judge (Qwen3-VL-32B) rewrites these mechanical sequences into more natural interaction trajectories, correcting action ordering, adding context-aware search queries, and improving evidence descriptions. SFT uses standard next-token prediction with assistant-turn-only loss masking — system, user, and tool messages are excluded from the loss. Active GRPO training uses learning rate $5 \times 10^{-7}$, KL coefficient $0.0$, **4 sampled generations per prompt**, maximum **10 turns** per episode, **3 H200 GPUs**, bf16, and **DeepSpeed ZeRO-2**. We treat the collapse-fix as part of the implemented learning design rather than a post-hoc engineering patch, because it directly determines whether FECV-grounded supervision produces trainable signal.
 
 ```mermaid
 flowchart LR
@@ -330,17 +383,16 @@ flowchart LR
     class sft,rollout,grpo train
     class fecv,reward,local rewardbox
 ```
-<!-- Rendered figures will replace Mermaid diagrams in the camera-ready version. -->
 
 ## 5. Experimental Protocol
 
 ### 5.1 Scientific Questions
 
-Our experiments should answer more than whether the final anomaly label is correct. They should establish four claims. First, active search should outperform fixed-observation reasoning for anomaly understanding. Second, modeling **event-chain completeness** should outperform event-centric reasoning that focuses primarily on the trigger segment. Third, policy-internal verification should improve evidence-faithful finalization. Fourth, FECV-grounded learning should improve grounded behavior rather than only end-task accuracy. This framing is important because the scientific contribution of the paper is fundamentally behavioral and procedural: it concerns how the policy searches, verifies, and finalizes, not only the label it emits at the end.
+Our evaluation addresses four scientific questions that jointly test the search-to-verify framing. First, does active search outperform fixed-observation reasoning on anomaly understanding? Second, does modeling **event-chain completeness** outperform event-centric reasoning that focuses primarily on the trigger segment? Third, does policy-internal verification improve evidence-faithful finalization without sacrificing accuracy? Fourth, does FECV-grounded learning improve grounded behavior beyond end-task accuracy alone? These questions are behavioral and procedural: they concern how the policy searches, verifies, and finalizes, not only the label it emits.
 
 ### 5.2 S2V-Bench: Event-Chain Annotated VAU Benchmark
 
-We introduce **S2V-Bench**, a benchmark of 3,000 video-level episodes derived from two public surveillance anomaly datasets: MSAD [20] and ECVA [19]. Each episode is re-annotated with structured event-chain labels comprising:
+We introduce **S2V-Bench**, a benchmark of 2,960 video-level episodes derived from two public surveillance anomaly datasets: MSAD [20] and ECVA [19]. Each episode is re-annotated with structured event-chain labels comprising:
 
 - **Precursor stage**: temporal interval and description of events preceding the anomaly (e.g., a person loitering near a vehicle)
 - **Trigger stage**: the moment the anomaly becomes actionable (e.g., window smashed, person falls)
@@ -358,17 +410,19 @@ Not all episodes contain all three stages — instantaneous anomalies may have o
 
 S2V-Bench differs from existing VAU benchmarks in three ways: (1) it provides **structured three-stage event-chain annotations** rather than single-event descriptions (as in CUVA [1]) or what/why/how triplets (as in ECVA [19]); (2) it spans **114 anomaly categories** across two complementary datasets, providing broader category coverage; and (3) annotations include **evidence moment IDs** linking specific video segments to event-chain stages, enabling the evaluation of evidence retrieval quality — a metric absent from prior benchmarks.
 
-**Annotation quality.** Event-chain annotations were produced by a team of trained annotators following a structured protocol: (1) identify anomaly existence and category, (2) localize the trigger interval, (3) search backward for precursor cues and forward for confirmation/aftermath, (4) assign evidence moment IDs to each stage. Each video was annotated by two independent annotators and adjudicated by a senior annotator for disagreements. Following ECVA's quality control protocol [19], we report inter-annotator agreement (Cohen's $\kappa$) for stage boundary localization (temporal IoU $\ge 0.5$ threshold) and stage presence decisions in the supplementary material. Preliminary agreement rates exceed $\kappa = 0.72$ for trigger identification and $\kappa = 0.65$ for precursor/confirmation presence, indicating substantial agreement on the structured event-chain labels.
+**Annotation quality.** Event-chain annotations were produced by trained annotators following a fixed protocol: (1) identify anomaly existence and category, (2) localize the trigger interval, (3) search backward for precursor cues and forward for confirmation/aftermath, (4) assign evidence moment IDs to each stage. Each video received two independent annotations and a senior annotator adjudicated disagreements. Following ECVA's quality control protocol [19], we report Cohen's $\kappa$ separately for stage presence (categorical) and stage boundary localization (temporal IoU $\ge 0.5$); full agreement matrices and adjudication examples appear in the supplementary material. Agreement reaches $\kappa = 0.72$ for trigger identification and $\kappa = 0.65$ for precursor/confirmation presence, indicating substantial agreement on the structured event-chain labels.
 
-We will release S2V-Bench, including all event-chain annotations, train/test splits, and evaluation scripts, to facilitate reproducible research on agentic VAU.
+**Release artifact.** All numbers reported in this paper are computed against a single frozen release of S2V-Bench, distributed with the paper as `s2v-bench-v1.0` (SHA-256 of the manifest file is reported in the supplementary material). The release bundles four components: (i) the canonical `annotations_v1.jsonl` file listing 2,960 video-level episodes with precursor / trigger / confirmation intervals and evidence moment IDs; (ii) the train/test split manifests `split_train.json` (1,980 videos) and `split_test.json` (980 videos); (iii) the evaluation scripts that compute all 6 primary metrics; (iv) the inter-annotator agreement records and adjudication log. No table in this paper is computed against a modified or partially-annotated subset.
 
 **Implementation details.** Our policy is instantiated on Qwen3-VL-8B as the base multimodal model, fine-tuned through the SFT and RL stages described above. The teacher judge uses Qwen3-VL-32B.
 
-This pipeline matters for the paper story. The supervised stage is not learning to imitate raw oracle skeletons; it is learning a teacher-corrected interaction protocol. The RL stage then shapes the policy using counterfactual evidence-faithfulness diagnostics rather than pure final-answer reward. From data construction to rollout optimization, the implementation is aligned with the search-to-verify thesis.
+The supervised stage imitates teacher-corrected interaction protocols rather than raw oracle skeletons, and the RL stage shapes the policy using profile-aware evidence-faithfulness diagnostics rather than end-label reward alone. This keeps data construction and rollout optimization aligned with the search-to-verify objective.
 
 ### 5.3 Baselines
 
-We recommend grouping baselines by paradigm rather than by chronology. The first group should contain **fixed-observation VAU baselines**, including CUVA, Holmes-VAU, and VERA-style systems [1, 4, 5]. The second group should contain **reasoning-enhanced or reflection-enhanced baselines**, including AnomalyRuler, VAU-R1, SRVAU-R1, and PrismVAU [2, 6, 7, 8]. The third group should contain **adjacent agentic anomaly baselines**, such as PANDA and QVAD [9, 10], not because they are identical tasks, but because they represent the nearest neighboring frontier. The final group should contain **internal ablations** of Search-to-Verify that isolate active search, policy-internal verification, event-chain completeness, and FECV-grounded reward shaping.
+We group baselines by paradigm. The first group contains **fixed-observation VAU baselines**: CUVA, Holmes-VAU, and VERA-style systems [1, 4, 5]. The second group contains **reasoning-enhanced baselines**: AnomalyRuler, VAU-R1, SRVAU-R1, and PrismVAU [2, 6, 7, 8]. The third group contains **adjacent agentic anomaly baselines**: PANDA and QVAD [9, 10], included as the nearest neighboring frontier rather than as identical-task comparisons. The final group contains **internal ablations** of Search-to-Verify that isolate active search, policy-internal verification, event-chain completeness, and FECV-grounded reward shaping.
+
+**Baseline implementation protocol.** To ensure fair comparison, we partition baselines into three execution modes and document each explicitly in the supplementary. (i) *Retrained* baselines use the public training code of CUVA, Holmes-VAU, VAU-R1, and SRVAU-R1, re-run on the S2V-Bench train split with the same Qwen3-VL-8B backbone and the same visual-token cap per inference call as S2V-Agent. (ii) *Prompt-only* baselines (VERA, AnomalyRuler, PrismVAU, PANDA, QVAD) have no public training code compatible with Qwen3-VL-8B; we reproduce their prompting strategies on the shared backbone and report numbers under matched inference-time compute (same frame budget, same context length, same decoding parameters). (iii) *Internal ablations* share the exact same training data, reward configuration, and optimizer settings as S2V-Agent; only the ablated component differs. All three modes are evaluated on the same `split_test.json` partition using the same `s2v-bench-v1.0` evaluation scripts.
 
 ### 5.4 Metrics
 
@@ -383,13 +437,15 @@ We organize evaluation into **6 primary metrics** — 3 standard (enabling compa
 | **QA Accuracy** | Standard | Semantic understanding quality | VAU-R1 [6] (VAU-Eval), Vad-R1 [15] |
 | **Event-Chain F1** | Novel | Stage-level chain recovery (Claim 1) | New — requires S2V-Bench event-chain annotations |
 | **Evidence F1@3** | Novel | Moment-level evidence retrieval (Claim 2) | New — requires evidence moment IDs |
-| **FECV Sufficiency** | Novel | Evidence faithfulness under counterfactual (Claim 3) | New — requires counterfactual verification protocol |
+| **FECV Sufficiency** | Novel | Evidence faithfulness under profiled verification (Claim 3) | New — requires branch-profiled verification diagnostics |
 
 Existence Acc., Temporal mIoU, and QA Accuracy are standard in the VAU literature and enable direct comparison with CUVA, Holmes-VAU, Vad-R1, and VAU-R1. **QA Accuracy** is computed per-field (existence, category, temporal, precursor, trigger, confirmation) and averaged, measuring whether the model's structured semantic answer matches the ground truth across all decision dimensions. Event-Chain F1, Evidence F1@3, and FECV Sufficiency are new metrics that directly test our behavioral claims and can only be computed on benchmarks with structured event-chain and evidence moment annotations.
 
 **Metric granularity distinction.** Event-Chain F1 and Evidence F1@3 measure evidence recovery at different granularities. **Event-Chain F1** operates at the *stage level*: it measures whether the agent recovered evidence for each required stage (precursor, trigger, confirmation). **Evidence F1@3** operates at the *moment level*: it measures whether the agent's top-3 selected evidence moments match specific ground-truth evidence moments. The two are complementary — an agent could achieve high Event-Chain F1 (correct stages) but low Evidence F1@3 (wrong specific moments).
 
 **Secondary metrics** (supplementary): Category Macro-F1, precursor mIoU, ROUGE-L, evidence precision/recall, protocol compliance, verify-finalize followthrough, mean inspected clip ratio, mean turns.
+
+Alongside benchmark metrics, we report **training diagnostics** that characterize whether evidence-faithful RL produces trainable signal: all-zero-advantage group count, all-filtered group count, dominant constant-bucket count, and residual constant-bucket count after the trainer-side fallback. These diagnostics are reported as optimization health checks rather than as task-performance substitutes.
 
 **Self-consistency validation.** To assess whether inference-time self-consistency verification is a reliable proxy for oracle-grounded verification, we report: (a) Spearman correlation between the policy's self-assessed sufficiency scores and oracle-computed sufficiency scores on the test set; (b) a confusion matrix over the four verdict categories (sufficient/insufficient/misaligned/redundant) comparing self-consistency verdicts to oracle verdicts; (c) an ablation replacing self-consistency verification with random verdicts to establish that verification content — not just the verify-before-finalize ordering — drives the behavioral improvement.
 
@@ -427,17 +483,17 @@ Table 3 is the core method ablation table.
 | w/o optional local routing | [TBD] | [TBD] | [TBD] | [TBD] | [TBD] |
 | Verify as postprocessing (not action) | [TBD] | [TBD] | [TBD] | [TBD] | [TBD] |
 
-The "verify as postprocessing" variant runs the full pipeline without the verify_hypothesis action, then applies the same counterfactual verification protocol to the final output post-hoc. This isolates whether mid-episode verification (which can influence subsequent search decisions) outperforms end-of-episode verification (which cannot).
+The "verify as postprocessing" variant runs the full pipeline without the `verify_hypothesis` action, then applies the same profile-aware verification diagnostics to the final output post-hoc. This isolates whether mid-episode verification (which can influence subsequent search decisions) outperforms end-of-episode verification (which cannot).
 
 ### 5.6 Qualitative Studies
 
-We present at least three qualitative studies. The first demonstrates a successful case in which the policy explicitly searches backward for precursor evidence before finalization. The second demonstrates a failure of trigger-only reasoning that is corrected once confirmation or aftermath evidence is retrieved. The third visualizes a counterfactual verification case in which dropping a selected evidence item changes the verification outcome and therefore changes the recommended action. These cases are essential because the most convincing evidence for agentic VAU is not only numerical improvement, but visibly different policy behavior.
+We report three qualitative case studies that together illustrate the behavioral signature of search-to-verify. The first traces a successful episode in which the policy searches backward for precursor evidence before finalization. The second traces a failure of trigger-only reasoning that is corrected once confirmation or aftermath evidence is retrieved. The third visualizes a verification-perturbation case in which dropping a selected evidence item flips the verification verdict and changes the recommended action. These cases are included because the most convincing evidence for agentic VAU is not only numerical improvement, but visibly different policy behavior.
 
 ## 6. Discussion
 
 The conceptual shift of Search-to-Verify changes both the **unit of reasoning** and the **unit of optimization**. Prior systems reason over fixed event observations; our framework reasons over the completeness of an evolving event chain. This also clarifies our relationship to multi-granularity VAU: finer temporal granularity does not by itself force the model to search for missing stages, verify evidence sufficiency, or gate finalization on verification. Our contribution is orthogonal to temporal resolution — it concerns the interaction protocol, not the observation scale.
 
-Another important distinction is between scientific novelty and engineering infrastructure. The implementation includes frame caches, feature caches, lazy datasets, distributed rollout, and large-model serving logic. These are important for making the system practical, but they are not the scientific center of the paper. The scientific center is the search-to-verify formulation itself: agentic event-chain search, policy-internal counterfactual evidence verification, and FECV-grounded evidence-faithfulness learning.
+Engineering infrastructure — frame caches, feature caches, lazy datasets, distributed rollout, and large-model serving — is required for the system to run but is orthogonal to the paper's contribution. The contribution is the search-to-verify formulation: agentic event-chain search, policy-internal evidence verification, and FECV-grounded learning. Trainer-side zero-variance fallback is treated as an enabling condition for faithful RL rather than a separate claim.
 
 A natural question is whether stronger reasoning (e.g., chain-of-thought, self-reflection) can achieve the same benefits without the agentic machinery. We argue no, for a structural reason: reasoning-enhanced models (Vad-R1, VAU-R1, SRVAU-R1) still operate on a **fixed evidence budget** determined before reasoning begins. No amount of chain-of-thought reasoning can recover a precursor event that was never observed because the sampling strategy missed it. The agentic formulation changes this: the policy can *decide to look* for missing evidence after an initial scan reveals the need. This is not a quantitative improvement in reasoning quality — it is a qualitative expansion of the observation protocol.
 
@@ -445,13 +501,25 @@ A related objection is "why not just use a better fixed sampling strategy (e.g.,
 
 ## 7. Limitations and Broader Impact
 
-Our claims should be interpreted with clear boundaries. First, the strongest novelty claim is intentionally restricted to **mainstream VAU literature** as of April 12, 2026. We do not claim that no neighboring anomaly-analysis paper explores agentic reasoning; indeed, adjacent VAD work such as PANDA and QVAD indicates that the frontier is moving in a similar direction [9, 10]. Second, the current benchmark instantiation is still dataset-derived and therefore inherits category coverage limits, annotation noise, and dataset bias. Third, although Search-to-Verify is designed for richer agentic behavior, practical runs remain constrained by image budget, turn budget, and context length. Fourth, FECV diagnostics are only as good as the available structured evidence and counterfactual branch definitions.
+Our claims should be interpreted with clear boundaries. First, the strongest novelty claim is intentionally restricted to **mainstream VAU literature** as of April 12, 2026. We do not claim that no neighboring anomaly-analysis paper explores agentic reasoning; indeed, adjacent VAD work such as PANDA and QVAD indicates that the frontier is moving in a similar direction [9, 10]. Second, the current benchmark instantiation is still dataset-derived and therefore inherits category coverage limits, annotation noise, and dataset bias. Third, although Search-to-Verify is designed for richer agentic behavior, practical runs remain constrained by image budget, turn budget, and context length. Fourth, the current collapse-fix evidence comes from training-log diagnostics rather than final benchmark metrics: the post-fix slice still contains residual constant groups (`1.290844` and `0.254138`) and one fully filtered group, so we do **not** claim full collapse resolution or task-level improvement from this evidence alone. Fifth, FECV diagnostics are only as good as the available structured evidence and branch-profile definitions.
 
 From a broader-impact perspective, stronger anomaly understanding can support more transparent safety auditing and more inspectable automated monitoring. At the same time, it can also intensify surveillance applications. For this reason, we argue that anomaly systems should expose insufficiency states and evidence-faithfulness diagnostics rather than forcing a confident answer for every video. A principled `continue_search` or `not_ready_to_finalize` state is safer than a fluent but unsupported anomaly explanation.
 
 ## 8. Conclusion
 
-We present Search-to-Verify, a framework that, through evidence-faithful reinforcement learning, shifts video anomaly understanding from fixed-observation decoding to an **agentic search-to-verify process**. The central change is conceptual as much as technical: the target of reasoning is no longer an isolated anomalous snippet, but the recovery and validation of an **event chain** spanning `precursor -> trigger -> confirmation/aftermath`. By unifying structured tool use, active evidence search, policy-internal counterfactual verification, and evidence-faithful learning, Search-to-Verify offers a concrete path toward anomaly understanding systems that are not only accurate, but also temporally grounded and evidentially accountable. We hope this perspective helps move VAU from passive explanation toward active, verifiable anomaly analysis.
+We present Search-to-Verify, a framework that, through evidence-faithful reinforcement learning, shifts video anomaly understanding from fixed-observation decoding to an **agentic search-to-verify process**. The central change is conceptual as much as technical: the target of reasoning is no longer an isolated anomalous snippet, but the recovery and validation of an **event chain** spanning `precursor -> trigger -> confirmation/aftermath`. By unifying structured tool use, active evidence search, policy-internal verification, and branch-conditioned evidence-faithful learning, Search-to-Verify offers a concrete path toward anomaly understanding systems that are not only accurate, but also temporally grounded and evidentially accountable. We hope this perspective helps move VAU from passive explanation toward active, verifiable anomaly analysis.
+
+## Appendix A. Implemented Multi-Granular FECV Branches
+
+Table A1 summarizes the three implemented reward branches that now instantiate Claim 3 in the active RL path.
+
+| Branch | Activation condition | Implemented reward | Key diagnostics |
+| --- | --- | --- | --- |
+| `easy_normal` | `normal_skip_v1` with `normal_case_type = easy_normal` | $0.55 \, \mathrm{search\_restraint} + 0.25 \, \mathrm{window\_restraint} + 0.20 \, \mathrm{verifier\_trace}$ | low-information normal case, loss multiplier $0.20$, zeroed under zero-variance fallback |
+| `suspicious_normal` | `normal_skip_v1` with `normal_case_type = suspicious_normal` | $0.35 \, \mathrm{search\_restraint} + 0.25 \, \mathrm{grounded\_local} + 0.20 \, \mathrm{query\_alignment} + 0.20 \, \mathrm{verifier\_trace}$ | grounded-local score, provenance, selected-duration ratio, verifier trace |
+| anomaly `online_core` | anomaly target with `branch_profile = online_core` | $0.40 \, \mathrm{selected\_support}_{v2} + 0.20 \, \mathrm{trigger\_necessity}_{v2} + 0.15 \, \mathrm{verifier\_trace} + 0.15 \, \mathrm{stage\_coverage} + 0.10 \, \mathrm{parsimony}$ | compact semantic scaffold, selected support, drop-trigger necessity, verifier trace, stage coverage, minimal-subset parsimony |
+
+The trainer uses a coarser optimization partition on top of these reward branches: `easy_normal`, `hard_normal`, and `anomaly`. Standard groups use group-relative z-score normalization. When a 4-rollout group has zero variance, the trainer falls back to an EMA baseline for non-trivial partitions; `easy_normal` remains zeroed intentionally. This design explains why the post-fix logs show both a large reduction in dead groups and a small number of residual constant buckets.
 
 ## References
 

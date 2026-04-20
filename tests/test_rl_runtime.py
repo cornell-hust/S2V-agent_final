@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
 import torch
 import yaml
 
@@ -15,13 +16,28 @@ import train_saver_rl
 from saver_v3.rl import cli_shared
 from saver_v3.rl.runtime import RLJobConfig, build_active_rl_trl_argv, run_rl_job
 from saver_v3.core.rollout import SaverRolloutRunner, _build_episode_training_feature
-from saver_v3.core.counterfactual_verification import run_counterfactual_verification_batch
+from saver_v3.core.counterfactual_verification import (
+    CounterfactualReplayProtocolError,
+    _finalize_branch_evaluation_request,
+    _parse_counterfactual_branch_replay_response,
+    _run_counterfactual_branch_replay_batch,
+    infer_counterfactual_window_ids,
+    run_counterfactual_verification_batch,
+)
+from saver_v3.core.reward import _fecv_specificity_reward
 from saver_v3.core.schema import SaverEnvironmentState
 from saver_v3.sft.training import _build_rl_completion_episode_spec_from_feature
+from saver_v3.sft.training import BatchBuildResult
 from saver_v3.model.vllm_generation import VllmQwenGenerationPolicy
+from saver_v3.rl import grpo_trainer_env as native_grpo_module
 from saver_v3.rl import timesearch_aligned_grpo_trainer as aligned_grpo_module
 from saver_v3.rl import trl_grpo_trainer as trl_grpo_module
-from saver_v3.rl.trl_grpo_trainer import MutableIterationDataset, TrlVllmGrpoRunner, _continuous_rl_args
+from saver_v3.rl.trl_grpo_trainer import (
+    MutableIterationDataset,
+    TrlVllmGrpoRunner,
+    _continuous_rl_args,
+    should_run_inline_rollout_eval,
+)
 from saver_v3.rl.timesearch_aligned_grpo_trainer import (
     TimesearchAlignedGRPOTrainerMixin,
     _USE_CURRENT_POLICY_LOGPROBS_SENTINEL,
@@ -33,6 +49,26 @@ from saver_v3.rl.trl_grpo_trainer import _save_loadable_hf_authority_checkpoint
 
 def _write_yaml(path: Path, payload: dict) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+class _ReplayBatchPolicy:
+    def __init__(self, response_batches):
+        self.response_batches = [list(batch) for batch in response_batches]
+        self.calls = []
+
+    def generate_from_messages_batch(self, messages_batch):
+        recorded_batch = []
+        for messages in list(messages_batch or []):
+            recorded_batch.append([dict(message) for message in list(messages or [])])
+        self.calls.append(recorded_batch)
+        if not self.response_batches:
+            raise AssertionError("No prepared replay batch responses remain.")
+        responses = list(self.response_batches.pop(0))
+        if len(responses) != len(recorded_batch):
+            raise AssertionError(
+                f"Prepared replay batch size {len(responses)} does not match request batch size {len(recorded_batch)}."
+            )
+        return responses
 
 
 class RLRuntimeTests(unittest.TestCase):
@@ -199,10 +235,10 @@ class RLRuntimeTests(unittest.TestCase):
             self.assertTrue(torch.equal(model.saved["state_dict"]["weight"], torch.tensor([2.0])))
             processor.save_pretrained.assert_called_once_with(str(path))
 
-    def test_repo_rl_yaml_default_min_weight_is_zero_for_diagnostics(self) -> None:
+    def test_repo_rl_yaml_default_min_weight_matches_current_config(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         payload = yaml.safe_load((repo_root / "configs/rl/qwen3_vl_8b_grpo_train.yaml").read_text(encoding="utf-8"))
-        self.assertEqual(float(payload["optimization"]["min_weight"]), 0.0)
+        self.assertEqual(float(payload["optimization"]["min_weight"]), 0.01)
 
     def test_legacy_native_train_entrypoint_fails_fast(self) -> None:
         fake_args = mock.Mock()
@@ -215,164 +251,1108 @@ class RLRuntimeTests(unittest.TestCase):
             "video_id": "vid1",
             "group_id": "vid1",
             "generation_id": 0,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+                {"role": "tool", "content": [{"type": "text", "text": "obs"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+            ],
             "turns": [
                 {
                     "step_index": 1,
                     "action": "tool_call",
                     "tool_name": "scan_timeline",
-                    "_rl_token_trace": {
-                        "prompt_trace": {
-                            "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                            "pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
-                        },
-                        "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
-                        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-                    },
+                    "valid_action": True,
+                    "_prompt_messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                    ],
+                    "_assistant_message_index": 1,
+                    "assistant_response_raw": "scan",
                 },
                 {
                     "step_index": 2,
                     "action": "answer",
                     "tool_name": None,
-                    "_rl_token_trace": {
-                        "prompt_trace": {
-                            "prompt_ids": torch.tensor([[1, 2, 7]], dtype=torch.long),
-                            "prompt_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
-                            "image_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
-                        },
-                        "completion_ids": torch.tensor([[5, 6]], dtype=torch.long),
-                        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-                    },
+                    "valid_action": True,
+                    "_prompt_messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                        {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+                        {"role": "tool", "content": [{"type": "text", "text": "obs"}]},
+                    ],
+                    "_assistant_message_index": 3,
+                    "assistant_response_raw": "answer",
                 },
             ],
         }
-        feature = _build_episode_training_feature(result=result)
+        feature = _build_episode_training_feature(result=result, require_message_supervision=True)
         self.assertIsNotNone(feature)
-        self.assertIn("episode_turn_samples", feature)
-        self.assertEqual(len(feature["episode_turn_samples"]), 2)
-        first_turn, second_turn = feature["episode_turn_samples"]
-        self.assertTrue(torch.equal(first_turn["episode_prompt_trace"]["prompt_ids"], torch.tensor([[1, 2]], dtype=torch.long)))
-        self.assertTrue(torch.equal(second_turn["episode_prompt_trace"]["prompt_ids"], torch.tensor([[1, 2, 7]], dtype=torch.long)))
-        self.assertIn("multimodal_inputs", first_turn["episode_prompt_trace"])
-        self.assertIn("pixel_values", first_turn["episode_prompt_trace"]["multimodal_inputs"])
-        self.assertIn("image_grid_thw", second_turn["episode_prompt_trace"]["multimodal_inputs"])
-        self.assertEqual(first_turn["sample_weight"], 1.0)
-        self.assertEqual(second_turn["sample_weight"], 2.0)
+        self.assertNotIn("episode_turn_samples", feature)
+        self.assertNotIn("episode_prompt_trace", feature)
+        self.assertNotIn("episode_assistant_traces", feature)
+        self.assertIn("messages", feature)
+        self.assertEqual(len(feature["messages"]), 4)
+        self.assertIn("assistant_supervision", feature)
+        self.assertEqual([float(entry["loss_weight"]) for entry in feature["assistant_supervision"]], [1.0, 2.0])
+        self.assertEqual([int(entry["assistant_message_index"]) for entry in feature["assistant_supervision"]], [1, 3])
 
-    def test_episode_training_feature_rejects_legacy_prompt_trace_keys(self) -> None:
+    def test_episode_training_feature_requires_prompt_message_snapshots_for_active_rl(self) -> None:
         result = {
             "video_id": "vid1",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+            ],
             "turns": [
                 {
                     "step_index": 1,
                     "action": "tool_call",
                     "tool_name": "scan_timeline",
-                    "_rl_token_trace": {
-                        "prompt_trace": {
-                            "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                            "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                        },
-                        "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
-                        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-                    },
+                    "valid_action": True,
+                    "_assistant_message_index": 1,
+                    "assistant_response_raw": "scan",
                 }
             ],
         }
-        with self.assertRaisesRegex(ValueError, "prompt_trace must contain tensor `prompt_ids` and `prompt_mask`"):
-            _build_episode_training_feature(result=result)
+        with self.assertRaisesRegex(ValueError, "missing `_prompt_messages`"):
+            _build_episode_training_feature(result=result, require_message_supervision=True)
 
-    def test_episode_training_feature_raises_when_valid_turns_have_no_traces(self) -> None:
+    def test_episode_training_feature_requires_assistant_message_index_for_active_rl(self) -> None:
         result = {
             "video_id": "vid1",
-            "terminated_reason": "finalized",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+            ],
             "turns": [
                 {
                     "step_index": 1,
                     "action": "tool_call",
                     "tool_name": "scan_timeline",
                     "valid_action": True,
-                },
-                {
-                    "step_index": 2,
-                    "action": "tool_call",
-                    "tool_name": "finalize_case",
-                    "valid_action": True,
+                    "_prompt_messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                    ],
+                    "assistant_response_raw": "scan",
                 },
             ],
         }
-        with self.assertRaisesRegex(ValueError, "valid turns but no token traces were attached"):
-            _build_episode_training_feature(result=result)
+        with self.assertRaisesRegex(ValueError, "missing `_assistant_message_index`"):
+            _build_episode_training_feature(result=result, require_message_supervision=True)
 
-    def test_episode_feature_builds_episode_batch(self) -> None:
+    def test_episode_feature_rejects_trace_only_trajectory_pack(self) -> None:
         processor = object()
         feature = {
-            "episode_prompt_trace": {
-                "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                "multimodal_inputs": {
-                    "pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
-                },
-            },
-            "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
-            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-            "advantages": 1.0,
-            "sample_weight": 2.0,
+            "episode_prompt_trace": {"prompt_ids": torch.tensor([[1, 2]], dtype=torch.long)},
+            "episode_assistant_traces": [],
+            "advantage": 1.0,
+            "sample_weight": 1.0,
             "sample_loss_multiplier": 1.0,
         }
-        result = _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
-        self.assertIsNotNone(result.batch)
-        self.assertIn("prompt_ids", result.batch)
-        self.assertIn("completion_ids", result.batch)
-        self.assertIn("completion_mask", result.batch)
-        self.assertIn("old_policy_token_log_probs", result.batch)
-        self.assertIn("advantages", result.batch)
-        self.assertIn("sample_weight", result.batch)
-        self.assertIn("sample_loss_multiplier", result.batch)
-        self.assertIn("multimodal_inputs", result.batch)
-        self.assertIn("pixel_values", result.batch["multimodal_inputs"])
-        self.assertTrue(result.batch["completion_mask"].any().item())
-        self.assertEqual(float(result.batch["sample_weight"].item()), 2.0)
-
-    def test_episode_feature_requires_advantages(self) -> None:
-        processor = object()
-        feature = {
-            "episode_prompt_trace": {
-                "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                "multimodal_inputs": {},
-            },
-            "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
-            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-        }
-        result = _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
-        self.assertIsNone(result.batch)
-        self.assertEqual(result.drop_reason, "missing_rollout_advantages")
-
-    def test_episode_feature_rejects_legacy_flat_prompt_trace_multimodal_tensors(self) -> None:
-        processor = object()
-        feature = {
-            "episode_prompt_trace": {
-                "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                "pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
-            },
-            "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
-            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-            "advantages": 1.0,
-        }
-        with self.assertRaisesRegex(ValueError, "Legacy RL pure-pack prompt_trace format detected"):
+        with self.assertRaisesRegex(ValueError, "require message-only `messages` \\+ `assistant_supervision`"):
             _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
 
-    def test_episode_feature_rejects_legacy_prompt_completion_shape(self) -> None:
+    def test_episode_feature_accepts_message_only_shared_schema(self) -> None:
         processor = object()
         feature = {
-            "prompt_messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
-            "completion_text": "a",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+                {"role": "tool", "content": [{"type": "text", "text": "obs"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+            ],
+            "assistant_supervision": [
+                {"assistant_message_index": 1, "loss_weight": 1.0},
+                {"assistant_message_index": 3, "loss_weight": 2.0},
+            ],
+            "sample_weight": 1.5,
+            "advantage": 1.5,
+            "sample_loss_multiplier": 1.0,
+        }
+        mocked_episode_batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.long),
+            "labels": torch.tensor([[-100, -100, 12, -100, 14, 15]], dtype=torch.long),
+            "token_advantages": torch.tensor([[0.0, 0.0, 1.5, 0.0, 3.0, 3.0]], dtype=torch.float32),
+            "pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+            "completion_mask": torch.tensor([[0, 0, 1, 0, 1, 1]], dtype=torch.bool),
+            "completion_token_count": torch.tensor([3], dtype=torch.long),
+            "sample_weight": torch.tensor([1.5], dtype=torch.float32),
+            "advantage": torch.tensor([1.5], dtype=torch.float32),
+        }
+        with mock.patch(
+            "saver_v3.sft.training._build_episode_batch_from_feature",
+            return_value=BatchBuildResult(
+                batch=mocked_episode_batch,
+                cached_plan=None,
+                completion_token_count=3,
+                drop_reason=None,
+                budgeting_attempted=True,
+                is_episode_feature=True,
+            ),
+        ):
+            result = _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
+        self.assertIsNotNone(result.batch)
+        self.assertTrue(
+            torch.equal(
+                result.batch["prompt_ids"],
+                torch.tensor([[10, 11]], dtype=torch.long),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                result.batch["completion_ids"],
+                torch.tensor([[12, 13, 14, 15]], dtype=torch.long),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                result.batch["completion_mask"],
+                torch.tensor([[1, 1, 1, 1]], dtype=torch.bool),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                result.batch["token_loss_weight"],
+                torch.tensor([[1.0, 0.0, 2.0, 2.0]], dtype=torch.float32),
+            )
+        )
+        self.assertIn("pixel_values", result.batch)
+
+    def test_episode_feature_requires_advantage(self) -> None:
+        processor = object()
+        feature = {
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+            "assistant_supervision": [{"assistant_message_index": 0, "loss_weight": 1.0}],
+        }
+        with self.assertRaisesRegex(ValueError, "must include singular `advantage`"):
+            _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
+
+    def test_episode_feature_rejects_legacy_plural_advantages(self) -> None:
+        processor = object()
+        feature = {
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "scan"}]}],
+            "assistant_supervision": [{"assistant_message_index": 0, "loss_weight": 1.0}],
             "advantages": 1.0,
         }
-        result = _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
-        self.assertIsNone(result.batch)
-        self.assertEqual(result.drop_reason, "missing_pure_pack_materials")
+        with self.assertRaisesRegex(ValueError, "legacy plural `advantages` is no longer supported"):
+            _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
+
+
+def test_episode_feature_rejects_trace_only_fallback_helper():
+    from saver_v3.sft.training import _build_pure_grpo_tensor_pack_from_episode_feature
+    feature = {
+        "episode_prompt_trace": {
+            "prompt_ids": torch.tensor([11, 12], dtype=torch.long),
+            "prompt_mask": torch.tensor([1, 1], dtype=torch.bool),
+            "multimodal_inputs": {},
+        },
+        "episode_assistant_traces": [
+            {
+                "completion_ids": torch.tensor([21, 22, 23], dtype=torch.long),
+                "completion_mask": torch.tensor([1, 1, 1], dtype=torch.bool),
+            }
+        ],
+        "advantage": 0.75,
+        "sample_weight": 0.75,
+        "sample_loss_multiplier": 1.0,
+    }
+    with pytest.raises(ValueError, match="trace-only episode features are no longer supported"):
+        _build_pure_grpo_tensor_pack_from_episode_feature(processor=None, feature=feature)
+
+
+def test_native_prepare_advantages_requires_singular_advantage():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+
+    with pytest.raises(ValueError, match="requires singular `advantage`"):
+        trainer._prepare_advantages(
+            {"sample_weight": torch.tensor([0.5], dtype=torch.float32)},
+            device=torch.device("cpu"),
+        )
+
+
+def test_native_prepared_batch_merge_supports_nested_multimodal_inputs():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer.processor = types.SimpleNamespace(tokenizer=types.SimpleNamespace(pad_token_id=0, eos_token_id=0))
+    trainer._reserved_episode_spec_keys = native_grpo_module._NativeGRPOTrainerMixin._reserved_episode_spec_keys.__get__(trainer)
+    trainer._episode_spec_multimodal_inputs = native_grpo_module._NativeGRPOTrainerMixin._episode_spec_multimodal_inputs.__get__(trainer)
+    trainer._pad_token_id = native_grpo_module._NativeGRPOTrainerMixin._pad_token_id.__get__(trainer)
+    trainer._sequence_pad_values = native_grpo_module._NativeGRPOTrainerMixin._sequence_pad_values.__get__(trainer)
+    trainer._is_full_sequence_aligned_tensor = native_grpo_module._NativeGRPOTrainerMixin._is_full_sequence_aligned_tensor.__get__(trainer)
+    trainer._pad_and_concat = native_grpo_module._NativeGRPOTrainerMixin._pad_and_concat.__get__(trainer)
+    trainer._pad_full_sequence_aligned_and_concat = (
+        native_grpo_module._NativeGRPOTrainerMixin._pad_full_sequence_aligned_and_concat.__get__(trainer)
+    )
+    trainer._multimodal_inputs_signature = native_grpo_module._NativeGRPOTrainerMixin._multimodal_inputs_signature.__get__(trainer)
+    trainer._prepared_batch_merge_signature_entry = (
+        native_grpo_module._NativeGRPOTrainerMixin._prepared_batch_merge_signature_entry.__get__(trainer)
+    )
+    trainer._prepared_batch_merge_signature = (
+        native_grpo_module._NativeGRPOTrainerMixin._prepared_batch_merge_signature.__get__(trainer)
+    )
+    trainer._merge_multimodal_input_samples = (
+        native_grpo_module._NativeGRPOTrainerMixin._merge_multimodal_input_samples.__get__(trainer)
+    )
+    trainer._collate_multimodal_input_samples = (
+        native_grpo_module._NativeGRPOTrainerMixin._collate_multimodal_input_samples.__get__(trainer)
+    )
+    trainer._collate_multimodal_input_value = (
+        native_grpo_module._NativeGRPOTrainerMixin._collate_multimodal_input_value.__get__(trainer)
+    )
+    trainer._merge_prepared_batches = native_grpo_module._NativeGRPOTrainerMixin._merge_prepared_batches.__get__(trainer)
+
+    batch_a = {
+        "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+        "advantage": torch.tensor([1.0], dtype=torch.float32),
+        "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+        "multimodal_inputs": {
+            "pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+            "image_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+        },
+    }
+    batch_b = {
+        "prompt_ids": torch.tensor([[5, 6]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[7, 8]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+        "advantage": torch.tensor([0.5], dtype=torch.float32),
+        "sample_weight": torch.tensor([0.5], dtype=torch.float32),
+        "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+        "multimodal_inputs": {
+            "pixel_values": torch.tensor([[0.3, 0.4]], dtype=torch.float32),
+            "image_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+        },
+    }
+
+    signature = trainer._prepared_batch_merge_signature(batch_a)
+    assert signature
+
+    merged = trainer._merge_prepared_batches([batch_a, batch_b])
+    assert isinstance(merged["multimodal_inputs"], list)
+    assert len(merged["multimodal_inputs"]) == 2
+
+    collated = trainer._episode_spec_multimodal_inputs(merged)
+    assert torch.equal(
+        collated["pixel_values"],
+        torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32),
+    )
+    assert torch.equal(
+        collated["image_grid_thw"],
+        torch.tensor([[1, 1, 2], [1, 1, 2]], dtype=torch.long),
+    )
+
+
+def test_native_prepared_batch_merge_accepts_missing_old_policy_logprobs():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer.processor = types.SimpleNamespace(tokenizer=types.SimpleNamespace(pad_token_id=0, eos_token_id=0))
+    trainer._reserved_episode_spec_keys = native_grpo_module._NativeGRPOTrainerMixin._reserved_episode_spec_keys.__get__(trainer)
+    trainer._episode_spec_multimodal_inputs = native_grpo_module._NativeGRPOTrainerMixin._episode_spec_multimodal_inputs.__get__(trainer)
+    trainer._pad_token_id = native_grpo_module._NativeGRPOTrainerMixin._pad_token_id.__get__(trainer)
+    trainer._sequence_pad_values = native_grpo_module._NativeGRPOTrainerMixin._sequence_pad_values.__get__(trainer)
+    trainer._is_full_sequence_aligned_tensor = native_grpo_module._NativeGRPOTrainerMixin._is_full_sequence_aligned_tensor.__get__(trainer)
+    trainer._pad_and_concat = native_grpo_module._NativeGRPOTrainerMixin._pad_and_concat.__get__(trainer)
+    trainer._pad_full_sequence_aligned_and_concat = (
+        native_grpo_module._NativeGRPOTrainerMixin._pad_full_sequence_aligned_and_concat.__get__(trainer)
+    )
+    trainer._multimodal_inputs_signature = native_grpo_module._NativeGRPOTrainerMixin._multimodal_inputs_signature.__get__(trainer)
+    trainer._prepared_batch_merge_signature_entry = (
+        native_grpo_module._NativeGRPOTrainerMixin._prepared_batch_merge_signature_entry.__get__(trainer)
+    )
+    trainer._prepared_batch_merge_signature = (
+        native_grpo_module._NativeGRPOTrainerMixin._prepared_batch_merge_signature.__get__(trainer)
+    )
+    trainer._merge_multimodal_input_samples = (
+        native_grpo_module._NativeGRPOTrainerMixin._merge_multimodal_input_samples.__get__(trainer)
+    )
+    trainer._merge_prepared_batches = native_grpo_module._NativeGRPOTrainerMixin._merge_prepared_batches.__get__(trainer)
+
+    batch_a = {
+        "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[2]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+        "advantage": torch.tensor([1.0], dtype=torch.float32),
+        "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+        "old_policy_token_log_probs": None,
+        "multimodal_inputs": {"pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32)},
+    }
+    batch_b = {
+        "prompt_ids": torch.tensor([[3]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[4]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1]], dtype=torch.bool),
+        "advantage": torch.tensor([0.5], dtype=torch.float32),
+        "sample_weight": torch.tensor([0.5], dtype=torch.float32),
+        "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+        "old_policy_token_log_probs": None,
+        "multimodal_inputs": {"pixel_values": torch.tensor([[0.3, 0.4]], dtype=torch.float32)},
+    }
+
+    signature = trainer._prepared_batch_merge_signature(batch_a)
+    assert signature
+
+    merged = trainer._merge_prepared_batches([batch_a, batch_b])
+    assert merged["old_policy_token_log_probs"] is None
+    assert isinstance(merged["multimodal_inputs"], list)
+
+
+def test_native_prepared_batch_merge_signature_allows_variable_multimodal_leading_dims():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer.processor = types.SimpleNamespace(tokenizer=types.SimpleNamespace(pad_token_id=0, eos_token_id=0))
+    trainer._reserved_episode_spec_keys = native_grpo_module._NativeGRPOTrainerMixin._reserved_episode_spec_keys.__get__(trainer)
+    trainer._episode_spec_multimodal_inputs = native_grpo_module._NativeGRPOTrainerMixin._episode_spec_multimodal_inputs.__get__(trainer)
+    trainer._pad_token_id = native_grpo_module._NativeGRPOTrainerMixin._pad_token_id.__get__(trainer)
+    trainer._sequence_pad_values = native_grpo_module._NativeGRPOTrainerMixin._sequence_pad_values.__get__(trainer)
+    trainer._is_full_sequence_aligned_tensor = native_grpo_module._NativeGRPOTrainerMixin._is_full_sequence_aligned_tensor.__get__(trainer)
+    trainer._pad_and_concat = native_grpo_module._NativeGRPOTrainerMixin._pad_and_concat.__get__(trainer)
+    trainer._pad_full_sequence_aligned_and_concat = (
+        native_grpo_module._NativeGRPOTrainerMixin._pad_full_sequence_aligned_and_concat.__get__(trainer)
+    )
+    trainer._multimodal_inputs_signature = native_grpo_module._NativeGRPOTrainerMixin._multimodal_inputs_signature.__get__(trainer)
+    trainer._prepared_batch_merge_signature_entry = (
+        native_grpo_module._NativeGRPOTrainerMixin._prepared_batch_merge_signature_entry.__get__(trainer)
+    )
+    trainer._prepared_batch_merge_signature = (
+        native_grpo_module._NativeGRPOTrainerMixin._prepared_batch_merge_signature.__get__(trainer)
+    )
+    trainer._merge_multimodal_input_samples = (
+        native_grpo_module._NativeGRPOTrainerMixin._merge_multimodal_input_samples.__get__(trainer)
+    )
+    trainer._merge_prepared_batches = native_grpo_module._NativeGRPOTrainerMixin._merge_prepared_batches.__get__(trainer)
+
+    batch_a = {
+        "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+        "advantage": torch.tensor([1.0], dtype=torch.float32),
+        "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+        "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+        "multimodal_inputs": {
+            "pixel_values": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+            "image_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+        },
+    }
+    batch_b = {
+        "prompt_ids": torch.tensor([[5, 6]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[7, 8]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+        "advantage": torch.tensor([0.5], dtype=torch.float32),
+        "sample_weight": torch.tensor([0.5], dtype=torch.float32),
+        "sample_loss_multiplier": torch.tensor([1.0], dtype=torch.float32),
+        "multimodal_inputs": {
+            "pixel_values": torch.tensor([[0.3, 0.4], [0.5, 0.6]], dtype=torch.float32),
+            "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 2]], dtype=torch.long),
+        },
+    }
+
+    assert trainer._prepared_batch_merge_signature(batch_a) == trainer._prepared_batch_merge_signature(batch_b)
+
+    merged = trainer._merge_prepared_batches([batch_a, batch_b])
+    collated = trainer._episode_spec_multimodal_inputs(merged)
+    assert tuple(collated["pixel_values"].shape) == (3, 2)
+    assert tuple(collated["image_grid_thw"].shape) == (3, 3)
+
+
+def test_move_episode_spec_to_device_casts_visual_tensors_without_touching_grid_dtype():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer._native_visual_tensor_dtype = torch.bfloat16
+    trainer._is_visual_multimodal_tensor_key = (
+        native_grpo_module._NativeGRPOTrainerMixin._is_visual_multimodal_tensor_key.__get__(trainer)
+    )
+    trainer._move_multimodal_payload_to_device = (
+        native_grpo_module._NativeGRPOTrainerMixin._move_multimodal_payload_to_device.__get__(trainer)
+    )
+    trainer._move_episode_spec_to_device = (
+        native_grpo_module._NativeGRPOTrainerMixin._move_episode_spec_to_device.__get__(trainer)
+    )
+
+    moved = trainer._move_episode_spec_to_device(
+        {
+            "prompt_ids": torch.tensor([[1]], dtype=torch.long),
+            "multimodal_inputs": {
+                "pixel_values": torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+                "image_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+            },
+        },
+        device=torch.device("meta"),
+    )
+
+    assert moved["multimodal_inputs"]["pixel_values"].dtype == torch.bfloat16
+    assert moved["multimodal_inputs"]["pixel_values"].device.type == "meta"
+    assert moved["multimodal_inputs"]["image_grid_thw"].dtype == torch.long
+    assert moved["multimodal_inputs"]["image_grid_thw"].device.type == "meta"
+
+
+def test_native_materialize_episode_spec_requires_cached_episode_spec():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    with pytest.raises(ValueError, match="must contain materialized `episode_spec`"):
+        trainer._materialize_episode_spec(
+            {"video_id": "vid1", "advantage": 1.0},
+            device=torch.device("cpu"),
+        )
+
+def test_episode_feature_rejects_legacy_flat_prompt_trace_multimodal_tensors():
+    processor = object()
+    feature = {
+        "episode_prompt_trace": {"prompt_ids": torch.tensor([[1, 2]], dtype=torch.long)},
+        "advantage": 1.0,
+    }
+    with pytest.raises(ValueError, match="require message-only `messages` \\+ `assistant_supervision`"):
+        _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
+
+
+def test_episode_feature_rejects_legacy_prompt_completion_shape():
+    processor = object()
+    feature = {
+        "prompt_messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "completion_text": "a",
+        "advantage": 1.0,
+    }
+    with pytest.raises(ValueError, match="require message-only `messages` \\+ `assistant_supervision`"):
+        _build_rl_completion_episode_spec_from_feature(processor, feature, max_seq_length=4096)
+
+
+def test_native_build_episode_spec_entry_applies_easy_normal_partition_multiplier():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer._budgeting_stats = mock.Mock()
+    trainer._sample_partition_multipliers = dict(native_grpo_module._DEFAULT_SAMPLE_PARTITION_MULTIPLIERS)
+    trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+    trainer._partition_loss_multiplier = native_grpo_module._NativeGRPOTrainerMixin._partition_loss_multiplier.__get__(trainer)
+    trainer._build_episode_spec_entry_from_rollout = (
+        native_grpo_module._NativeGRPOTrainerMixin._build_episode_spec_entry_from_rollout.__get__(trainer)
+    )
+    rollout = {
+        "video_id": "vid_easy",
+        "generation_id": 2,
+        "group_advantage": 0.5,
+        "scoring_target": {"existence": "normal"},
+        "reward_summary": {
+            "total_reward": 1.0,
+            "fecv_normal_case_type": "easy_normal",
+            "fecv_easy_normal_sample_loss_multiplier": 0.2,
+        },
+        "_rl_episode_training_feature": {
+            "video_id": "vid_easy",
+            "generation_id": 2,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+            ],
+            "assistant_supervision": [
+                {
+                    "assistant_message_index": 1,
+                    "turn_index": 1,
+                    "turn_kind": "scan_timeline",
+                    "tool_name": "scan_timeline",
+                    "loss_weight": 1.0,
+                }
+            ],
+        },
+    }
+    trainer._build_episode_spec = mock.Mock(
+        return_value=BatchBuildResult(
+            batch={"prompt_ids": torch.tensor([[1, 2]], dtype=torch.long)},
+            cached_plan=None,
+            completion_token_count=2,
+            drop_reason=None,
+            budgeting_attempted=True,
+            is_episode_feature=True,
+        )
+    )
+
+    result = trainer._build_episode_spec_entry_from_rollout(rollout)
+
+    assert result is not None
+    feature = trainer._build_episode_spec.call_args.kwargs["feature"]
+    assert float(feature["sample_loss_multiplier"]) == pytest.approx(0.2)
+    assert result["sample_partition"] == "easy_normal"
+    assert float(result["sample_partition_multiplier"]) == pytest.approx(0.2)
+
+
+def test_native_zero_variance_advantage_fallback_uses_partition_baseline_for_hard_normal():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer.advantage_clip = 3.0
+    trainer._advantage_partition_min_history = 1
+    trainer._reward_partition_baselines = {
+        "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+        "hard_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+    }
+    trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+    trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
+    trainer._update_reward_partition_baseline = (
+        native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
+    )
+    trainer._apply_zero_variance_advantage_fallback = (
+        native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
+    )
+    rollouts = [
+        {
+            "group_reward_std": 0.0,
+            "group_advantage": 0.0,
+            "reward_summary": {"total_reward": 0.6, "fecv_normal_case_type": "suspicious_normal"},
+            "scoring_target": {"existence": "normal"},
+        }
+    ]
+
+    updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
+
+    assert updated[0]["sample_partition"] == "hard_normal"
+    assert float(updated[0]["group_advantage"]) == pytest.approx(0.35)
+    assert updated[0]["advantage_source"] == "partition_ema"
+    assert updated[0]["fallback_partition"] == "hard_normal"
+
+
+def test_native_zero_variance_advantage_fallback_keeps_easy_normal_zero():
+    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+    trainer.advantage_clip = 3.0
+    trainer._advantage_partition_min_history = 1
+    trainer._reward_partition_baselines = {
+        "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+        "easy_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+    }
+    trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+    trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
+    trainer._update_reward_partition_baseline = (
+        native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
+    )
+    trainer._apply_zero_variance_advantage_fallback = (
+        native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
+    )
+    rollouts = [
+        {
+            "group_reward_std": 0.0,
+            "group_advantage": 0.0,
+            "reward_summary": {
+                "total_reward": 1.0,
+                "fecv_normal_case_type": "easy_normal",
+                "fecv_easy_normal_sample_loss_multiplier": 0.2,
+            },
+            "scoring_target": {"existence": "normal"},
+        }
+    ]
+
+    updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
+
+    assert updated[0]["sample_partition"] == "easy_normal"
+    assert float(updated[0]["group_advantage"]) == pytest.approx(0.0)
+    assert updated[0]["advantage_source"] == "zero_advantage"
+
+
+def test_select_iteration_indices_balances_anomaly_and_normal_when_records_available():
+    records = [{"label": {"is_anomaly": False}} for _ in range(6)] + [
+        {"label": {"is_anomaly": True}} for _ in range(2)
+    ]
+
+    first = cli_shared.select_iteration_indices(
+        dataset_size=len(records),
+        rollout_count=4,
+        start_index=0,
+        iteration=0,
+        seed=42,
+        records=records,
+    )
+    second = cli_shared.select_iteration_indices(
+        dataset_size=len(records),
+        rollout_count=4,
+        start_index=0,
+        iteration=1,
+        seed=42,
+        records=records,
+    )
+
+    assert sum(1 for index in first if records[index]["label"]["is_anomaly"]) == 2
+    assert sum(1 for index in second if records[index]["label"]["is_anomaly"]) == 2
+    assert len(first) == 4
+    assert len(second) == 4
+
+    def test_native_rollout_flattening_returns_single_trajectory_feature(self) -> None:
+        rollout = {
+            "video_id": "vid1",
+            "group_id": "vid1",
+            "generation_id": 0,
+            "group_advantage": 1.25,
+            "reward_summary": {"total_reward": 1.25},
+            "_rl_episode_training_feature": {
+                "video_id": "vid1",
+                "group_id": "vid1",
+                "generation_id": 0,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+                    {"role": "tool", "content": [{"type": "text", "text": "obs"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                ],
+                "assistant_supervision": [
+                    {"assistant_message_index": 1, "loss_weight": 1.0},
+                    {"assistant_message_index": 3, "loss_weight": 2.0},
+                ],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "no longer uses intermediate rollout features"):
+            native_grpo_module._flatten_rollout_to_episode_features(rollout, min_abs_advantage=0.01)
+
+    def test_trl_vllm_grpo_trainer_routes_to_native_grpo_trainer(self) -> None:
+        args = types.SimpleNamespace(
+            rl_reward_version="timesearch_v3",
+            rl_reward_config={},
+            learning_rate=5e-7,
+            num_train_epochs=1.0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,
+            logging_steps=10,
+            save_steps=100,
+            save_total_limit=2,
+            warmup_ratio=0.03,
+            weight_decay=0.0,
+            max_grad_norm=1.0,
+            bf16=True,
+            fp16=False,
+            dataloader_num_workers=0,
+            dataloader_prefetch_factor=0,
+            dataloader_persistent_workers=False,
+            kl_beta=0.005,
+            ppo_clip_epsilon=0.2,
+            rollout_max_turns=12,
+            num_generations=6,
+            min_weight=0.01,
+            advantage_clip=3.0,
+            policy_max_new_tokens=256,
+            max_image_side=640,
+            max_image_pixels=0,
+            max_total_images=28,
+            keep_recent_tool_image_messages=3,
+            keep_recent_text_messages=20,
+            max_seq_length=8192,
+            policy_do_sample=True,
+            policy_temperature=0.8,
+            policy_top_p=0.95,
+            policy_top_k=50,
+            policy_repetition_penalty=1.02,
+            rl_rollout_use_cache=True,
+            rl_fecv_use_cache=True,
+            rl_compute_loss_microbatch_size=2,
+            rl_steps_per_generation=1,
+            rl_fecv_failure_policy="degrade",
+            rl_log_empty_batch_rank_summary=True,
+            torch_dtype="bfloat16",
+            attn_implementation="flash_attention_3",
+        )
+        trainer = object()
+        reference_model = object()
+        fake_vllm_runtime = object()
+        with mock.patch.object(trl_grpo_module, "create_native_grpo_trainer", return_value=trainer) as native_ctor, mock.patch.object(
+            trl_grpo_module,
+            "load_qwen_model_and_processor",
+            return_value=(reference_model, object()),
+        ) as load_model:
+            result = trl_grpo_module.create_trl_vllm_grpo_trainer(
+                args=args,
+                model=object(),
+                processor=object(),
+                trainer_init_model_path="/tmp/checkpoint",
+                train_items=[],
+                train_dataset=object(),
+                checkpoint_dir="/tmp/out",
+                iteration_index=0,
+                num_iterations=1,
+                config=object(),
+                rollout_eval_callback=None,
+                vllm_runtime=fake_vllm_runtime,
+                proposal_runtime=None,
+                strict_feature_guided_proposal=False,
+                save_strategy="no",
+            )
+        self.assertIs(result, trainer)
+        native_ctor.assert_called_once()
+        load_model.assert_called_once()
+        self.assertIs(native_ctor.call_args.kwargs["reference_model"], reference_model)
+        self.assertTrue(callable(native_ctor.call_args.kwargs["trainer_class_transform"]))
+        transform = native_ctor.call_args.kwargs["trainer_class_transform"]
+
+        class _BaseTrainer:
+            def __init__(self):
+                self.processor = object()
+                self.state = types.SimpleNamespace(global_step=0)
+                self.policy_max_new_tokens = 256
+                self.max_total_images = 28
+                self.max_seq_length = 8192
+                self.keep_recent_tool_image_messages = 3
+                self.keep_recent_text_messages = 20
+                self.max_image_side = 640
+                self.max_image_pixels = 0
+                self.policy_do_sample = True
+                self.policy_temperature = 0.8
+                self.policy_top_p = 0.95
+                self.policy_top_k = 50
+                self.policy_repetition_penalty = 1.02
+
+        transformed_cls = transform(_BaseTrainer)
+        trainer_instance = transformed_cls()
+        with mock.patch.object(trl_grpo_module, "_unwrap_model", return_value=object()):
+            policy = trainer_instance._build_policy(model=object(), use_generation_cache=True)
+        self.assertFalse(policy.capture_rl_token_traces)
+
+    def test_native_generation_item_payload_skips_old_policy_prefetch_when_reuse_is_safe(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer.args = types.SimpleNamespace(gradient_accumulation_steps=4)
+        trainer.steps_per_generation = 1
+        trainer.num_generations = 1
+        trainer.min_weight = 0.0
+        trainer._new_rollout_metric_lists = lambda: {
+            "reward_total": [],
+            "reward_accuracy": [],
+            "reward_fecv_evidence": [],
+            "reward_protocol_finalize": [],
+            "reward_fecv_decision": [],
+            "reward_fecv_specificity": [],
+        }
+        trainer._new_runtime_stats = lambda: {
+            "raw_local_episode_spec_count": 0,
+            "raw_local_prepared_batch_count": 0,
+            "raw_local_sample_count": 0,
+            "local_fecv_failure_count": 0,
+            "groups_filtered_by_min_weight": 0,
+            "groups_all_zero_advantage": 0,
+            "replay_fill_batches": 0,
+            "replay_fill_episode_specs": 0,
+        }
+        trainer._generate_scored_rollouts = lambda item, rollout_model, progress=None: [
+            {
+                "video_id": "vid1",
+                "group_id": "vid1",
+                "generation_id": 0,
+                "group_advantage": 1.0,
+                "reward_summary": {"total_reward": 1.0, "components": {}},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+                "turns": [],
+            }
+        ]
+        trainer._build_episode_spec_entry_from_rollout = mock.Mock(
+            return_value={"episode_spec": {"completion_ids": torch.tensor([[1]])}, "advantage": 1.0}
+        )
+        trainer._populate_old_policy_log_probs = mock.Mock(side_effect=AssertionError("should not be called"))
+
+        payload = trainer._build_generation_item_payload({"video_id": "vid1"}, rollout_model=object())
+        self.assertEqual(len(payload["episode_specs"]), 1)
+        trainer._build_episode_spec_entry_from_rollout.assert_called_once()
+        trainer._populate_old_policy_log_probs.assert_not_called()
+
+    def test_native_generation_item_payload_logs_reward_diagnostics(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer.args = types.SimpleNamespace(gradient_accumulation_steps=4)
+        trainer.steps_per_generation = 1
+        trainer.num_generations = 2
+        trainer.min_weight = 0.01
+        trainer._new_rollout_metric_lists = lambda: {
+            "reward_total": [],
+            "reward_accuracy": [],
+            "reward_fecv_evidence": [],
+            "reward_protocol_finalize": [],
+            "reward_fecv_decision": [],
+            "reward_fecv_specificity": [],
+        }
+        trainer._new_runtime_stats = lambda: {
+            "raw_local_episode_spec_count": 0,
+            "raw_local_prepared_batch_count": 0,
+            "raw_local_sample_count": 0,
+            "local_fecv_failure_count": 0,
+            "groups_filtered_by_min_weight": 0,
+            "groups_all_zero_advantage": 0,
+            "replay_fill_batches": 0,
+            "replay_fill_episode_specs": 0,
+        }
+        trainer._generate_scored_rollouts = lambda item, rollout_model, progress=None: [
+            {
+                "video_id": "vid1",
+                "generation_id": 0,
+                "group_advantage": 0.0,
+                "reward_summary": {
+                    "total_reward": 0.25,
+                    "components": {
+                        "accuracy_reward": 0.0,
+                        "fecv_evidence_faithfulness_reward": 0.25,
+                        "protocol_finalize_reward": 0.0,
+                        "fecv_decision_sufficiency_reward": 0.0,
+                        "fecv_specificity_reward": 0.0,
+                    },
+                },
+                "fecv_failed": False,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+                "turns": [],
+            },
+            {
+                "video_id": "vid1",
+                "generation_id": 1,
+                "group_advantage": 1.5,
+                "reward_summary": {
+                    "total_reward": 1.0,
+                    "components": {
+                        "accuracy_reward": 1.0,
+                        "fecv_evidence_faithfulness_reward": 0.0,
+                        "protocol_finalize_reward": 0.0,
+                        "fecv_decision_sufficiency_reward": 0.0,
+                        "fecv_specificity_reward": 0.0,
+                    },
+                },
+                "fecv_failed": False,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+                "turns": [],
+            },
+        ]
+        trainer._build_episode_spec_entry_from_rollout = mock.Mock(
+            side_effect=[
+                None,
+                {"episode_spec": {"completion_ids": torch.tensor([[1]])}, "advantage": 1.5},
+            ]
+        )
+        trainer._populate_old_policy_log_probs = mock.Mock()
+        logged_messages = []
+        with mock.patch.object(native_grpo_module, "runtime_log", side_effect=lambda message, **kwargs: logged_messages.append(str(message))):
+            payload = trainer._build_generation_item_payload({"video_id": "vid1"}, rollout_model=object())
+        self.assertEqual(len(payload["episode_specs"]), 1)
+        joined = "\n".join(logged_messages)
+        self.assertIn("rl reward/advantage debug:", joined)
+        self.assertIn("min_weight=0.010000", joined)
+        self.assertIn("advantages=['0.000000', '1.500000']", joined)
+        self.assertIn("filtered_below_min_weight=1", joined)
+        self.assertIn("rl reward components debug:", joined)
+
+    def test_build_episode_spec_entry_from_rollout_logs_drop_reason_details(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer._budgeting_stats = mock.Mock()
+        rollout = {
+            "video_id": "vid1",
+            "generation_id": 3,
+            "group_advantage": 0.125,
+            "reward_summary": {"total_reward": 0.25},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+            "turns": [
+                {
+                    "step_index": 1,
+                    "action": "tool_call",
+                    "tool_name": "scan_timeline",
+                    "valid_action": True,
+                    "_prompt_messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+                    "_assistant_message_index": 1,
+                    "assistant_response_raw": "scan",
+                }
+            ],
+        }
+        trainer._build_episode_spec = mock.Mock(
+            return_value=BatchBuildResult(
+                batch=None,
+                cached_plan=None,
+                completion_token_count=0,
+                drop_reason="zero_response_after_budgeting",
+                budgeting_attempted=True,
+                is_episode_feature=True,
+            )
+        )
+        logged_messages = []
+        with mock.patch.object(native_grpo_module, "runtime_log", side_effect=lambda message, **kwargs: logged_messages.append(str(message))):
+            result = trainer._build_episode_spec_entry_from_rollout(rollout)
+        self.assertIsNone(result)
+        joined = "\n".join(logged_messages)
+        self.assertIn("rl episode spec drop debug:", joined)
+        self.assertIn("video_id=vid1", joined)
+        self.assertIn("generation_id=3", joined)
+        self.assertIn("group_advantage=0.125000", joined)
+        self.assertIn("drop_reason=zero_response_after_budgeting", joined)
+        self.assertIn("completion_token_count=0", joined)
+        self.assertIn("has_messages=True", joined)
+        self.assertIn("message_count=1", joined)
+        self.assertIn("assistant_supervision_count=1", joined)
+
+    def test_build_episode_spec_entry_from_rollout_prefers_prebuilt_feature(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer._budgeting_stats = mock.Mock()
+        trainer._sample_partition_multipliers = dict(native_grpo_module._DEFAULT_SAMPLE_PARTITION_MULTIPLIERS)
+        trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+        trainer._partition_loss_multiplier = native_grpo_module._NativeGRPOTrainerMixin._partition_loss_multiplier.__get__(trainer)
+        rollout = {
+            "video_id": "vid1",
+            "generation_id": 0,
+            "group_advantage": 0.5,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+            ],
+            "turns": [
+                {
+                    "step_index": 1,
+                    "action": "tool_call",
+                    "tool_name": "scan_timeline",
+                    "valid_action": True,
+                    # Intentionally omit `_prompt_messages` to mirror the production crash path.
+                    "_assistant_message_index": 1,
+                    "assistant_response_raw": "scan",
+                }
+            ],
+            "_rl_episode_training_feature": {
+                "video_id": "vid1",
+                "generation_id": 0,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+                ],
+                "assistant_supervision": [
+                    {
+                        "assistant_message_index": 1,
+                        "turn_index": 1,
+                        "turn_kind": "scan_timeline",
+                        "tool_name": "scan_timeline",
+                        "loss_weight": 1.0,
+                    }
+                ],
+            },
+        }
+        trainer._build_episode_spec = mock.Mock(
+            return_value=BatchBuildResult(
+                batch={"prompt_ids": torch.tensor([[1, 2]], dtype=torch.long)},
+                cached_plan=None,
+                completion_token_count=2,
+                drop_reason=None,
+                budgeting_attempted=True,
+                is_episode_feature=True,
+            )
+        )
+        with mock.patch.object(
+            native_grpo_module,
+            "_build_episode_training_feature",
+            side_effect=AssertionError("should reuse prebuilt rollout feature"),
+        ):
+            result = trainer._build_episode_spec_entry_from_rollout(rollout)
+        self.assertIsNotNone(result)
+        trainer._build_episode_spec.assert_called_once()
+        feature = trainer._build_episode_spec.call_args.kwargs["feature"]
+        self.assertEqual(float(feature["advantage"]), 0.5)
+        self.assertEqual(len(feature["assistant_supervision"]), 1)
+
+    def test_build_episode_spec_entry_from_rollout_applies_easy_normal_partition_multiplier(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer._budgeting_stats = mock.Mock()
+        trainer._sample_partition_multipliers = dict(native_grpo_module._DEFAULT_SAMPLE_PARTITION_MULTIPLIERS)
+        trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+        trainer._partition_loss_multiplier = native_grpo_module._NativeGRPOTrainerMixin._partition_loss_multiplier.__get__(trainer)
+        rollout = {
+            "video_id": "vid_easy",
+            "generation_id": 2,
+            "group_advantage": 0.5,
+            "scoring_target": {"existence": "normal"},
+            "reward_summary": {
+                "total_reward": 1.0,
+                "fecv_normal_case_type": "easy_normal",
+                "fecv_easy_normal_sample_loss_multiplier": 0.2,
+            },
+            "_rl_episode_training_feature": {
+                "video_id": "vid_easy",
+                "generation_id": 2,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "scan"}]},
+                ],
+                "assistant_supervision": [
+                    {
+                        "assistant_message_index": 1,
+                        "turn_index": 1,
+                        "turn_kind": "scan_timeline",
+                        "tool_name": "scan_timeline",
+                        "loss_weight": 1.0,
+                    }
+                ],
+            },
+        }
+        trainer._build_episode_spec = mock.Mock(
+            return_value=BatchBuildResult(
+                batch={"prompt_ids": torch.tensor([[1, 2]], dtype=torch.long)},
+                cached_plan=None,
+                completion_token_count=2,
+                drop_reason=None,
+                budgeting_attempted=True,
+                is_episode_feature=True,
+            )
+        )
+
+        result = trainer._build_episode_spec_entry_from_rollout(rollout)
+
+        self.assertIsNotNone(result)
+        feature = trainer._build_episode_spec.call_args.kwargs["feature"]
+        self.assertAlmostEqual(float(feature["sample_loss_multiplier"]), 0.2, places=6)
+        self.assertEqual(result["sample_partition"], "easy_normal")
+        self.assertAlmostEqual(float(result["sample_partition_multiplier"]), 0.2, places=6)
+
+    def test_zero_variance_advantage_fallback_uses_partition_baseline_for_hard_normal(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer.advantage_clip = 3.0
+        trainer._advantage_partition_min_history = 1
+        trainer._reward_partition_baselines = {
+            "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+            "hard_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+        }
+        trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+        trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
+        trainer._update_reward_partition_baseline = (
+            native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
+        )
+        trainer._apply_zero_variance_advantage_fallback = (
+            native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
+        )
+        rollouts = [
+            {
+                "group_reward_std": 0.0,
+                "group_advantage": 0.0,
+                "reward_summary": {"total_reward": 0.6, "fecv_normal_case_type": "suspicious_normal"},
+                "scoring_target": {"existence": "normal"},
+            }
+        ]
+
+        updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
+
+        self.assertEqual(updated[0]["sample_partition"], "hard_normal")
+        self.assertAlmostEqual(float(updated[0]["group_advantage"]), 0.35, places=6)
+        self.assertEqual(updated[0]["advantage_source"], "partition_ema")
+        self.assertEqual(updated[0]["fallback_partition"], "hard_normal")
+
+    def test_zero_variance_advantage_fallback_keeps_easy_normal_zero(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer.advantage_clip = 3.0
+        trainer._advantage_partition_min_history = 1
+        trainer._reward_partition_baselines = {
+            "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+            "easy_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
+        }
+        trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
+        trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
+        trainer._update_reward_partition_baseline = (
+            native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
+        )
+        trainer._apply_zero_variance_advantage_fallback = (
+            native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
+        )
+        rollouts = [
+            {
+                "group_reward_std": 0.0,
+                "group_advantage": 0.0,
+                "reward_summary": {
+                    "total_reward": 1.0,
+                    "fecv_normal_case_type": "easy_normal",
+                    "fecv_easy_normal_sample_loss_multiplier": 0.2,
+                },
+                "scoring_target": {"existence": "normal"},
+            }
+        ]
+
+        updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
+
+        self.assertEqual(updated[0]["sample_partition"], "easy_normal")
+        self.assertAlmostEqual(float(updated[0]["group_advantage"]), 0.0, places=6)
+        self.assertEqual(updated[0]["advantage_source"], "zero_advantage")
 
     def test_old_logprob_reuse_condition_matches_timesearch_r_rule(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -449,7 +1429,7 @@ class RLRuntimeTests(unittest.TestCase):
         trainer.fecv_stage_batch_size = 8
         self.assertEqual(trainer._effective_local_rollout_batch_size(), 3)
 
-    def test_rollout_preserves_rl_token_trace_for_episode_training_feature(self) -> None:
+    def test_rollout_captures_prompt_messages_and_builds_message_only_feature(self) -> None:
         class FakeAdapter:
             def build_initial_messages(self, item):
                 return list(item["messages"])
@@ -474,26 +1454,11 @@ class RLRuntimeTests(unittest.TestCase):
 
         class FakePolicy:
             def __init__(self):
-                self._traces = [
-                    {
-                        "prompt_trace": {
-                            "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                        },
-                        "completion_ids": torch.tensor([[3, 4]], dtype=torch.long),
-                        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
-                    }
-                ]
                 self.seen_batch_sizes = []
 
             def generate_from_messages_batch(self, messages_batch):
                 self.seen_batch_sizes.append(len(messages_batch))
                 return ['<tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":1.0}}</tool_call>']
-
-            def pop_last_rl_token_traces(self):
-                traces = self._traces
-                self._traces = None
-                return traces
 
         runner = SaverRolloutRunner(environment=FakeEnvironment(), adapter=FakeAdapter(), max_turns=1)
         policy = FakePolicy()
@@ -504,15 +1469,14 @@ class RLRuntimeTests(unittest.TestCase):
                 "multimodal_cache": {"preview_frames": [], "preview_timestamps": []},
             },
             policy,
+            capture_prompt_messages=True,
         )
 
         self.assertEqual(policy.seen_batch_sizes, [1])
         self.assertIn("_rl_episode_training_feature", result)
-        feature = result["_rl_episode_training_feature"]
-        self.assertEqual(len(feature["episode_turn_samples"]), 1)
-        self.assertTrue(torch.equal(feature["episode_turn_samples"][0]["completion_ids"], torch.tensor([[3, 4]])))
-        self.assertNotIn("_rl_token_trace", result["turns"][0])
+        self.assertIn("messages", result)
         self.assertNotIn("_prompt_messages", result["turns"][0])
+        self.assertNotIn("_assistant_message_index", result["turns"][0])
 
     def test_training_step_skips_backward_when_empty_batch_is_globally_empty(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -1092,6 +2056,362 @@ class RLRuntimeTests(unittest.TestCase):
                 branch_profile="full",
             )
 
+    def test_parse_counterfactual_branch_replay_response_reports_missing_answer_tag(self) -> None:
+        result = _parse_counterfactual_branch_replay_response("plain text without answer tags")
+        self.assertFalse(result["available"])
+        self.assertEqual(result["unavailable_reason"], "missing_answer_tag")
+
+    def test_parse_counterfactual_branch_replay_response_reports_invalid_answer_json(self) -> None:
+        result = _parse_counterfactual_branch_replay_response("<answer>{not-json}</answer>")
+        self.assertFalse(result["available"])
+        self.assertEqual(result["unavailable_reason"], "invalid_answer_json")
+
+    def test_parse_counterfactual_branch_replay_response_reports_normalized_payload_empty(self) -> None:
+        result = _parse_counterfactual_branch_replay_response('<answer>{"summary":"missing decision"}</answer>')
+        self.assertFalse(result["available"])
+        self.assertEqual(result["unavailable_reason"], "normalized_payload_empty")
+
+    def test_finalize_branch_evaluation_request_preserves_replay_unavailable_reason(self) -> None:
+        request = {
+            "window_ids": ["w0002"],
+            "reference_payload": {"decision": {"existence": "normal", "category": "normal"}},
+            "target": {"existence": "normal", "category": "normal"},
+            "stage_requirements": {},
+            "rollout": {},
+        }
+        replay = {
+            "available": False,
+            "response_text": "<answer>{not-json}</answer>",
+            "semantic_answer": None,
+            "semantic_answer_text": None,
+            "final_answer": None,
+            "unavailable_reason": "invalid_answer_json",
+        }
+        result = _finalize_branch_evaluation_request(request, replay)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["unavailable_reason"], "invalid_answer_json")
+
+    def test_parse_counterfactual_branch_replay_response_accepts_bare_json(self) -> None:
+        result = _parse_counterfactual_branch_replay_response(
+            '{"decision":{"existence":"normal","category":"normal"}}'
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["parse_mode"], "bare_json")
+
+    def test_parse_counterfactual_branch_replay_response_repairs_truncated_bare_json(self) -> None:
+        result = _parse_counterfactual_branch_replay_response(
+            '{"decision":{"existence":"normal","category":"normal"}'
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["parse_mode"], "bare_json_repaired")
+
+    def test_parse_counterfactual_branch_replay_response_extracts_compact_decision_from_malformed_full_payload(self) -> None:
+        result = _parse_counterfactual_branch_replay_response(
+            '{"decision":{"existence":"normal","category":"normal"},"summary":"No anomaly found.","qa_focus_answers":{"existence":"No anomaly."}',
+            compact_decision_only=True,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["parse_mode"], "bare_json_decision_extracted")
+
+    def test_parse_counterfactual_branch_replay_response_extracts_compact_decision_before_known_tail_markers(self) -> None:
+        result = _parse_counterfactual_branch_replay_response(
+            '{"decision":{"existence":"normal","category":"normal","severity":0},"required_stages":[],"available_stages":[],"stage_to_moment_ids":',
+            compact_decision_only=True,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["parse_mode"], "bare_json_decision_extracted")
+
+    def test_parse_counterfactual_branch_replay_response_extracts_compact_decision_fields_from_malformed_payload(self) -> None:
+        result = _parse_counterfactual_branch_replay_response(
+            '{"decision":{"existence":"normal","category":"normal","severity":0,"hard_normal":true,"anomaly_interval_sec":null,"precursor_interval_sec":null,"earliest_actionable_sec":null,"evidence_moment_ids":',
+            compact_decision_only=True,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["parse_mode"], "bare_json_decision_fields_extracted")
+
+    def test_run_counterfactual_branch_replay_batch_accepts_bare_json_without_answer_tag(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['{"decision":{"existence":"normal","category":"normal"}}'],
+            ]
+        )
+        result = _run_counterfactual_branch_replay_batch(
+            policy,
+            requests=[
+                {
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "reply with answer"}]}],
+                    "target": {"existence": "normal", "category": "normal"},
+                    "compact_decision_only": True,
+                }
+            ],
+        )
+        self.assertTrue(result[0]["available"])
+        self.assertEqual(result[0]["parse_mode"], "bare_json")
+        self.assertEqual(len(policy.calls), 1)
+
+    def test_run_counterfactual_branch_replay_batch_accepts_repaired_bare_json(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['{"decision":{"existence":"normal","category":"normal"}'],
+            ]
+        )
+        result = _run_counterfactual_branch_replay_batch(
+            policy,
+            requests=[
+                {
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "reply with answer"}]}],
+                    "target": {"existence": "normal", "category": "normal"},
+                    "compact_decision_only": True,
+                }
+            ],
+        )
+        self.assertTrue(result[0]["available"])
+        self.assertEqual(result[0]["parse_mode"], "bare_json_repaired")
+
+    def test_run_counterfactual_branch_replay_batch_raises_on_missing_answer_tag_without_json(self) -> None:
+        policy = _ReplayBatchPolicy([["plain text without answer tags"]])
+        with self.assertRaises(CounterfactualReplayProtocolError) as exc_info:
+            _run_counterfactual_branch_replay_batch(
+                policy,
+                requests=[
+                    {
+                        "messages": [{"role": "user", "content": [{"type": "text", "text": "reply with answer"}]}],
+                        "target": {"existence": "normal", "category": "normal"},
+                        "compact_decision_only": True,
+                        "branch_name": "full_selected",
+                        "rollout": {"video_id": "sample", "generation_id": 3},
+                    }
+                ],
+            )
+        self.assertIn("missing_answer_tag", str(exc_info.exception))
+        self.assertIn("full_selected", str(exc_info.exception))
+
+    def test_run_counterfactual_branch_replay_batch_raises_on_tool_call_output(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['<tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0}}</tool_call>'],
+            ]
+        )
+        with self.assertRaises(CounterfactualReplayProtocolError) as exc_info:
+            _run_counterfactual_branch_replay_batch(
+                policy,
+                requests=[
+                    {
+                        "messages": [{"role": "user", "content": [{"type": "text", "text": "reply with answer"}]}],
+                        "target": {"existence": "normal", "category": "normal"},
+                        "compact_decision_only": True,
+                        "branch_name": "full_selected",
+                        "rollout": {"video_id": "sample", "generation_id": 7},
+                    }
+                ],
+            )
+        self.assertIn("tool_call_not_allowed", str(exc_info.exception))
+
+    def test_infer_counterfactual_window_ids_merges_sources_in_priority_order(self) -> None:
+        rollout = {
+            "state": {"active_evidence_window_ids": ["w0002"]},
+            "turns": [
+                {
+                    "tool_name": "verify_hypothesis",
+                    "verifier_verified_window_ids": ["w0003"],
+                    "self_verification_selected_window_ids": ["w0004"],
+                }
+            ],
+        }
+        self.assertEqual(infer_counterfactual_window_ids(rollout), ["w0002", "w0003", "w0004"])
+
+    def test_online_core_executes_minimal_subset_with_compact_scaffold(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['<answer>{"decision":{"existence":"anomaly","category":"fall"}}</answer>'],
+                ['<answer>{"decision":{"existence":"anomaly","category":"fall"}}</answer>'],
+            ]
+        )
+        result = run_counterfactual_verification_batch(
+            policy,
+            batch_inputs=[
+                {
+                    "item": {"video_id": "sample", "multimodal_cache": {"question": "Does an anomaly exist?"}},
+                    "rollout": {
+                        "video_id": "sample",
+                        "state": {
+                            "active_evidence_window_ids": ["w0002"],
+                            "evidence_ledger": [
+                                {
+                                    "window_id": "w0002",
+                                    "role": "trigger",
+                                    "description": "A person falls to the ground.",
+                                    "selected_frame_indices": [],
+                                    "selected_timestamps": [],
+                                }
+                            ],
+                        },
+                        "turns": [],
+                    },
+                    "reference_record": {
+                        "structured_target": {
+                            "existence": "anomaly",
+                            "category": "fall",
+                            "event_chain_target": {"required_stages": ["trigger"]},
+                        }
+                    },
+                }
+            ],
+            branch_profile="online_core",
+        )
+        self.assertGreaterEqual(len(policy.calls), 2)
+        self.assertIn("minimal_subset", result[0]["counterfactual_branches"])
+        second_call_messages = policy.calls[1][0]
+        user_text = ""
+        for message in second_call_messages:
+            if message.get("role") != "user":
+                continue
+            for item in message.get("content", []):
+                if isinstance(item, dict) and item.get("type") == "text":
+                    user_text += str(item.get("text") or "")
+        self.assertIn('"decision"', user_text)
+        self.assertNotIn('"summary"', user_text)
+        self.assertNotIn('"qa_focus_answers"', user_text)
+
+    def test_minimal_subset_uses_full_semantic_scaffold(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['<answer>{"decision":{"existence":"normal","category":"normal"},"summary":"No anomaly found.","rationale":"Evidence supports normal.","event_chain_summary":{"precursor":"","trigger":"","confirmation":""},"qa_focus_answers":{"existence":"No anomaly.","category":"Normal video.","temporal":"No anomaly interval."}}</answer>'],
+                ['<answer>{"decision":{"existence":"normal","category":"normal"},"summary":"No anomaly found.","rationale":"Evidence supports normal.","event_chain_summary":{"precursor":"","trigger":"","confirmation":""},"qa_focus_answers":{"existence":"No anomaly.","category":"Normal video.","temporal":"No anomaly interval."}}</answer>'],
+            ]
+        )
+        run_counterfactual_verification_batch(
+            policy,
+            batch_inputs=[
+                {
+                    "item": {"video_id": "sample", "multimodal_cache": {"question": "Does an anomaly exist?"}},
+                    "rollout": {
+                        "video_id": "sample",
+                        "state": {
+                            "active_evidence_window_ids": ["w0002"],
+                            "evidence_ledger": [
+                                {
+                                    "window_id": "w0002",
+                                    "role": "observation",
+                                    "description": "A person falls to the ground.",
+                                    "selected_frame_indices": [],
+                                    "selected_timestamps": [],
+                                }
+                            ],
+                        },
+                        "turns": [],
+                    },
+                    "reference_record": {"structured_target": {"existence": "normal", "category": "normal"}},
+                }
+            ],
+            branch_profile="full",
+        )
+        self.assertGreaterEqual(len(policy.calls), 2)
+        second_call_messages = policy.calls[1][0]
+        user_text = ""
+        for message in second_call_messages:
+            if message.get("role") != "user":
+                continue
+            for item in message.get("content", []):
+                if isinstance(item, dict) and item.get("type") == "text":
+                    user_text += str(item.get("text") or "")
+        self.assertIn('"summary"', user_text)
+        self.assertIn('"qa_focus_answers"', user_text)
+
+    def test_minimal_subset_failure_is_isolated_in_full_profile(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['{"decision":{"existence":"normal","category":"normal"}}'],
+                ['{"decision":{"existence":"normal","category":"normal"}} trailing'],
+            ]
+        )
+        result = run_counterfactual_verification_batch(
+            policy,
+            batch_inputs=[
+                {
+                    "item": {"video_id": "sample", "multimodal_cache": {"question": "Does an anomaly exist?"}},
+                    "rollout": {
+                        "video_id": "sample",
+                        "state": {
+                            "active_evidence_window_ids": ["w0002"],
+                            "evidence_ledger": [
+                                {
+                                    "window_id": "w0002",
+                                    "role": "observation",
+                                    "description": "A person falls to the ground.",
+                                    "selected_frame_indices": [],
+                                    "selected_timestamps": [],
+                                }
+                            ],
+                        },
+                        "turns": [],
+                    },
+                    "reference_record": {"structured_target": {"existence": "normal", "category": "normal"}},
+                }
+            ],
+            branch_profile="full",
+        )
+        branches = result[0]["counterfactual_branches"]
+        self.assertTrue(branches["full_selected"]["available"])
+        self.assertFalse(branches["minimal_subset"]["available"])
+        self.assertEqual(branches["minimal_subset"]["unavailable_reason"], "invalid_bare_json")
+
+    def test_fecv_specificity_reward_ignores_minimal_subset_in_online_core(self) -> None:
+        profile = {
+            "counterfactual_profile_source": "online_core",
+            "selection_metadata": {"normalized_branch_profile": "online_core"},
+            "summary": {
+                "minimal_subset_sufficiency": False,
+                "negative_specificity_pass": False,
+                "counterfactual_type_supported": False,
+            },
+            "branch_field_matrix": {
+                "minimal_subset": {"available": True},
+            },
+            "branch_delta_matrix": {},
+        }
+        self.assertEqual(_fecv_specificity_reward(profile, target={"counterfactual_type": "none"}), 0.0)
+
+    def test_counterfactual_verification_batch_preserves_input_order_with_normal_skip(self) -> None:
+        policy = _ReplayBatchPolicy(
+            [
+                ['{"decision":{"existence":"anomaly","category":"assault"}}'],
+            ]
+        )
+        result = run_counterfactual_verification_batch(
+            policy,
+            batch_inputs=[
+                {
+                    "item": {"video_id": "normal_first"},
+                    "rollout": {"video_id": "normal_first", "state": {}, "turns": []},
+                    "reference_record": {"structured_target": {"existence": "normal", "category": "normal"}},
+                },
+                {
+                    "item": {"video_id": "anomaly_second", "multimodal_cache": {"question": "Does an anomaly exist?"}},
+                    "rollout": {
+                        "video_id": "anomaly_second",
+                        "state": {
+                            "active_evidence_window_ids": ["w0002"],
+                            "evidence_ledger": [
+                                {
+                                    "window_id": "w0002",
+                                    "role": "observation",
+                                    "description": "A person falls to the ground.",
+                                    "selected_frame_indices": [],
+                                    "selected_timestamps": [],
+                                }
+                            ],
+                        },
+                        "turns": [],
+                    },
+                    "reference_record": {"structured_target": {"existence": "anomaly", "category": "assault"}},
+                },
+            ],
+            branch_profile="online_core",
+        )
+        self.assertEqual(result[0]["counterfactual_profile_source"], "normal_skip_v1")
+        self.assertEqual(result[1]["counterfactual_profile_source"], "online_core")
+
     def test_generate_scored_rollouts_batch_skips_verification_policy_for_structured_oracle(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
         trainer.num_generations = 1
@@ -1443,6 +2763,7 @@ class RLRuntimeTests(unittest.TestCase):
         trainer._build_generation_batch_key = lambda items: ("batch",)
         trainer._empty_generation_step_payload = lambda video_ids=None: {"episode_inputs": [], "runtime_stats": {}, "rollout_metrics": {}, "budgeting_metrics": {}, "video_ids": video_ids or []}
         trainer._align_episode_inputs_across_ranks = lambda episode_inputs, device, runtime_stats: list(episode_inputs)
+        trainer.rl_enable_reference_prefetch_cache = False
         trainer._materialize_episode_inputs = mock.Mock(side_effect=lambda episode_inputs, device: list(episode_inputs))
         trainer._populate_old_policy_log_probs = mock.Mock(side_effect=AssertionError("should not be called from prepare_inputs"))
         trainer._has_trainable_weight = TimesearchAlignedGRPOTrainerMixin._has_trainable_weight.__get__(trainer)
@@ -1591,16 +2912,10 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertEqual(materialized[0]["old_policy_token_log_probs"].shape[0], 5)
         self.assertEqual(len(materialized[0]["multimodal_inputs"]), 5)
 
-    def test_iter_loss_microbatches_slices_nested_multimodal_inputs(self) -> None:
+    def test_iter_loss_microbatches_keeps_full_episode_input(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
         trainer.compute_loss_microbatch_size = 2
         trainer._episode_input_sample_count = TimesearchAlignedGRPOTrainerMixin._episode_input_sample_count.__get__(trainer)
-        trainer._slice_episode_input_sample_range = (
-            TimesearchAlignedGRPOTrainerMixin._slice_episode_input_sample_range.__get__(trainer)
-        )
-        trainer._slice_multimodal_input_samples = (
-            TimesearchAlignedGRPOTrainerMixin._slice_multimodal_input_samples.__get__(trainer)
-        )
         trainer._iter_loss_microbatches = TimesearchAlignedGRPOTrainerMixin._iter_loss_microbatches.__get__(trainer)
 
         microbatches = trainer._iter_loss_microbatches(
@@ -1617,11 +2932,9 @@ class RLRuntimeTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(len(microbatches), 2)
-        self.assertEqual(microbatches[0]["prompt_ids"].shape[0], 2)
-        self.assertEqual(len(microbatches[0]["multimodal_inputs"]), 2)
-        self.assertEqual(microbatches[1]["prompt_ids"].shape[0], 2)
-        self.assertEqual(len(microbatches[1]["multimodal_inputs"]), 2)
+        self.assertEqual(len(microbatches), 1)
+        self.assertEqual(microbatches[0]["prompt_ids"].shape[0], 4)
+        self.assertEqual(len(microbatches[0]["multimodal_inputs"]), 4)
 
     def test_zero_advantage_payload_no_longer_replays_recent_payload(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -1969,6 +3282,42 @@ class RLRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(job.rollout_stage_batch_size, 6)
             self.assertEqual(job.fecv_stage_batch_size, 5)
+            self.assertEqual(job.compute_loss_microbatch_size, 2)
+
+    def test_rl_job_config_parses_compute_loss_microbatch_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / "rl.yaml"
+            model_config_path = tmp_path / "model.yaml"
+            attention_config_path = tmp_path / "attn.yaml"
+            rollout_config_path = tmp_path / "rollout.yaml"
+
+            _write_yaml(rollout_config_path, {"server": {"launcher": "external_launcher"}})
+            _write_yaml(model_config_path, {
+                "base_model": "/models/qwen3-vl-8b-Instruct",
+                "attn_implementation": "flash_attention_3",
+            })
+            _write_yaml(attention_config_path, {"policy_name": "fa3_only"})
+            _write_yaml(config_path, {
+                "policy_init_from": "/checkpoints/sft/final_hf_model",
+                "rollout_backend": "vllm",
+                "rollout_config": str(rollout_config_path),
+                "data": {"train_manifest": "/data/rl_train.jsonl"},
+                "optimization": {
+                    "compute_loss_microbatch_size": 4,
+                    "max_tool_message_frames": 4,
+                    "max_total_video_frames": 12,
+                },
+            })
+
+            job = RLJobConfig.from_files(
+                config_path=str(config_path),
+                model_config_path=str(model_config_path),
+                attention_config_path=str(attention_config_path),
+            )
+            self.assertEqual(job.compute_loss_microbatch_size, 4)
+            self.assertEqual(job.max_tool_message_frames, 4)
+            self.assertEqual(job.max_total_video_frames, 12)
 
     def test_rl_job_config_defaults_keep_recent_tool_image_messages_to_three(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2095,6 +3444,9 @@ class RLRuntimeTests(unittest.TestCase):
             rollout_config="/tmp/rollout.yaml",
             deepspeed_config_path="/tmp/zero3.json",
             reward_config={"weights": {"temporal_miou_weight": 1.0}},
+            inline_rollout_eval=True,
+            rollout_eval_start_iteration=10,
+            rollout_eval_interval_iterations=10,
             num_iterations=7,
             num_train_epochs=1.0,
             learning_rate=5e-7,
@@ -2131,6 +3483,9 @@ class RLRuntimeTests(unittest.TestCase):
         _assert_flag_value("--model-path", "/tmp/policy")
         self.assertNotIn("--reference-model-path", argv)
         _assert_flag_value("--deepspeed", "/tmp/zero3.json")
+        self.assertIn("--inline-rollout-eval", argv)
+        _assert_flag_value("--rollout-eval-start-iteration", "10")
+        _assert_flag_value("--rollout-eval-interval-iterations", "10")
         _assert_flag_value("--vllm-guided-decoding-regex", "^json$")
         _assert_flag_value("--min-weight", "0.0")
         _assert_flag_value("--advantage-clip", "2.5")
@@ -2148,6 +3503,36 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertIn("--gradient-checkpointing", argv)
         self.assertIn("--policy-do-sample", argv)
         self.assertIn("--bf16", argv)
+
+    def test_inline_rollout_eval_scheduler_supports_start_and_interval(self) -> None:
+        self.assertFalse(
+            should_run_inline_rollout_eval(
+                8,
+                eval_start_iteration=10,
+                eval_every_iterations=10,
+            )
+        )
+        self.assertTrue(
+            should_run_inline_rollout_eval(
+                9,
+                eval_start_iteration=10,
+                eval_every_iterations=10,
+            )
+        )
+        self.assertFalse(
+            should_run_inline_rollout_eval(
+                10,
+                eval_start_iteration=10,
+                eval_every_iterations=10,
+            )
+        )
+        self.assertTrue(
+            should_run_inline_rollout_eval(
+                19,
+                eval_start_iteration=10,
+                eval_every_iterations=10,
+            )
+        )
 
     def test_build_active_rl_trl_argv_omits_open_ended_judge_flags(self) -> None:
         job = RLJobConfig(
@@ -2278,6 +3663,33 @@ class RLRuntimeTests(unittest.TestCase):
         self.assertEqual(len(first), 4)
         self.assertEqual(len(second), 4)
         self.assertTrue(set(first).isdisjoint(set(second)))
+
+    def test_select_iteration_indices_balances_anomaly_and_normal_when_records_available(self) -> None:
+        records = [{"label": {"is_anomaly": False}} for _ in range(6)] + [
+            {"label": {"is_anomaly": True}} for _ in range(2)
+        ]
+
+        first = cli_shared.select_iteration_indices(
+            dataset_size=len(records),
+            rollout_count=4,
+            start_index=0,
+            iteration=0,
+            seed=42,
+            records=records,
+        )
+        second = cli_shared.select_iteration_indices(
+            dataset_size=len(records),
+            rollout_count=4,
+            start_index=0,
+            iteration=1,
+            seed=42,
+            records=records,
+        )
+
+        self.assertEqual(sum(1 for index in first if records[index]["label"]["is_anomaly"]), 2)
+        self.assertEqual(sum(1 for index in second if records[index]["label"]["is_anomaly"]), 2)
+        self.assertEqual(len(first), 4)
+        self.assertEqual(len(second), 4)
 
     def test_run_rl_job_writes_launch_manifest_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2524,6 +3936,11 @@ class RLRuntimeTests(unittest.TestCase):
                 "policy_init_from": "/checkpoints/sft/final_hf_model",
                 "rollout_backend": "vllm",
                 "rollout_config": str(rollout_config_path),
+                "logging": {
+                    "inline_rollout_eval": True,
+                    "rollout_eval_start_iteration": 10,
+                    "rollout_eval_interval_iterations": 10,
+                },
                 "data": {
                     "train_manifest": "/data/rl_train.jsonl",
                     "eval_manifest": "/data/rl_eval.jsonl",
@@ -2541,6 +3958,9 @@ class RLRuntimeTests(unittest.TestCase):
             self.assertEqual(job.materialized_train_items_path, "/data/rl_train.materialized.jsonl")
             self.assertEqual(job.materialized_eval_items_path, "/data/rl_eval.materialized.jsonl")
             self.assertTrue(job.require_materialized_runtime_cache)
+            self.assertTrue(job.inline_rollout_eval)
+            self.assertEqual(job.rollout_eval_start_iteration, 10)
+            self.assertEqual(job.rollout_eval_interval_iterations, 10)
 
     def test_build_active_rl_trl_argv_includes_materialized_runtime_cache_flags(self) -> None:
         job = RLJobConfig(
@@ -2564,12 +3984,25 @@ class RLRuntimeTests(unittest.TestCase):
             rollout_backend="vllm",
             rollout_config="/tmp/rollout.yaml",
             deepspeed_config_path="/tmp/zero3.json",
+            inline_rollout_eval=True,
+            rollout_eval_start_iteration=10,
+            rollout_eval_interval_iterations=10,
         )
         argv = build_active_rl_trl_argv(job)
-        argv_pairs = dict(zip(argv[::2], argv[1::2]))
-        self.assertEqual(argv_pairs["--materialized-train-items-path"], "/tmp/train.materialized.jsonl")
-        self.assertEqual(argv_pairs["--materialized-eval-items-path"], "/tmp/eval.materialized.jsonl")
-        self.assertEqual(argv_pairs["--require-materialized-runtime-cache"], "true")
+        def _flag_value(flag: str) -> str:
+            self.assertIn(flag, argv)
+            index = argv.index(flag)
+            self.assertLess(index + 1, len(argv))
+            return argv[index + 1]
+
+        self.assertEqual(_flag_value("--materialized-train-items-path"), "/tmp/train.materialized.jsonl")
+        self.assertEqual(_flag_value("--materialized-eval-items-path"), "/tmp/eval.materialized.jsonl")
+        self.assertEqual(_flag_value("--require-materialized-runtime-cache"), "true")
+        self.assertEqual(_flag_value("--rl-compute-loss-microbatch-size"), "2")
+        self.assertEqual(_flag_value("--max-tool-message-frames"), "0")
+        self.assertEqual(_flag_value("--max-total-video-frames"), "0")
+        self.assertEqual(_flag_value("--rollout-eval-start-iteration"), "10")
+        self.assertEqual(_flag_value("--rollout-eval-interval-iterations"), "10")
 
     def test_build_managed_reference_model_uses_prepare_deepspeed_for_zero3(self) -> None:
         trainer = types.SimpleNamespace(
@@ -2789,8 +4222,8 @@ class RefLogprobPrefetchTests(unittest.TestCase):
     def test_prefetch_uses_reference_forward_for_active_episodes(self) -> None:
         trainer = self._make_trainer(reference_model=mock.Mock())
         trainer.reference_model.parameters = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
-        active_episode = self._make_episode(sample_count=2, completion_tokens=4, sample_loss_multiplier=1.0)
-        known_tensor = torch.arange(8, dtype=torch.float32).view(2, 4) * 0.1
+        active_episode = self._make_episode(sample_count=4, completion_tokens=4, sample_loss_multiplier=1.0)
+        known_tensor = torch.arange(16, dtype=torch.float32).view(4, 4) * 0.1
         trainer._compute_reference_token_log_probs_for_batch = mock.Mock(return_value=known_tensor)
         trainer._prefetch_reference_log_probs(
             wrapped_model=None,
@@ -2801,8 +4234,15 @@ class RefLogprobPrefetchTests(unittest.TestCase):
         self.assertIsInstance(cached, torch.Tensor)
         self.assertEqual(cached.dtype, torch.float32)
         self.assertEqual(cached.device.type, "cpu")
-        self.assertEqual(tuple(cached.shape), (2, 4))
+        self.assertEqual(tuple(cached.shape), (4, 4))
         self.assertTrue(torch.allclose(cached, known_tensor))
+
+    def test_iter_reference_prefetch_batches_keeps_full_episode_input(self) -> None:
+        trainer = self._make_trainer(compute_loss_microbatch_size=2)
+        episode = self._make_episode(sample_count=4, completion_tokens=3, sample_loss_multiplier=1.0)
+        batches = trainer._iter_reference_prefetch_batches(episode)
+        self.assertEqual(len(batches), 1)
+        self.assertIs(batches[0], episode)
 
     def test_compute_loss_uses_cached_reference_logprobs_when_present(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -2885,24 +4325,17 @@ class RefLogprobPrefetchTests(unittest.TestCase):
         expected_sample = expected_per_token.sum(dim=-1) / 2.0
         self.assertTrue(torch.allclose(sample_losses.detach(), expected_sample, atol=1e-5))
 
-    def test_microbatch_slicing_preserves_reference_cache(self) -> None:
+    def test_iter_loss_microbatches_keeps_reference_cache_on_full_episode(self) -> None:
         trainer = self._make_trainer(compute_loss_microbatch_size=2)
         episode = self._make_episode(sample_count=4, completion_tokens=3, sample_loss_multiplier=1.0)
         episode["reference_token_log_probs"] = torch.arange(12, dtype=torch.float32).view(4, 3) * 0.1
         microbatches = trainer._iter_loss_microbatches(episode)
-        self.assertEqual(len(microbatches), 2)
-        self.assertEqual(tuple(microbatches[0]["reference_token_log_probs"].shape), (2, 3))
-        self.assertEqual(tuple(microbatches[1]["reference_token_log_probs"].shape), (2, 3))
+        self.assertEqual(len(microbatches), 1)
+        self.assertEqual(tuple(microbatches[0]["reference_token_log_probs"].shape), (4, 3))
         self.assertTrue(
             torch.allclose(
                 microbatches[0]["reference_token_log_probs"],
-                episode["reference_token_log_probs"][0:2],
-            )
-        )
-        self.assertTrue(
-            torch.allclose(
-                microbatches[1]["reference_token_log_probs"],
-                episode["reference_token_log_probs"][2:4],
+                episode["reference_token_log_probs"],
             )
         )
 
@@ -2918,16 +4351,12 @@ class RefLogprobPrefetchTests(unittest.TestCase):
         self.assertNotIn("reference_token_log_probs", episode)
 
     def test_prefetch_noop_when_flag_off(self) -> None:
-        # Flag off: caller (_prepare_inputs) is expected to skip _prefetch_reference_log_probs.
-        # This test asserts that when the flag is False, a manually-simulated skip leaves
-        # no cache on the episode and the inline reference forward path still runs.
         trainer = self._make_trainer(
             kl_beta=0.1,
             reference_model=mock.Mock(),
             rl_enable_reference_prefetch_cache=False,
         )
         episode = self._make_episode(sample_count=1, completion_tokens=2, sample_loss_multiplier=1.0)
-        # Simulate the _prepare_inputs skip guarded by the feature flag:
         if trainer.rl_enable_reference_prefetch_cache:
             trainer._prefetch_reference_log_probs(
                 wrapped_model=None,

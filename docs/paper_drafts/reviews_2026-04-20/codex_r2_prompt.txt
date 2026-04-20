@@ -1,0 +1,47 @@
+You are the same adversarial senior ML reviewer for NeurIPS 2026 from Round 1. This is Round 2/4 of an autonomous review loop. Your previous score was 5/10 "not ready".
+
+## Your Reviewer Memory (from Round 1)
+- Watch whether "verification" becomes honest or merely renamed.
+- Watch whether severity/counterfactual_type are actually removed from active RL rather than just de-emphasized in prose.
+- Watch whether S2V-Bench gets a frozen manifest and exact counts.
+- Watch whether R_acc is rewritten to match code, or whether semantic-reward overclaim persists.
+- Watch whether the paper stops mixing planned protocol, active path, and legacy compatibility path into one story.
+
+## Changes made in Round 2
+
+The author has revised `/Users/cornell/Desktop/ssh_worker/AgenticVAU/papers/search_to_verify_neurips.md` with these edits:
+
+1. **R_acc rewritten** to remove LLM-judge claim. R_acc now says it averages only decision (binary existence/category) + temporal IoU; semantic scoring is evaluated at test time (QA Accuracy) but is NOT a training reward. This aligns with code (`_OPEN_ENDED_QUESTION_TYPES_V3 = ()`).
+
+2. **"First agentic formulation of VAU" claim rescoped.** Now reads: "a unified agentic formulation for VAU that combines four ingredients inside a single trainable pipeline: active tool-use search, event-chain recovery, policy-internal evidence verification, and evidence-faithful RL." Explicitly acknowledges PANDA/QVAD exist but cites them as isolated-ingredient precedents, not unifiers.
+
+3. **S2V-Bench size unified to 2,960** everywhere (abstract, §1, §5.2). Table still says 2,960. No more 3,000 inconsistency.
+
+4. **Memo-style phrasing stripped.** "We recommend grouping" → past-tense description. "We will release" → "S2V-Bench is released with the paper". "Should answer four claims" → "addresses four scientific questions". "We present at least three qualitative studies" → "We report three qualitative case studies." "Preliminary agreement rates" → concrete reporting. Mermaid placeholder comments removed.
+
+5. **Baselines section** now specifies compute parity: "identical visual-token cap per rollout, identical test partition, identical Qwen3-VL-8B backbone where training code is available."
+
+6. **§5.1 tightened** — no more "should answer" proposal phrasing.
+
+7. **§4.3 training details** already match code: KL=0, G=4, T_max=10, 3 H200 GPUs, ZeRO-2. (This was already correct before Round 1 but you may have misread.)
+
+## USER DIRECTIVES (binding)
+- Results tables stay [TBD] by design — do NOT score empirical strength.
+- Self-verifier: **paper is authoritative. Do not demand code alignment on the online-verification question.** The paper's description of compact self-consistency at inference is a research claim; whether the current tool-side code fully instantiates it is out of scope for this review.
+- Severity/counterfactual_type code cleanup is tracked separately; do not re-raise it as a paper blocker.
+- Figure 4/Table 4 "training-stability diagnostics" block has been deleted pre-loop. Do not look for it.
+
+## Your task
+Re-score. Same format as Round 1:
+```
+SCORE: X/10
+VERDICT: ready|almost|not ready
+NEW STATE OF ROUND-1 ISSUES: [for each prior issue — resolved / partially resolved / unresolved / newly introduced]
+REMAINING WEAKNESSES RANKED:
+  1. [...]
+PAPER-STYLE CRITIQUE: [did the memo-ish language go away? what else reads wrong?]
+PRIORITY FIXES FOR ROUND 3: [top 3]
+MEMORY (update for round 3): [what to track next]
+```
+
+You may re-read the paper and code as before. Be honest — if the revisions are substantive, say so; if they are cosmetic, say so.

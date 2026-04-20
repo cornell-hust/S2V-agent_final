@@ -86,7 +86,6 @@ _SECOND_INTERVAL_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\s*(?:to|and|-)\s*(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)",
     re.IGNORECASE,
 )
-_COUNTERFACTUAL_STAGE_TEXT_THRESHOLD = 0.3
 _OPEN_ENDED_QUESTION_TYPES = (
     "trigger_evidence",
     "normal_reason",
@@ -393,11 +392,18 @@ def _normal_continuous_verifier_score_details(rollout_trace: Dict[str, Any]) -> 
         "misaligned": 0.0,
         "unknown": 0.5,
     }
+    action_offsets = {
+        "finalize": 0.0,
+        "refine_evidence": -0.10,
+        "continue_search": -0.30,
+        "revise_claim": -0.45,
+        "unknown": 0.0,
+    }
     normalized_status = primary_status or "unknown"
     normalized_action = recommended_action or "unknown"
     base_status_score = float(status_scores.get(normalized_status, 0.5))
-    action_offset = 0.0
-    score_after_action = _clamp(base_status_score)
+    action_offset = float(action_offsets.get(normalized_action, 0.0))
+    score_after_action = _clamp(base_status_score + action_offset)
     return {
         "primary_status": normalized_status,
         "recommended_action": normalized_action,
@@ -467,114 +473,11 @@ def _normal_query_alignment_score(rollout_trace: Dict[str, Any]) -> float:
     return round(_clamp((_query_alignment_reward(rollout_trace) + 1.0) / 2.0), 6)
 
 
-def _window_duration_seconds(entry: Dict[str, Any]) -> float:
-    start_sec = entry.get("start_sec")
-    end_sec = entry.get("end_sec")
-    if start_sec is not None and end_sec is not None:
-        duration = _safe_float(end_sec) - _safe_float(start_sec)
-        if duration > 0.0:
-            return float(duration)
-    timestamps = [_safe_float(value, 0.0) for value in list(entry.get("selected_timestamps") or [])]
-    if len(timestamps) >= 2:
-        duration = max(timestamps) - min(timestamps)
-        if duration > 0.0:
-            return float(duration)
-    return 0.0
-
-
-def _normal_selected_duration_ratio(
-    rollout_trace: Dict[str, Any],
-    *,
-    selected_window_ids: Sequence[str] | None,
-) -> float:
-    selected_ids = {str(value).strip() for value in list(selected_window_ids or []) if str(value).strip()}
-    if not selected_ids:
-        return 0.0
-    state = dict(rollout_trace.get("state") or {})
-    evidence_ledger = [dict(entry) for entry in list(state.get("evidence_ledger") or []) if isinstance(entry, dict)]
-    selected_records = [
-        entry
-        for entry in evidence_ledger
-        if str(entry.get("window_id") or "").strip() in selected_ids
-    ]
-    selected_duration = sum(_window_duration_seconds(entry) for entry in selected_records)
-    total_duration = sum(_window_duration_seconds(entry) for entry in evidence_ledger)
-    if total_duration > 0.0:
-        return round(_clamp(selected_duration / total_duration), 6)
-    total_window_count = max(
-        len({
-            str(entry.get("window_id") or "").strip()
-            for entry in evidence_ledger
-            if str(entry.get("window_id") or "").strip()
-        }),
-        len(selected_ids),
-    )
-    if total_window_count <= 0:
-        return 0.0
-    return round(_clamp(float(len(selected_ids)) / float(total_window_count)), 6)
-
-
-def _verifier_trace_score_from_payload(
-    derived_scores: Dict[str, Any],
-    *,
-    default: float = 0.5,
-) -> float:
-    if not isinstance(derived_scores, dict) or not derived_scores:
-        return round(_clamp(default), 6)
-    sufficiency = _safe_float(
-        derived_scores.get("sufficiency_score", derived_scores.get("sufficiency")),
-        default,
-    )
-    necessity = _safe_float(
-        derived_scores.get("necessity_score", derived_scores.get("necessity")),
-        default,
-    )
-    finalize_readiness = _safe_float(
-        derived_scores.get("finalize_readiness_score", derived_scores.get("finalize_readiness")),
-        default,
-    )
-    counterfactual_faithfulness = _safe_float(
-        derived_scores.get("counterfactual_faithfulness", derived_scores.get("counterfactual_faithfulness_score")),
-        default,
-    )
-    return round(
-        _clamp(
-            (
-                float(sufficiency)
-                + float(necessity)
-                + float(finalize_readiness)
-                + float(counterfactual_faithfulness)
-            ) / 4.0
-        ),
-        6,
-    )
-
-
-def _normal_verifier_trace_score(
-    rollout_trace: Dict[str, Any],
-    *,
-    continuous_verifier_score: float,
-    verification_consistency_score: float,
-) -> float:
-    verifier_turn = _latest_verifier_turn(rollout_trace)
-    derived_scores = dict((verifier_turn or {}).get("verifier_derived_scores") or {})
-    if derived_scores:
-        return _verifier_trace_score_from_payload(
-            derived_scores,
-            default=continuous_verifier_score,
-        )
-    return round(
-        _clamp(0.70 * float(continuous_verifier_score) + 0.30 * float(verification_consistency_score)),
-        6,
-    )
-
-
 def _normal_skip_restraint_reward(
     rollout_trace: Dict[str, Any],
     *,
     target: Dict[str, Any],
     selected_window_count: int,
-    selected_window_ids: Optional[Sequence[str]] = None,
     selected_by_stage: Optional[Dict[str, Any]] = None,
     selection_resolution_source: str = "",
 ) -> Dict[str, Any]:
@@ -591,31 +494,16 @@ def _normal_skip_restraint_reward(
         selected_window_count=selected_window_count,
         selected_by_stage=dict(selected_by_stage or {}),
     )
+    grounded_local_score = _clamp(0.70 * window_restraint_score + 0.30 * provenance_score)
     continuous_verifier_details = _normal_continuous_verifier_score_details(rollout_trace)
     continuous_verifier_score = float(continuous_verifier_details.get("score_after_action") or 0.0)
-    verification_consistency_score = _normal_verification_consistency_score(rollout_trace)
     query_alignment_score = _normal_query_alignment_score(rollout_trace)
-    selected_duration_ratio = _normal_selected_duration_ratio(
-        rollout_trace,
-        selected_window_ids=selected_window_ids,
-    )
-    verifier_trace_score_normal = _normal_verifier_trace_score(
-        rollout_trace,
-        continuous_verifier_score=continuous_verifier_score,
-        verification_consistency_score=verification_consistency_score,
-    )
-    grounded_local_score = _clamp(
-        0.35 * window_restraint_score
-        + 0.20 * provenance_score
-        + 0.25 * (1.0 - selected_duration_ratio)
-        + 0.20 * verifier_trace_score_normal
-    )
     easy_normal_sample_loss_multiplier = (
         float(EASY_NORMAL_SAMPLE_LOSS_MULTIPLIER) if case_type == "easy_normal" else 1.0
     )
     if not _decision_matches(final_prediction, target):
         return {
-            "normal_reward_mode": "restraint_v5",
+            "normal_reward_mode": "restraint_v4",
             "normal_case_type": case_type,
             "easy_normal_sample_loss_multiplier": round(float(easy_normal_sample_loss_multiplier), 6),
             "normal_evidence_tool_turn_count": int(evidence_tool_turn_count),
@@ -641,30 +529,20 @@ def _normal_skip_restraint_reward(
                 6,
             ),
             "normal_continuous_verifier_score_after_action": 0.0,
-            "normal_verifier_trace_score": 0.0,
-            "normal_selected_duration_ratio": 0.0,
-            "normal_grounded_local_mode": "grounded_local_score_v2",
             "normal_grounded_local_score": 0.0,
             "normal_provenance_score": 0.0,
             "normal_provenance_source_bucket": provenance_source_bucket,
             "normal_restraint_reward": 0.0,
         }
     search_restraint_score = _normal_search_restraint_score(rollout_trace)
-    if case_type == "easy_normal":
-        reward = _clamp(
-            0.55 * search_restraint_score
-            + 0.25 * window_restraint_score
-            + 0.20 * verifier_trace_score_normal
-        )
-    else:
-        reward = _clamp(
-            0.35 * search_restraint_score
-            + 0.25 * grounded_local_score
-            + 0.20 * query_alignment_score
-            + 0.20 * verifier_trace_score_normal
-        )
+    verification_consistency_score = _normal_verification_consistency_score(rollout_trace)
+    reward = 1.0 if case_type == "easy_normal" else _clamp(
+        0.50 * continuous_verifier_score
+        + 0.30 * grounded_local_score
+        + 0.20 * query_alignment_score
+    )
     return {
-        "normal_reward_mode": "restraint_v5",
+        "normal_reward_mode": "restraint_v4",
         "normal_case_type": case_type,
         "easy_normal_sample_loss_multiplier": round(float(easy_normal_sample_loss_multiplier), 6),
         "normal_evidence_tool_turn_count": int(evidence_tool_turn_count),
@@ -690,9 +568,6 @@ def _normal_skip_restraint_reward(
             6,
         ),
         "normal_continuous_verifier_score_after_action": round(float(continuous_verifier_score), 6),
-        "normal_verifier_trace_score": round(float(verifier_trace_score_normal), 6),
-        "normal_selected_duration_ratio": round(float(selected_duration_ratio), 6),
-        "normal_grounded_local_mode": "grounded_local_score_v2",
         "normal_grounded_local_score": round(float(grounded_local_score), 6),
         "normal_provenance_score": round(float(provenance_score), 6),
         "normal_provenance_source_bucket": provenance_source_bucket,
@@ -1319,108 +1194,6 @@ def _timesearch_selected_support_score(
     return max(0.0, min(1.0, 0.7 * decision_field_support + 0.3 * stage_text_support))
 
 
-def _timesearch_selected_support_score_v2(
-    profile: Dict[str, Any],
-    *,
-    target: Dict[str, Any],
-) -> float:
-    full_selected = dict(((profile.get("branch_field_matrix") or {}).get("full_selected") or {}))
-    if not bool(full_selected.get("available")):
-        return 0.0
-    fields = dict(full_selected.get("fields") or {})
-    decision_keys = ["existence", "category"]
-    if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
-        decision_keys.append("temporal")
-    if _target_requires_counterfactual_type(target):
-        decision_keys.append("counterfactual_type")
-    decision_scores = [_safe_float((fields.get(key) or {}).get("score"), 0.0) for key in decision_keys]
-    decision_field_support = (
-        sum(decision_scores) / float(len(decision_scores))
-        if decision_scores
-        else 0.0
-    )
-    required_stages = normalize_event_chain_stages(infer_required_stages_from_target(target))
-    if not required_stages:
-        return round(_clamp(decision_field_support), 6)
-    stage_scores = [_safe_float((fields.get(stage) or {}).get("score"), 0.0) for stage in required_stages]
-    stage_text_support = sum(stage_scores) / float(len(stage_scores)) if stage_scores else 0.0
-    return round(_clamp(0.75 * decision_field_support + 0.25 * stage_text_support), 6)
-
-
-def _timesearch_trigger_necessity_score_v2(
-    profile: Dict[str, Any],
-    *,
-    target: Dict[str, Any],
-) -> float:
-    branch_delta_matrix = dict(profile.get("branch_delta_matrix") or {})
-    drop_trigger_delta = dict((branch_delta_matrix.get("drop_trigger") or {}).get("fields") or {})
-    if not drop_trigger_delta:
-        return 0.0
-    required_keys = ["existence", "category"]
-    if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
-        required_keys.append("temporal")
-    if _target_requires_counterfactual_type(target):
-        required_keys.append("counterfactual_type")
-    delta_scores = [_safe_float(drop_trigger_delta.get(key), 0.0) for key in required_keys]
-    if not delta_scores:
-        return 0.0
-    return round(_clamp(max(delta_scores)), 6)
-
-
-def _timesearch_stage_coverage_score(
-    profile: Dict[str, Any],
-    *,
-    target: Dict[str, Any],
-    rollout_trace: Optional[Dict[str, Any]] = None,
-) -> float:
-    required_stages = normalize_event_chain_stages(infer_required_stages_from_target(target))
-    if not required_stages:
-        return 1.0
-    branch_field_matrix = dict(profile.get("branch_field_matrix") or {})
-    full_selected = dict(branch_field_matrix.get("full_selected") or {})
-    supported_stages = set(normalize_event_chain_stages(full_selected.get("supported_stages") or []))
-    missing_required_stages = set(normalize_event_chain_stages(full_selected.get("missing_required_stages") or []))
-    if not supported_stages and rollout_trace is not None:
-        verifier_turn = _latest_verifier_turn(rollout_trace)
-        supported_stages = set(normalize_event_chain_stages((verifier_turn or {}).get("covered_stages") or []))
-        missing_required_stages = set(
-            normalize_event_chain_stages((verifier_turn or {}).get("missing_required_stages") or [])
-        )
-    if supported_stages or missing_required_stages:
-        covered_count = len(set(required_stages) - missing_required_stages)
-        if supported_stages:
-            covered_count = max(covered_count, len(set(required_stages) & supported_stages))
-        return round(_clamp(float(covered_count) / float(len(required_stages))), 6)
-    fields = dict(full_selected.get("fields") or {})
-    covered_count = sum(
-        1
-        for stage in required_stages
-        if _safe_float((fields.get(stage) or {}).get("score"), 0.0) >= _COUNTERFACTUAL_STAGE_TEXT_THRESHOLD
-    )
-    return round(_clamp(float(covered_count) / float(len(required_stages))), 6)
-
-
-def _timesearch_verifier_trace_score(
-    profile: Dict[str, Any],
-    *,
-    rollout_trace: Optional[Dict[str, Any]] = None,
-) -> float:
-    if rollout_trace is not None:
-        verifier_turn = _latest_verifier_turn(rollout_trace)
-        if verifier_turn is not None:
-            derived_scores = dict(verifier_turn.get("verifier_derived_scores") or {})
-            return _verifier_trace_score_from_payload(derived_scores, default=0.5)
-    branch_field_matrix = dict(profile.get("branch_field_matrix") or {})
-    full_selected = dict(branch_field_matrix.get("full_selected") or {})
-    if bool(full_selected.get("available")):
-        finalize_readiness = _safe_float(
-            (((full_selected.get("fields") or {}).get("finalize_readiness") or {}).get("score")),
-            0.5,
-        )
-        return round(_clamp(finalize_readiness), 6)
-    return 0.0
-
-
 def _timesearch_fecv_diagnostics(
     profile: Dict[str, Any],
     *,
@@ -1470,9 +1243,6 @@ def _timesearch_fecv_diagnostics(
     normal_verifier_action_offset = 0.0
     normal_continuous_verifier_score_before_action = 0.0
     normal_continuous_verifier_score_after_action = 0.0
-    normal_verifier_trace_score = 0.0
-    normal_selected_duration_ratio = 0.0
-    normal_grounded_local_mode = ""
     normal_grounded_local_score = 0.0
     normal_provenance_score = 0.0
     normal_provenance_source_bucket = ""
@@ -1484,7 +1254,6 @@ def _timesearch_fecv_diagnostics(
                 rollout_trace,
                 target=target,
                 selected_window_count=selected_window_count,
-                selected_window_ids=selected_window_ids,
                 selected_by_stage=selected_by_stage,
                 selection_resolution_source=selection_resolution_source,
             )
@@ -1517,9 +1286,6 @@ def _timesearch_fecv_diagnostics(
             normal_continuous_verifier_score_after_action = float(
                 normal_reward.get("normal_continuous_verifier_score_after_action") or 0.0
             )
-            normal_verifier_trace_score = float(normal_reward.get("normal_verifier_trace_score") or 0.0)
-            normal_selected_duration_ratio = float(normal_reward.get("normal_selected_duration_ratio") or 0.0)
-            normal_grounded_local_mode = str(normal_reward.get("normal_grounded_local_mode") or "")
             normal_grounded_local_score = float(normal_reward.get("normal_grounded_local_score") or 0.0)
             normal_provenance_score = float(normal_reward.get("normal_provenance_score") or 0.0)
             normal_provenance_source_bucket = str(
@@ -1569,17 +1335,10 @@ def _timesearch_fecv_diagnostics(
                 float(normal_continuous_verifier_score_after_action),
                 6,
             ),
-            "normal_verifier_trace_score": round(float(normal_verifier_trace_score), 6),
-            "normal_selected_duration_ratio": round(float(normal_selected_duration_ratio), 6),
-            "normal_grounded_local_mode": normal_grounded_local_mode,
             "normal_grounded_local_score": round(float(normal_grounded_local_score), 6),
             "normal_provenance_score": round(float(normal_provenance_score), 6),
             "normal_provenance_source_bucket": normal_provenance_source_bucket,
             "normal_restraint_reward": round(float(normal_restraint_reward), 6),
-            "selected_support_mode": "",
-            "trigger_necessity_mode": "",
-            "verifier_trace_score": 0.0,
-            "stage_coverage_score": 0.0,
         }
 
     if normalized_branch_profile == "structured_oracle_v1":
@@ -1630,17 +1389,10 @@ def _timesearch_fecv_diagnostics(
                 float(normal_continuous_verifier_score_after_action),
                 6,
             ),
-            "normal_verifier_trace_score": round(float(normal_verifier_trace_score), 6),
-            "normal_selected_duration_ratio": round(float(normal_selected_duration_ratio), 6),
-            "normal_grounded_local_mode": normal_grounded_local_mode,
             "normal_grounded_local_score": round(float(normal_grounded_local_score), 6),
             "normal_provenance_score": round(float(normal_provenance_score), 6),
             "normal_provenance_source_bucket": normal_provenance_source_bucket,
             "normal_restraint_reward": round(float(normal_restraint_reward), 6),
-            "selected_support_mode": "",
-            "trigger_necessity_mode": "",
-            "verifier_trace_score": 0.0,
-            "stage_coverage_score": 0.0,
         }
 
     full_selected = dict(branch_field_matrix.get("full_selected") or {})
@@ -1662,22 +1414,12 @@ def _timesearch_fecv_diagnostics(
         if stage in fields
     }
     selected_support = _timesearch_selected_support_score(profile, target=target)
-    selected_support_v2 = _timesearch_selected_support_score_v2(profile, target=target)
+
     drop_trigger_delta = dict((branch_delta_matrix.get("drop_trigger") or {}).get("fields") or {})
-    trigger_necessity_v1 = max(
+    trigger_necessity = max(
         _safe_float(drop_trigger_delta.get("existence"), 0.0),
         _safe_float(drop_trigger_delta.get("category"), 0.0),
     ) if drop_trigger_delta else 0.0
-    trigger_necessity_v2 = _timesearch_trigger_necessity_score_v2(profile, target=target)
-    stage_coverage_score = _timesearch_stage_coverage_score(
-        profile,
-        target=target,
-        rollout_trace=rollout_trace,
-    )
-    verifier_trace_score = _timesearch_verifier_trace_score(
-        profile,
-        rollout_trace=rollout_trace,
-    )
 
     hard_neg_delta = dict((branch_delta_matrix.get("hard_negative_swap") or {}).get("fields") or {})
     negative_resistance = max(
@@ -1689,15 +1431,8 @@ def _timesearch_fecv_diagnostics(
     parsimony_bonus = 1.0 - (float(len(minimal_ids)) / float(len(full_ids))) if full_ids and minimal_ids else 0.0
 
     online_core = normalized_branch_profile == "online_core"
-    trigger_necessity = trigger_necessity_v2 if online_core else trigger_necessity_v1
     if online_core:
-        reward = (
-            0.40 * selected_support_v2
-            + 0.20 * trigger_necessity
-            + 0.15 * verifier_trace_score
-            + 0.15 * stage_coverage_score
-            + 0.10 * parsimony_bonus
-        )
+        reward = (0.5 * selected_support + 0.2 * trigger_necessity + 0.1 * parsimony_bonus) / 0.8
     else:
         reward = 0.5 * selected_support + 0.2 * trigger_necessity + 0.2 * negative_resistance + 0.1 * parsimony_bonus
     reward = round(max(0.0, min(1.0, reward)), 6)
@@ -1708,11 +1443,11 @@ def _timesearch_fecv_diagnostics(
         "full_selected_available": bool(full_selected.get("available")),
         "decision_field_scores": decision_field_scores,
         "required_stage_scores": required_stage_scores,
-        "selected_support_score": round(float(selected_support_v2 if online_core else selected_support), 6),
+        "selected_support_score": round(float(selected_support), 6),
         "trigger_necessity_delta": round(float(trigger_necessity), 6),
         "negative_resistance_delta": round(float(negative_resistance), 6),
         "minimal_subset_parsimony_bonus": round(float(parsimony_bonus), 6),
-        "oracle_required_stage_coverage_score": round(float(stage_coverage_score if online_core else 0.0), 6),
+        "oracle_required_stage_coverage_score": 0.0,
         "evidence_faithfulness_reward": reward,
         "selected_window_count": selected_window_count,
         "selected_record_count": selected_record_count,
@@ -1745,17 +1480,10 @@ def _timesearch_fecv_diagnostics(
             float(normal_continuous_verifier_score_after_action),
             6,
         ),
-        "normal_verifier_trace_score": round(float(normal_verifier_trace_score), 6),
-        "normal_selected_duration_ratio": round(float(normal_selected_duration_ratio), 6),
-        "normal_grounded_local_mode": normal_grounded_local_mode,
         "normal_grounded_local_score": round(float(normal_grounded_local_score), 6),
         "normal_provenance_score": round(float(normal_provenance_score), 6),
         "normal_provenance_source_bucket": normal_provenance_source_bucket,
         "normal_restraint_reward": round(float(normal_restraint_reward), 6),
-        "selected_support_mode": "selected_support_v2" if online_core else "selected_support_v1",
-        "trigger_necessity_mode": "trigger_necessity_v2" if online_core else "trigger_necessity_v1",
-        "verifier_trace_score": round(float(verifier_trace_score if online_core else 0.0), 6),
-        "stage_coverage_score": round(float(stage_coverage_score if online_core else 0.0), 6),
     }
 
 
@@ -1929,12 +1657,8 @@ def _score_rollout_trace_timesearch(
         "fecv_selection_resolution_source": str(fecv_diagnostics.get("selection_resolution_source") or ""),
         "fecv_recovered_from_trace": bool(fecv_diagnostics.get("recovered_from_trace")),
         "fecv_selected_support_score": round(float(fecv_diagnostics.get("selected_support_score") or 0.0), 6),
-        "fecv_selected_support_mode": str(fecv_diagnostics.get("selected_support_mode") or ""),
         "fecv_trigger_necessity_delta": round(float(fecv_diagnostics.get("trigger_necessity_delta") or 0.0), 6),
-        "fecv_trigger_necessity_mode": str(fecv_diagnostics.get("trigger_necessity_mode") or ""),
         "fecv_negative_resistance_delta": round(float(fecv_diagnostics.get("negative_resistance_delta") or 0.0), 6),
-        "fecv_verifier_trace_score": round(float(fecv_diagnostics.get("verifier_trace_score") or 0.0), 6),
-        "fecv_stage_coverage_score": round(float(fecv_diagnostics.get("stage_coverage_score") or 0.0), 6),
         "fecv_minimal_subset_parsimony_bonus": round(
             float(fecv_diagnostics.get("minimal_subset_parsimony_bonus") or 0.0),
             6,
@@ -1993,17 +1717,6 @@ def _score_rollout_trace_timesearch(
         "fecv_normal_continuous_verifier_score_after_action": round(
             float(fecv_diagnostics.get("normal_continuous_verifier_score_after_action") or 0.0),
             6,
-        ),
-        "fecv_normal_verifier_trace_score": round(
-            float(fecv_diagnostics.get("normal_verifier_trace_score") or 0.0),
-            6,
-        ),
-        "fecv_normal_selected_duration_ratio": round(
-            float(fecv_diagnostics.get("normal_selected_duration_ratio") or 0.0),
-            6,
-        ),
-        "fecv_normal_grounded_local_mode": str(
-            fecv_diagnostics.get("normal_grounded_local_mode") or ""
         ),
         "fecv_normal_grounded_local_score": round(
             float(fecv_diagnostics.get("normal_grounded_local_score") or 0.0),

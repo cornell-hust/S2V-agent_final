@@ -10,7 +10,6 @@ ports so the SAVER-specific parts stay inspectable.
 - `scripts/` stores `torchrun` and DeepSpeed launch wrappers for raw-data preparation, training, and local-rank vLLM inference.
 - `docs/` explains how the pieces fit together and what is currently implemented.
 - `saver_v3/` contains the owned package code for v3 data preparation, runtime wrappers, and training/inference entrypoints.
-- `saver_agent/` keeps the method-semantic implementation reused from `idea2_v2` and now backs the official v3 SFT/eval stack.
 - `third_party_ports/` contains selectively copied reference code from `idea2_v2` and `TimeSearch-R` that v3 depends on.
 - `tests/` contains repository-level smoke and unit coverage.
 
@@ -29,7 +28,7 @@ surface stays small and explicit.
 
 ## Runtime Split
 
-- SFT uses the DeepSpeed launcher, but the data/episode semantics come from `saver_agent.run_standard_sft`.
+- SFT uses the DeepSpeed launcher and delegates to `saver_v3.sft.training.run_standard_sft`.
 - Policy inference uses raw SAVER data with one vLLM engine per local rank and full SAVER tool rollout.
 - Rollout eval uses the same raw-data rollout path plus `summarize_saver_metrics` and semantic metrics.
 - RL uses a dedicated TRL + vLLM GRPO route while reusing SAVER method, reward, and rollout semantics from the v2 stack.

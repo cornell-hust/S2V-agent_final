@@ -17,6 +17,7 @@ from saver_v3.data.materialized_cache import (
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp, write_json
 from saver_v3.rl.grpo_trainer_env import (
     _build_rl_authority_checkpoint_callback,
+    create_native_grpo_trainer,
     _load_training_proposal_runtime,
     _raw_records_require_feature_guided_proposal,
     _teardown_trainer_iteration_runtime,
@@ -26,7 +27,6 @@ from saver_v3.model.qwen_policy import QwenGenerationPolicy, load_generation_pro
 from saver_v3.core.reward import DEFAULT_RL_REWARD_VERSION
 from saver_v3.core.rollout import SaverRolloutRunner
 from saver_v3.common.runtime import distributed_runtime_from_env, runtime_log
-from saver_v3.rl.timesearch_aligned_grpo_trainer import create_timesearch_aligned_grpo_trainer
 from saver_v3.sft.training import _unwrap_model, load_qwen_model_and_processor, run_rollout_eval_with_policy
 from saver_v3.rl.trl_compat import patch_vllm_guided_decoding_params
 from saver_v3.model import vllm_generation as shared_vllm_generation
@@ -264,7 +264,7 @@ def _build_vllm_trainer_class_transform(
                 self._vllm_runtime = vllm_runtime
 
             def _build_policy(self, model: Any, *, use_generation_cache: bool) -> QwenGenerationPolicy:
-                return VllmQwenGenerationPolicy(
+                policy = VllmQwenGenerationPolicy(
                     runtime=vllm_runtime,
                     source_model=_unwrap_model(model),
                     step_resolver=lambda: int(getattr(getattr(self, "state", None), "global_step", 0) or 0),
@@ -272,6 +272,8 @@ def _build_vllm_trainer_class_transform(
                     processor=self.processor,
                     max_new_tokens=self.policy_max_new_tokens,
                     max_total_images=self.max_total_images,
+                    max_tool_message_frames=self.max_tool_message_frames,
+                    max_total_video_frames=self.max_total_video_frames,
                     max_seq_length=self.max_seq_length,
                     keep_recent_tool_image_messages=self.keep_recent_tool_image_messages,
                     keep_recent_text_messages=self.keep_recent_text_messages,
@@ -284,6 +286,7 @@ def _build_vllm_trainer_class_transform(
                     repetition_penalty=self.policy_repetition_penalty,
                     use_generation_cache=bool(use_generation_cache),
                 )
+                return policy
 
         _VllmNativeGRPOTrainer.__name__ = f"Vllm{base_trainer_class.__name__}"
         _VllmNativeGRPOTrainer.__qualname__ = f"Vllm{base_trainer_class.__qualname__}"
@@ -305,6 +308,8 @@ def _build_runtime_policy_builder(
         processor: Any,
         max_new_tokens: int,
         max_total_images: int,
+        max_tool_message_frames: int,
+        max_total_video_frames: int,
         max_seq_length: int,
         keep_recent_tool_image_messages: int,
         keep_recent_text_messages: int,
@@ -325,6 +330,8 @@ def _build_runtime_policy_builder(
                 processor=processor,
                 max_new_tokens=int(max_new_tokens),
                 max_total_images=int(max_total_images),
+                max_tool_message_frames=int(max_tool_message_frames),
+                max_total_video_frames=int(max_total_video_frames),
                 max_seq_length=int(max_seq_length),
                 keep_recent_tool_image_messages=int(keep_recent_tool_image_messages),
                 keep_recent_text_messages=int(keep_recent_text_messages),
@@ -337,13 +344,14 @@ def _build_runtime_policy_builder(
                 repetition_penalty=repetition_penalty,
                 use_generation_cache=bool(use_generation_cache),
             )
-            policy.capture_rl_token_traces = True
             return policy
         return QwenGenerationPolicy.from_components(
             model=_unwrap_model(model),
             processor=processor,
             max_new_tokens=int(max_new_tokens),
             max_total_images=int(max_total_images),
+            max_tool_message_frames=int(max_tool_message_frames),
+            max_total_video_frames=int(max_total_video_frames),
             max_seq_length=int(max_seq_length),
             keep_recent_tool_image_messages=int(keep_recent_tool_image_messages),
             keep_recent_text_messages=int(keep_recent_text_messages),
@@ -378,6 +386,7 @@ def _resolve_standard_trainer_checkpoint_path(output_dir: str | Path, global_ste
 def _sample_iteration_items(
     *,
     base_dataset: Any,
+    raw_records: Optional[List[Dict[str, Any]]],
     raw_record_count: int,
     select_iteration_indices_fn: Any,
     rollout_count: int,
@@ -392,6 +401,7 @@ def _sample_iteration_items(
             rollout_start_index,
             iteration_index,
             seed=seed,
+            records=raw_records,
         )
     except TypeError:
         indices = select_iteration_indices_fn(
@@ -415,7 +425,9 @@ def _build_continuous_iteration_callback(
     mutable_dataset: MutableIterationDataset,
     trainer: Any,
     processor: Any,
+    eval_start_iteration: int,
     eval_every_iterations: int,
+    final_rollout_eval: bool = False,
 ) -> Any:
     try:
         from transformers import TrainerCallback
@@ -429,8 +441,18 @@ def _build_continuous_iteration_callback(
             self.mutable_dataset = mutable_dataset
             self.trainer = trainer
             self.processor = processor
+            self.eval_start_iteration = max(1, int(eval_start_iteration))
             self.eval_every_iterations = max(1, int(eval_every_iterations))
+            self.final_rollout_eval = bool(final_rollout_eval)
             self.last_saved_checkpoint: Optional[Path] = None
+            self._final_eval_completed = False
+
+        def _should_trigger_checkpoint(self, iteration_index: int) -> bool:
+            return should_run_inline_rollout_eval(
+                iteration_index,
+                eval_start_iteration=self.eval_start_iteration,
+                eval_every_iterations=self.eval_every_iterations,
+            )
 
         @staticmethod
         def _iteration_from_epoch_begin(state: Any) -> int:
@@ -445,6 +467,7 @@ def _build_continuous_iteration_callback(
         def _refresh_iteration_items(self, iteration_index: int) -> List[Dict[str, Any]]:
             items = _sample_iteration_items(
                 base_dataset=self.owner.dataset,
+                raw_records=self.owner.raw_records,
                 raw_record_count=len(self.owner.raw_records),
                 select_iteration_indices_fn=self.owner.select_iteration_indices_fn,
                 rollout_count=int(self.owner.args.rollout_count),
@@ -469,15 +492,7 @@ def _build_continuous_iteration_callback(
         def on_train_begin(self, args, state, control, **kwargs):
             del kwargs
             iteration_index = self._iteration_from_epoch_begin(state)
-            items = self._refresh_iteration_items(iteration_index)
-            runtime_log(
-                (
-                    f"continuous RL epoch begin: iteration={int(iteration_index)} "
-                    f"groups={len(items)} num_generations={int(self.owner.args.num_generations)}"
-                ),
-                runtime=self.owner.runtime,
-                main_process_only=True,
-            )
+            self._refresh_iteration_items(iteration_index)
             return control
 
         def on_epoch_begin(self, args, state, control, **kwargs):
@@ -497,14 +512,14 @@ def _build_continuous_iteration_callback(
         def on_epoch_end(self, args, state, control, **kwargs):
             del args, kwargs
             iteration_index = self._iteration_from_epoch_end(state)
-            should_save = ((int(iteration_index) + 1) % int(self.eval_every_iterations)) == 0
+            should_save = self._should_trigger_checkpoint(int(iteration_index))
             control.should_save = bool(should_save)
             return control
 
         def on_save(self, args, state, control, model=None, **kwargs):
             del control, kwargs
             iteration_index = self._iteration_from_epoch_end(state)
-            if ((int(iteration_index) + 1) % int(self.eval_every_iterations)) != 0:
+            if not self._should_trigger_checkpoint(int(iteration_index)):
                 return
             checkpoint = get_last_checkpoint(args.output_dir)
             if not checkpoint:
@@ -529,7 +544,10 @@ def _build_continuous_iteration_callback(
                 {
                     "latest_checkpoint": str(checkpoint_path),
                     "checkpoint_root": str(checkpoint_path),
-                    "checkpoint_strategy": "standard_trainer_checkpoint_every_100_iterations",
+                    "checkpoint_strategy": _checkpoint_strategy_label(
+                        eval_start_iteration=self.eval_start_iteration,
+                        eval_every_iterations=self.eval_every_iterations,
+                    ),
                     "reference_model_source_path": str(getattr(self.trainer, "reference_model_source_path", self.owner.reference_model_source_path)),
                     "reference_model_backend": str(getattr(self.trainer, "reference_model_backend", self.owner.reference_model_backend)),
                     "use_liger_loss_requested": bool(getattr(self.trainer, "use_liger_loss_requested", self.owner.use_liger_loss_requested)),
@@ -575,6 +593,8 @@ def _build_continuous_iteration_callback(
                         processor=self.processor,
                         max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
                         max_total_images=int(rollout_eval_config.max_total_images),
+                        max_tool_message_frames=int(getattr(rollout_eval_config, "max_tool_message_frames", 0)),
+                        max_total_video_frames=int(getattr(rollout_eval_config, "max_total_video_frames", 0)),
                         max_seq_length=int(rollout_eval_config.max_seq_length),
                         keep_recent_tool_image_messages=int(getattr(rollout_eval_config, "keep_recent_tool_image_messages", 0)),
                         keep_recent_text_messages=int(rollout_eval_config.keep_recent_text_messages),
@@ -599,7 +619,109 @@ def _build_continuous_iteration_callback(
                     main_process_only=True,
                 )
 
+        def on_train_end(self, args, state, control, model=None, **kwargs):
+            del kwargs
+            if not self.final_rollout_eval:
+                return control
+            if self._final_eval_completed:
+                return control
+            runtime_log(
+                "continuous RL final eval begin: saving terminal checkpoint before rollout evaluation",
+                runtime=self.owner.runtime,
+                main_process_only=True,
+            )
+            try:
+                self.trainer.save_model(str(args.output_dir))
+            except Exception as exc:
+                runtime_log(
+                    f"final save_model failed, falling back to last saved checkpoint: {exc}",
+                    runtime=self.owner.runtime,
+                    main_process_only=True,
+                )
+            checkpoint = get_last_checkpoint(args.output_dir) or str(args.output_dir)
+            checkpoint_path = Path(checkpoint)
+            self.last_saved_checkpoint = checkpoint_path
+            self.owner.latest_checkpoint = str(checkpoint_path)
+            self.owner.current_model_path = str(checkpoint_path)
+            iteration_index = max(0, int(self._iteration_from_epoch_end(state)))
+            if iteration_index < int(getattr(self.owner.args, "num_iterations", 1) or 1) - 1:
+                iteration_index = int(getattr(self.owner.args, "num_iterations", 1) or 1) - 1
+            runtime_log(
+                f"continuous RL final checkpoint saved: checkpoint={checkpoint_path} iteration={iteration_index}",
+                runtime=self.owner.runtime,
+                main_process_only=True,
+            )
+            rollout_eval_config = self.owner.eval_config_builder(
+                args=self.owner.args,
+                current_model_path=str(checkpoint_path),
+                reference_model_path=str(checkpoint_path),
+                config=self.owner.config_builder(self.owner.args),
+            )
+            eval_model = _unwrap_model(model)
+            if callable(self.owner.inline_policy_factory):
+                policy = self.owner.inline_policy_factory(
+                    eval_model=eval_model,
+                    processor=self.processor,
+                    rollout_eval_config=rollout_eval_config,
+                    state=state,
+                    runtime=self.owner.runtime,
+                )
+            else:
+                policy = QwenGenerationPolicy.from_components(
+                    model=eval_model,
+                    processor=self.processor,
+                    max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
+                    max_total_images=int(rollout_eval_config.max_total_images),
+                    max_tool_message_frames=int(getattr(rollout_eval_config, "max_tool_message_frames", 0)),
+                    max_total_video_frames=int(getattr(rollout_eval_config, "max_total_video_frames", 0)),
+                    max_seq_length=int(rollout_eval_config.max_seq_length),
+                    keep_recent_tool_image_messages=int(getattr(rollout_eval_config, "keep_recent_tool_image_messages", 0)),
+                    keep_recent_text_messages=int(rollout_eval_config.keep_recent_text_messages),
+                    max_image_side=int(rollout_eval_config.max_image_side),
+                    max_image_pixels=int(rollout_eval_config.max_image_pixels),
+                    do_sample=False,
+                    use_generation_cache=bool(rollout_eval_config.use_generation_cache),
+                )
+            run_rollout_eval_with_policy(
+                policy,
+                rollout_eval_config=rollout_eval_config,
+                output_dir=args.output_dir,
+                rollout_eval_output_dir=str(self.owner.rollout_eval_output_root / "final"),
+                epoch_index=int(iteration_index) + 1,
+                epoch_value=float(getattr(state, "epoch", float(iteration_index + 1)) or float(iteration_index + 1)),
+                runtime=self.owner.runtime,
+            )
+            self._final_eval_completed = True
+            runtime_log(
+                f"continuous RL final eval complete: checkpoint={checkpoint_path}",
+                runtime=self.owner.runtime,
+                main_process_only=True,
+            )
+            return control
+
     return ContinuousIterationCallback()
+
+
+def should_run_inline_rollout_eval(
+    iteration_index: int,
+    *,
+    eval_start_iteration: int,
+    eval_every_iterations: int,
+) -> bool:
+    iteration_number = int(iteration_index) + 1
+    start_iteration = max(1, int(eval_start_iteration))
+    interval = max(1, int(eval_every_iterations))
+    if iteration_number < start_iteration:
+        return False
+    return ((iteration_number - start_iteration) % interval) == 0
+
+
+def _checkpoint_strategy_label(*, eval_start_iteration: int, eval_every_iterations: int) -> str:
+    return (
+        "standard_trainer_checkpoint_inline_eval"
+        f"_start_{max(1, int(eval_start_iteration))}"
+        f"_every_{max(1, int(eval_every_iterations))}_iterations"
+    )
 
 
 def create_trl_vllm_grpo_trainer(
@@ -626,15 +748,20 @@ def create_trl_vllm_grpo_trainer(
     extra_reward_config = getattr(args, "rl_reward_config", None)
     if isinstance(extra_reward_config, dict):
         reward_config.update(extra_reward_config)
-    return create_timesearch_aligned_grpo_trainer(
+    reference_model = None
+    if float(getattr(args, "kl_beta", 0.0) or 0.0) > 0.0:
+        reference_model, _ = load_qwen_model_and_processor(
+            str(trainer_init_model_path),
+            torch_dtype=str(args.torch_dtype or "auto"),
+            attn_implementation=args.attn_implementation or None,
+            gradient_checkpointing=False,
+            use_lora=False,
+        )
+    return create_native_grpo_trainer(
         model=model,
         processor=processor,
-        train_items=train_items,
         train_dataset=train_dataset,
         output_dir=checkpoint_dir,
-        trainer_init_model_path=str(trainer_init_model_path),
-        torch_dtype=str(args.torch_dtype or "auto"),
-        attn_implementation=args.attn_implementation or None,
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -650,6 +777,8 @@ def create_trl_vllm_grpo_trainer(
         dataloader_num_workers=args.dataloader_num_workers,
         dataloader_prefetch_factor=args.dataloader_prefetch_factor,
         dataloader_persistent_workers=args.dataloader_persistent_workers,
+        old_policy_model=None,
+        reference_model=reference_model,
         kl_beta=args.kl_beta,
         ppo_clip_epsilon=args.ppo_clip_epsilon,
         rollout_runner=SaverRolloutRunner(
@@ -663,6 +792,8 @@ def create_trl_vllm_grpo_trainer(
         max_image_side=args.max_image_side,
         max_image_pixels=args.max_image_pixels,
         max_total_images=args.max_total_images,
+        max_tool_message_frames=int(getattr(args, "max_tool_message_frames", 0) or 0),
+        max_total_video_frames=int(getattr(args, "max_total_video_frames", 0) or 0),
         keep_recent_tool_image_messages=args.keep_recent_tool_image_messages,
         keep_recent_text_messages=args.keep_recent_text_messages,
         max_seq_length=args.max_seq_length,
@@ -675,25 +806,25 @@ def create_trl_vllm_grpo_trainer(
         rollout_use_generation_cache=args.rl_rollout_use_cache,
         fecv_use_generation_cache=args.rl_fecv_use_cache,
         compute_loss_microbatch_size=args.rl_compute_loss_microbatch_size,
-        use_liger_loss=bool(getattr(args, "use_liger_loss", True)),
         steps_per_generation=max(1, int(getattr(args, "rl_steps_per_generation", 1))),
-        rollout_stage_batch_size=max(1, int(getattr(args, "rollout_stage_batch_size", 16))),
-        fecv_stage_batch_size=max(1, int(getattr(args, "fecv_stage_batch_size", 16))),
+        replay_buffer_enable=False,
+        replay_buffer_type="none",
+        replay_buffer_capacity=0,
+        replay_buffer_alpha=1.0,
         fecv_failure_policy=args.rl_fecv_failure_policy,
+        all_empty_policy="true_skip",
         log_empty_batch_rank_summary=args.rl_log_empty_batch_rank_summary,
         reward_version=getattr(args, "rl_reward_version", DEFAULT_RL_REWARD_VERSION),
         reward_config=reward_config,
         iteration_index=int(iteration_index),
         num_iterations=int(num_iterations),
         rollout_eval_callback=rollout_eval_callback,
-        proposal_runtime=proposal_runtime,
-        strict_feature_guided_proposal=bool(strict_feature_guided_proposal),
         deepspeed=str(getattr(args, "deepspeed", "") or "") or None,
         save_strategy=str(save_strategy),
-        policy_builder=_build_runtime_policy_builder(
+        trainer_class_transform=_build_vllm_trainer_class_transform(
             args=args,
             vllm_runtime=vllm_runtime,
-        ),
+        ) if vllm_runtime is not None else None,
     )
 
 
@@ -863,6 +994,9 @@ class TrlVllmGrpoRunner:
             "reference_model_source_path": str(self.current_model_path),
             "reference_model_backend": str(self.reference_model_backend),
             "rollout_eval_output_dir": str(self.rollout_eval_output_root / f"iter_{int(iteration):03d}"),
+            "inline_rollout_eval": bool(getattr(self.args, "inline_rollout_eval", False)),
+            "rollout_eval_start_iteration": int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
+            "rollout_eval_interval_iterations": int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
             "rl_backend": "trl_vllm_grpo",
             "rl_reward_version": str(getattr(self.args, "rl_reward_version", DEFAULT_RL_REWARD_VERSION)),
             "use_vllm": bool(getattr(self.args, "use_vllm", True)),
@@ -885,6 +1019,7 @@ class TrlVllmGrpoRunner:
     def _build_initial_iteration_items(self) -> List[Dict[str, Any]]:
         return _sample_iteration_items(
             base_dataset=self.dataset,
+            raw_records=self.raw_records,
             raw_record_count=len(self.raw_records),
             select_iteration_indices_fn=self.select_iteration_indices_fn,
             rollout_count=int(self.args.rollout_count),
@@ -920,7 +1055,9 @@ class TrlVllmGrpoRunner:
             mutable_dataset=mutable_dataset,
             trainer=trainer,
             processor=processor,
-            eval_every_iterations=100,
+            eval_start_iteration=int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
+            eval_every_iterations=int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
+            final_rollout_eval=bool(getattr(self.args, "final_rollout_eval", False)),
         )
         trainer.add_callback(continuous_callback)
         try:
@@ -946,7 +1083,14 @@ class TrlVllmGrpoRunner:
                 "reference_model_backend": str(self.reference_model_backend),
                 "rl_backend": "trl_vllm_grpo",
                 "rl_reward_version": str(getattr(self.args, "rl_reward_version", DEFAULT_RL_REWARD_VERSION)),
-                "checkpoint_strategy": "standard_trainer_checkpoint_every_100_iterations",
+                "inline_rollout_eval": bool(getattr(self.args, "inline_rollout_eval", False)),
+                "rollout_eval_start_iteration": int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
+                "rollout_eval_interval_iterations": int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
+                "final_rollout_eval": bool(getattr(self.args, "final_rollout_eval", False)),
+                "checkpoint_strategy": _checkpoint_strategy_label(
+                    eval_start_iteration=int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
+                    eval_every_iterations=int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
+                ),
                 "use_vllm": bool(getattr(self.args, "use_vllm", True)),
                 "vllm_mode": str(getattr(self.args, "vllm_mode", "colocate")),
                 "vllm_tensor_parallel_size": int(getattr(self.args, "vllm_tensor_parallel_size", 1)),
@@ -990,6 +1134,7 @@ class TrlVllmGrpoRunner:
                 self.args.rollout_start_index,
                 iteration,
                 seed=getattr(self.args, "seed", 42),
+                records=self.raw_records,
             )
         except TypeError:
             indices = self.select_iteration_indices_fn(
@@ -1155,6 +1300,8 @@ class TrlVllmGrpoRunner:
                 f"rollout_cache={bool(self.args.rl_rollout_use_cache)} fecv_cache={bool(self.args.rl_fecv_use_cache)} "
                 f"loss_microbatch={int(self.args.rl_compute_loss_microbatch_size)} "
                 f"rollout_eval_mode={'inline' if bool(getattr(self.args, 'inline_rollout_eval', False)) else 'deferred'} "
+                f"rollout_eval_start_iteration={int(getattr(self.args, 'rollout_eval_start_iteration', 1) or 1)} "
+                f"rollout_eval_interval_iterations={int(getattr(self.args, 'rollout_eval_interval_iterations', 1) or 1)} "
                 f"rollout_eval_output_root={self.rollout_eval_output_root}"
             ),
             runtime=self.runtime,

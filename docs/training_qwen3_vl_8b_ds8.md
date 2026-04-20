@@ -18,9 +18,9 @@ This layer targets single-node 8 GPU full-model training for
 - `saver_v3.cli.train_sft_ds`
 - `saver_v3.cli.train_rl_ds`
 
-`train_sft_ds` now delegates to `saver_agent.training.run_standard_sft`, so the official v3 SFT path uses `compact_trace_v2` episode-format data and the v2 lazy-video collator stack instead of the broken step-format dataset.
+`train_sft_ds` now delegates to `saver_v3.sft.training.run_standard_sft`, so the official v3 SFT path uses `compact_trace_v2` episode-format data and the v3-owned SFT training/runtime stack instead of the broken step-format dataset.
 
-`train_rl_ds` launches the pure-pack TRL + colocated-vLLM GRPO route. The active RL contract now requires materialized runtime item caches and only accepts episode-level tensor packs (`prompt_ids`, `prompt_mask`, `completion_ids`, `completion_mask`, `advantages`, `old_policy_token_log_probs`, multimodal inputs). Replay-buffer and legacy empty-batch flags are removed and fail fast.
+`train_rl_ds` launches the trajectory-level TRL + colocated-vLLM GRPO route. The active RL contract now requires materialized runtime item caches and only accepts message-only rollout supervision with `messages + assistant_supervision + advantage`. During generation, each scored rollout is immediately materialized into a final `episode_spec`; training then consumes only `episode_specs` and prepared batches, without an intermediate feature-layer contract. Episode-level completion-only tensors (`prompt_ids`, `prompt_mask`, `completion_ids`, `completion_mask`, `advantage`, `old_policy_token_log_probs`, multimodal inputs) are derived online from that unified schema. Replay-buffer flags, legacy empty-batch flags, and trace-only active RL payloads are removed and fail fast.
 
 ## Wrapper Commands
 
@@ -49,7 +49,7 @@ deepspeed \
 ## Template Decisions
 
 - `bf16` is the default dtype.
-- ZeRO-3 is the default optimizer strategy.
+- ZeRO-3 is the default optimizer strategy for the SFT full-model path in this layer; the active RL path uses `configs/deepspeed/zero2_rl.json`.
 - `NPROC_PER_NODE` defaults to 8.
 - Full-model training means language, vision, and projector parameters stay trainable.
 - `flash_attention_3` is hard-required.

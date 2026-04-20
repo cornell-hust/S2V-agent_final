@@ -24,14 +24,14 @@ saver_v3/
 ## Prerequisites
 
 ### Hardware
-- 8× H200 GPU (110 CPU cores, 1.1TB RAM)
+- Hopper-class GPU server required for FA3; the current project runtime uses 3× H200.
 - Flash Attention 3 required (Hopper-class GPUs)
 
 ### Software
 ```bash
 # Create conda environment
 conda env create -f envs/train-qwen3-vl-8b-full.yml
-conda activate idea2_v3
+conda activate idea2-v3-train
 
 # Or install manually
 pip install -e ".[train]"
@@ -327,7 +327,7 @@ bash scripts/train_rl_qwen3_vl_8b_ds8.sh
 bash scripts/train_rl_qwen3_vl_8b_ds8.sh --run
 ```
 
-The official active RL path is now pure-pack only: `train_rl_ds` materializes or loads runtime-item caches, converts rollouts into episode tensor packs, and trains on `episode_inputs` with explicit `advantages` and `old_policy_token_log_probs`. Legacy replay-buffer flags, legacy empty-batch flags, and server/client vLLM flags are removed and fail fast.
+The official active RL path is now trajectory-level, message-only, and direct-`episode_spec`: `train_rl_ds` materializes or loads runtime-item caches, converts each scored rollout into one `messages + assistant_supervision + advantage` supervision payload, immediately builds a final `episode_spec`, and trains only on `episode_specs -> prepared_batches` without an intermediate training-feature contract. TimeSearch-R-style rolling-message control flow and old-policy sentinel reuse are preserved when safe, reference KL stays inline in loss, and turn priority is expressed through trajectory-internal token/span weights rather than per-turn packs or trace-only fallbacks. Legacy replay-buffer flags, legacy empty-batch flags, trace-only active RL payloads, and server/client vLLM flags are removed and fail fast.
 
 **Reward (timesearch_v3):**
 ```
@@ -345,6 +345,18 @@ R_fecv = 0.5*support + 0.2*trigger_necessity
 
 R_protocol: {-1.0, +0.75, +1.0} (verify-before-finalize)
 ```
+
+GT-normal episodes do not enter the anomaly-oriented counterfactual branches. They keep
+`normal_skip_v1` as the verification route and reuse the `R_fecv` slot for a
+normal-specific restraint signal: correct `normal` decisions are rewarded for concise,
+non-redundant evidence behavior, while excessive search / over-selection lowers the score.
+GT-anomaly episodes keep the anomaly-oriented FECV path and now enforce a non-empty
+evidence contract: if `selected_window_ids` is empty, the runtime first tries to recover
+them from verification/state traces; if recovery still fails, the rollout is marked with
+`contract_violation_empty_selection` and receives the protocol failure penalty.
+RL logs under `artifacts/<EXP_NAME>/logs/` now emit both group-level summaries and
+per-sample `rl sample reward debug` lines, including each rollout's reward, advantage,
+FECV availability/selection metadata, and normal-specific reward breakdown when applicable.
 
 ### Step 5: RL Evaluation
 
@@ -392,7 +404,7 @@ Direct fixed-observation baselines should report the first 5 metrics. `FECV Suff
 
 - **Model**: Qwen3-VL-8B (full-param training), Qwen3-VL-32B (teacher judge)
 - **Attention**: Flash Attention 3 only (Hopper GPUs)
-- **Training**: DeepSpeed ZeRO-3, 8× H200
+- **Training**: DeepSpeed ZeRO-3 for SFT, ZeRO-2 for active RL, current runtime on 3× H200
 - **Reward**: timesearch_v3 (metric-aligned, 7-item R_acc)
 - **Verification**: 6-branch counterfactual protocol (full, minimal, drop×3, hard_neg)
 - **Visual budget**: K=8 frames per tool call, T_max=14 turns

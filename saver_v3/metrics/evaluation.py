@@ -78,6 +78,8 @@ class RolloutEvaluationConfig:
     enable_semantic_replay: bool = True
     semantic_replay_max_new_tokens: int = 512
     max_total_images: int = 0
+    max_tool_message_frames: int = 0
+    max_total_video_frames: int = 0
     max_seq_length: int = 0
     keep_recent_tool_image_messages: int = 0
     keep_recent_text_messages: int = 0
@@ -437,6 +439,8 @@ def _build_rollout_eval_metadata(eval_config: RolloutEvaluationConfig) -> Dict[s
         "enable_semantic_replay": bool(eval_config.enable_semantic_replay),
         "semantic_replay_max_new_tokens": int(eval_config.semantic_replay_max_new_tokens),
         "max_total_images": int(eval_config.max_total_images),
+        "max_tool_message_frames": int(eval_config.max_tool_message_frames),
+        "max_total_video_frames": int(eval_config.max_total_video_frames),
         "max_seq_length": int(eval_config.max_seq_length),
         "keep_recent_tool_image_messages": int(eval_config.keep_recent_tool_image_messages),
         "keep_recent_text_messages": int(eval_config.keep_recent_text_messages),
@@ -1010,6 +1014,8 @@ def run_rollout_evaluation(
             f"rollout_batch_size={int(_resolve_rollout_batch_size(eval_config))} "
             f"use_generation_cache={bool(eval_config.use_generation_cache)} "
             f"max_total_images={int(eval_config.max_total_images) if int(eval_config.max_total_images) > 0 else 'all'} "
+            f"max_tool_message_frames={int(eval_config.max_tool_message_frames) or 'all'} "
+            f"max_total_video_frames={int(eval_config.max_total_video_frames) or 'all'} "
             f"max_seq_length={int(eval_config.max_seq_length) or 'off'} "
             f"keep_recent_tool_image_messages={int(eval_config.keep_recent_tool_image_messages) or 'all'} "
             f"keep_recent_text_messages={int(eval_config.keep_recent_text_messages) or 'all'} "
@@ -1037,6 +1043,16 @@ def run_rollout_evaluation(
     if hasattr(policy, "keep_recent_tool_image_messages"):
         try:
             policy.keep_recent_tool_image_messages = int(eval_config.keep_recent_tool_image_messages)
+        except Exception:
+            pass
+    if hasattr(policy, "max_tool_message_frames"):
+        try:
+            policy.max_tool_message_frames = int(eval_config.max_tool_message_frames)
+        except Exception:
+            pass
+    if hasattr(policy, "max_total_video_frames"):
+        try:
+            policy.max_total_video_frames = int(eval_config.max_total_video_frames)
         except Exception:
             pass
     strict_feature_guided_proposal = bool(str(eval_config.proposal_model_path or "").strip())

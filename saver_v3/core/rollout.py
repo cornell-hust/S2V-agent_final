@@ -5,8 +5,6 @@ import json
 from dataclasses import asdict
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-import torch
-
 from saver_v3.core.adapter import TimeSearchRolloutAdapter
 from saver_v3.data.config import RolloutTraceConfig, SaverAgentConfig
 from saver_v3.core.environment import SaverVideoInteraction, parse_actions_and_contents
@@ -17,7 +15,6 @@ from saver_v3.core.semantic_answer import (
 )
 from saver_v3.core.schema import SaverEnvironmentState
 from saver_v3.core.self_verification import parse_self_verification_payload
-from saver_v3.common.runtime import distributed_runtime_from_env, runtime_log
 
 
 PolicyFn = Callable[[List[Dict[str, Any]], Dict[str, Any], SaverEnvironmentState, int], str]
@@ -27,60 +24,8 @@ SEARCH_TOOL_NAMES = {"scan_timeline", "seek_evidence"}
 def _build_episode_training_feature(
     *,
     result: Dict[str, Any],
+    require_message_supervision: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    def _copy_trace_value(value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value
-        return copy.deepcopy(value)
-
-    def _extract_prompt_trace(trace: Dict[str, Any], *, turn: Dict[str, Any]) -> Dict[str, Any]:
-        nested_prompt_trace = trace.get("prompt_trace")
-        if not isinstance(nested_prompt_trace, dict):
-            raise ValueError(
-                "RL token trace is missing `prompt_trace`: "
-                f"step={int(turn.get('step_index') or 0)} "
-                f"tool={str(turn.get('tool_name') or '') or 'none'} "
-                f"action={str(turn.get('action') or '') or 'none'} "
-                f"trace_keys={sorted(str(key) for key in trace.keys())}"
-            )
-        prompt_ids = nested_prompt_trace.get("prompt_ids")
-        prompt_mask = nested_prompt_trace.get("prompt_mask")
-        if not isinstance(prompt_ids, torch.Tensor) or not isinstance(prompt_mask, torch.Tensor):
-            raise ValueError(
-                "RL token trace prompt_trace must contain tensor `prompt_ids` and `prompt_mask`: "
-                f"step={int(turn.get('step_index') or 0)} "
-                f"tool={str(turn.get('tool_name') or '') or 'none'} "
-                f"action={str(turn.get('action') or '') or 'none'} "
-                f"prompt_trace_keys={sorted(str(key) for key in nested_prompt_trace.keys())}"
-            )
-        multimodal_inputs = nested_prompt_trace.get("multimodal_inputs")
-        if multimodal_inputs is None:
-            multimodal_inputs = {
-                str(key): _copy_trace_value(value)
-                for key, value in nested_prompt_trace.items()
-                if str(key) not in {"prompt_ids", "prompt_mask", "input_ids", "attention_mask"}
-                and isinstance(value, torch.Tensor)
-            }
-        elif not isinstance(multimodal_inputs, dict):
-            raise ValueError(
-                "RL token trace prompt_trace must contain dict `multimodal_inputs` when present: "
-                f"step={int(turn.get('step_index') or 0)} "
-                f"tool={str(turn.get('tool_name') or '') or 'none'} "
-                f"action={str(turn.get('action') or '') or 'none'} "
-                f"multimodal_inputs_type={type(multimodal_inputs).__name__}"
-            )
-        else:
-            multimodal_inputs = {
-                str(key): _copy_trace_value(value)
-                for key, value in multimodal_inputs.items()
-                if isinstance(value, torch.Tensor)
-            }
-        return {
-            "prompt_ids": _copy_trace_value(prompt_ids),
-            "prompt_mask": _copy_trace_value(prompt_mask),
-            "multimodal_inputs": multimodal_inputs,
-        }
-
     def _turn_kind(turn: Dict[str, Any]) -> str:
         tool_name = str(turn.get("tool_name") or "").strip()
         action = str(turn.get("action") or "").strip()
@@ -99,70 +44,109 @@ def _build_episode_training_feature(
         return 1.0
 
     turns = list(result.get("turns") or [])
-    turn_samples: List[Dict[str, Any]] = []
-    traced_turn_count = 0
+    assistant_supervision: List[Dict[str, Any]] = []
+    final_messages = result.get("messages")
     valid_turn_count = 0
     for turn in turns:
         if bool(turn.get("valid_action")):
             valid_turn_count += 1
-        trace = turn.get("_rl_token_trace")
-        if not isinstance(trace, dict):
+        if not bool(turn.get("valid_action")):
             continue
-        traced_turn_count += 1
-        prompt_trace = _extract_prompt_trace(trace, turn=turn)
-        completion_ids = trace.get("completion_ids")
-        completion_mask = trace.get("completion_mask")
-        if not isinstance(completion_ids, torch.Tensor) or not isinstance(completion_mask, torch.Tensor):
+        prompt_messages = turn.get("_prompt_messages")
+        assistant_message_index = turn.get("_assistant_message_index")
+        response_text = str(turn.get("assistant_response_raw") or "").strip()
+        if not response_text:
+            continue
+        if not isinstance(prompt_messages, list):
+            if require_message_supervision:
+                raise ValueError(
+                    "Active RL rollout is missing `_prompt_messages` for a valid assistant turn; "
+                    f"video_id={str(result.get('video_id') or '') or 'unknown'} "
+                    f"step={int(turn.get('step_index') or 0)}"
+                )
+            continue
+        if not isinstance(final_messages, list):
+            if require_message_supervision:
+                raise ValueError(
+                    "Active RL rollout result is missing final `messages`; "
+                    f"video_id={str(result.get('video_id') or '') or 'unknown'}"
+                )
+            continue
+        if assistant_message_index is None:
+            if require_message_supervision:
+                raise ValueError(
+                    "Active RL rollout is missing `_assistant_message_index` for a valid assistant turn; "
+                    f"video_id={str(result.get('video_id') or '') or 'unknown'} "
+                    f"step={int(turn.get('step_index') or 0)}"
+                )
+            continue
+        assistant_message_index = int(assistant_message_index)
+        expected_message_index = int(len(prompt_messages))
+        if assistant_message_index != expected_message_index:
             raise ValueError(
-                "RL token trace must contain tensor `completion_ids` and `completion_mask`: "
+                "Active RL assistant message index drifted from prompt snapshot length: "
+                f"video_id={str(result.get('video_id') or '') or 'unknown'} "
                 f"step={int(turn.get('step_index') or 0)} "
-                f"tool={str(turn.get('tool_name') or '') or 'none'} "
-                f"action={str(turn.get('action') or '') or 'none'} "
-                f"completion_ids_type={type(completion_ids).__name__} "
-                f"completion_mask_type={type(completion_mask).__name__}"
+                f"assistant_message_index={assistant_message_index} "
+                f"expected_message_index={expected_message_index}"
             )
-        turn_samples.append(
+        if not 0 <= assistant_message_index < len(final_messages):
+            raise ValueError(
+                "Active RL assistant message index points outside final message history: "
+                f"video_id={str(result.get('video_id') or '') or 'unknown'} "
+                f"step={int(turn.get('step_index') or 0)} "
+                f"assistant_message_index={assistant_message_index} "
+                f"message_count={len(final_messages)}"
+            )
+        if str(final_messages[assistant_message_index].get("role") or "") != "assistant":
+            raise ValueError(
+                "Active RL assistant supervision must point to an assistant message: "
+                f"video_id={str(result.get('video_id') or '') or 'unknown'} "
+                f"step={int(turn.get('step_index') or 0)} "
+                f"assistant_message_index={assistant_message_index} "
+                f"message_role={str(final_messages[assistant_message_index].get('role') or '') or 'missing'}"
+            )
+        assistant_supervision.append(
             {
-                "turn_index": int(turn.get("step_index") or len(turn_samples) + 1),
+                "assistant_message_index": assistant_message_index,
+                "turn_index": int(turn.get("step_index") or len(assistant_supervision) + 1),
                 "turn_kind": _turn_kind(turn),
-                "action": str(turn.get("action") or ""),
                 "tool_name": str(turn.get("tool_name") or ""),
-                "episode_prompt_trace": prompt_trace,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask.to(dtype=torch.bool),
-                "sample_weight": float(_turn_sample_weight(turn)),
-                "sample_loss_multiplier": 1.0,
+                "loss_weight": float(_turn_sample_weight(turn)),
             }
         )
-    if valid_turn_count > 0 and traced_turn_count == 0:
-        raise ValueError(
-            "RL rollout produced valid turns but no token traces were attached. "
-            f"video_id={str(result.get('video_id') or '') or 'unknown'} "
-            f"terminated_reason={str(result.get('terminated_reason') or '') or 'none'} "
-            f"turns={len(turns)} "
-            f"valid_turns={valid_turn_count} "
-            f"traced_turns={traced_turn_count}"
-        )
-    if not turn_samples:
-        runtime_log(
-            "rl feature build debug: "
-            f"video_id={str(result.get('video_id') or '') or 'unknown'} "
-            f"terminated_reason={str(result.get('terminated_reason') or '') or 'none'} "
-            f"turns={len(turns)} "
-            f"valid_turns={valid_turn_count} "
-            f"traced_turns={traced_turn_count} "
-            "prompt_trace_missing=0 "
-            "completion_tensor_missing=0 "
-            "first_trace_issue=none",
-            runtime=distributed_runtime_from_env(),
-            main_process_only=True,
-        )
+    if valid_turn_count > 0 and not isinstance(final_messages, list):
+        if require_message_supervision:
+            raise ValueError(
+                "Active RL rollout produced valid turns but no final `messages` history was recorded. "
+                f"video_id={str(result.get('video_id') or '') or 'unknown'} "
+                f"terminated_reason={str(result.get('terminated_reason') or '') or 'none'} "
+                f"turns={len(turns)} "
+                f"valid_turns={valid_turn_count}"
+            )
         return None
+    if valid_turn_count > 0 and not assistant_supervision:
+        if require_message_supervision:
+            raise ValueError(
+                "Active RL rollout produced valid turns but no assistant supervision spans could be constructed. "
+                f"video_id={str(result.get('video_id') or '') or 'unknown'} "
+                f"terminated_reason={str(result.get('terminated_reason') or '') or 'none'} "
+                f"turns={len(turns)} "
+                f"valid_turns={valid_turn_count}"
+            )
+        return None
+    if not assistant_supervision:
+        return None
+    if not isinstance(final_messages, list):
+        raise ValueError(
+            "Message-only RL feature construction requires final `messages` to be a list once supervision exists."
+        )
     return {
         "video_id": result.get("video_id"),
         "group_id": result.get("group_id"),
         "generation_id": result.get("generation_id"),
-        "episode_turn_samples": turn_samples,
+        "messages": copy.deepcopy(final_messages),
+        "assistant_supervision": assistant_supervision,
     }
 
 
@@ -410,39 +394,6 @@ class SaverRolloutRunner:
                 raise ValueError(
                     "Policy batch generation returned a different number of outputs than requested episodes."
                 )
-            pop_traces = getattr(policy, "pop_last_rl_token_traces", None)
-            if callable(pop_traces):
-                traces = pop_traces()
-                trace_count = -1 if traces is None else int(len(traces))
-                first_trace_keys = []
-                if isinstance(traces, list) and traces and isinstance(traces[0], dict):
-                    first_trace_keys = sorted(str(key) for key in traces[0].keys())
-                runtime_log(
-                    "rl trace consume debug: "
-                    f"policy_class={policy.__class__.__name__} "
-                    f"batch_size={len(episode_contexts)} "
-                    f"has_pop_traces=true "
-                    f"trace_count={trace_count} "
-                    f"first_trace_keys={first_trace_keys}",
-                    runtime=distributed_runtime_from_env(),
-                    main_process_only=True,
-                )
-                if traces is not None:
-                    if len(traces) != len(episode_contexts):
-                        raise ValueError(
-                            "Policy RL token trace batch returned a different number of traces than requested episodes."
-                        )
-                    for context, trace in zip(episode_contexts, traces):
-                        context["_rl_token_trace"] = trace
-            else:
-                runtime_log(
-                    "rl trace consume debug: "
-                    f"policy_class={policy.__class__.__name__} "
-                    f"batch_size={len(episode_contexts)} "
-                    "has_pop_traces=false",
-                    runtime=distributed_runtime_from_env(),
-                    main_process_only=True,
-                )
             return [str(output) for output in outputs]
         responses: List[str] = []
         for context in episode_contexts:
@@ -491,22 +442,22 @@ class SaverRolloutRunner:
             "decision_turn_indices": self._decision_turn_indices(turns),
             "latest_claim_trace": self._build_latest_claim_trace(turns),
             "search_trace": self._build_search_trace(turns),
+            # Build the RL supervision feature from the full message history before
+            # we optionally hide messages and strip per-turn prompt snapshots.
+            "messages": copy.deepcopy(context["messages"]),
         }
-        if self.config.rollout_trace.record_message_history:
-            result["messages"] = context["messages"]
-        else:
-            result["messages"] = None
         episode_training_feature = _build_episode_training_feature(
             result=result,
+            require_message_supervision=False,
         )
         if episode_training_feature is not None:
             result["_rl_episode_training_feature"] = episode_training_feature
+        if not self.config.rollout_trace.record_message_history:
+            result["messages"] = None
         for turn in turns:
             if isinstance(turn, dict):
-                turn.pop("_rl_token_trace", None)
-        for attempt in context["invalid_attempts"]:
-            if isinstance(attempt, dict):
-                attempt.pop("_rl_token_trace", None)
+                turn.pop("_prompt_messages", None)
+                turn.pop("_assistant_message_index", None)
         return result
 
     def run_episode(
@@ -549,6 +500,8 @@ class SaverRolloutRunner:
             self._initialize_episode_context(item, initial_state=initial_state)
             for item, initial_state in zip(items, state_batch)
         ]
+        for context in episode_contexts:
+            context["_capture_prompt_messages_enabled"] = bool(capture_prompt_messages)
 
         while True:
             ready_contexts: List[Dict[str, Any]] = []
@@ -564,6 +517,9 @@ class SaverRolloutRunner:
                     context["done"] = True
                     continue
                 context["_step_index"] = int(context["formal_step_index"]) + 1
+                context["_prompt_messages_before_action"] = (
+                    copy.deepcopy(context["messages"]) if capture_prompt_messages else None
+                )
                 context["_state_before"] = (
                     asdict(copy.deepcopy(context["state"])) if needs_state_snapshots else None
                 )
@@ -573,10 +529,6 @@ class SaverRolloutRunner:
             if not ready_contexts:
                 continue
 
-            for context in ready_contexts:
-                # Clear the previous step's trace before generation so the
-                # freshly generated RL token trace survives turn recording.
-                context.pop("_rl_token_trace", None)
             response_texts = self._policy_batch_generate(policy, ready_contexts)
             env_ready_contexts: List[Dict[str, Any]] = []
             env_predictions: List[str] = []
@@ -643,7 +595,10 @@ class SaverRolloutRunner:
                 is_valid_action = bool(context["_valid_action_flag"])
                 if is_valid_action:
                     context["messages"].append(self.adapter.build_assistant_message(response_text))
+                    context["_assistant_message_index"] = int(len(context["messages"]) - 1)
                     context["formal_step_index"] += 1
+                else:
+                    context["_assistant_message_index"] = None
                 context["state"] = next_state
                 state_before = context["_state_before"]
                 state_after = asdict(copy.deepcopy(context["state"])) if needs_state_snapshots else None
@@ -698,8 +653,10 @@ class SaverRolloutRunner:
                     "parsed_semantic_answer": None,
                     "semantic_answer_text": None,
                 }
-                if bool(context["_valid_action_flag"]) and isinstance(context.get("_rl_token_trace"), dict):
-                    turn_info["_rl_token_trace"] = context["_rl_token_trace"]
+                if capture_prompt_messages:
+                    turn_info["_prompt_messages"] = copy.deepcopy(context.get("_prompt_messages_before_action"))
+                if context.get("_assistant_message_index") is not None:
+                    turn_info["_assistant_message_index"] = int(context["_assistant_message_index"])
                 tool_message = (
                     context["_next_obs"]
                     if isinstance(context["_next_obs"], dict) and context["_next_obs"].get("role") == "tool"

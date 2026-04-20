@@ -37,21 +37,26 @@ optimization:
   min_weight: 0.01
   advantage_clip: 3.0
   ppo_clip_epsilon: 0.2
-  kl_beta: 0.005
+  kl_beta: 0.0
   rollout_count: 12
-  num_generations: 6
-  rollout_max_turns: 12
+  num_generations: 4
+  rollout_max_turns: 10
   policy_do_sample: true
   policy_temperature: 0.8
   policy_top_p: 0.95
   policy_top_k: 50
   policy_repetition_penalty: 1.02
+  num_preview_frames: 8
+  keep_recent_text_messages: 20
   keep_recent_tool_image_messages: 3
-  gradient_accumulation_steps: 22
+  max_tool_message_frames: 4
+  max_total_video_frames: 12
+  gradient_accumulation_steps: 8
+  compute_loss_microbatch_size: 4
   rl_steps_per_generation: 1
   rollout_stage_batch_size: 8
   fecv_stage_batch_size: 8
-  vllm_max_num_seqs: 2
+  vllm_max_num_seqs: 3
   vllm_fallback_max_num_seqs: 2
 
 distributed:
@@ -59,6 +64,12 @@ distributed:
   nnodes: 1
   nproc_per_node: 3
   bf16: true
+
+logging:
+  inline_rollout_eval: false
+  rollout_eval_start_iteration: 1
+  rollout_eval_interval_iterations: 10
+  final_rollout_eval: true
 
 rewards:
   reward_version: timesearch_v3

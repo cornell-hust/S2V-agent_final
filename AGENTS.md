@@ -83,8 +83,8 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
 
 - Active RL with `use_liger_loss=true` must not use `configs/deepspeed/zero3_offload_rl.json`.
 - As of 2026-04-17, the default RL DeepSpeed config should be `configs/deepspeed/zero2_rl.json`.
-- As of 2026-04-17, the default RL `gradient_accumulation_steps` for the current 3-GPU setup should be `8`.
-- As of 2026-04-17, the default RL `compute_loss` microbatch size should be `3`.
+- As of the current RL config, `gradient_accumulation_steps` for the active 3-GPU setup is `22`.
+- As of the current active RL run config, `rl_compute_loss_microbatch_size` is `2`.
 - `scripts/run_full_pipeline.sh` should not auto-derive RL grad accumulation from the old 8-GPU baseline formula when running the current 3-GPU RL path.
 - Optional RL memory-pressure fallback: `configs/deepspeed/zero2_cpuoffload_rl.json`.
   Use it only when `zero2_rl.json` still exceeds memory; expect it to be slower than plain Zero2 because optimizer state is offloaded to CPU.
@@ -98,7 +98,7 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
 - As of 2026-04-17, active RL should default to `use_liger_loss=false`.
 - If `Liger` is revisited later, treat it as a separate research/debug task rather than the default RL path.
 - Active RL pure-pack episode inputs are not packed sequences. The local RL process may patch `transformers.modeling_flash_attention_utils._is_packed_sequence` to always return `False`, but this is only an auxiliary mitigation and does not by itself make `Liger` workable in the current stack.
-- As of 2026-04-17, the active TRL RL path should recover from all-zero-advantage local payloads using a TimeSearch-R-style **local replay fallback**; if replay misses and the local step still has no trainable signal, the optimizer step should be skipped rather than silently advancing training state.
+- The current active TRL RL path does not have a working all-zero-advantage local replay fallback in the live trainer path; treat zero-advantage replay as inactive unless the implementation is explicitly restored.
 
 ### Data Prep File Map
 
@@ -145,6 +145,8 @@ Current official preprocessing outputs under `data_utils/`:
 - `docs/tasks/` — execution/task docs.
 - `docs/paper_drafts/` — paper drafts.
 - `refine-logs/EXPERIMENT_PLAN.md` — experiment planning scratch artifact.
+- For code analysis or experiment-result analysis, fetch the latest experiment logs from the server-side artifacts tree at `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/artifacts`.
+- The local Mac workspace does not contain authoritative experiment logs for this project; do not treat local files as the log source of truth.
 
 ### Documentation Sync Rule
 
@@ -187,6 +189,7 @@ export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 - When reading or modifying server-side code over SSH, read the target implementation as completely as practical before drawing conclusions.
 - Do not inspect only a few lines around a symbol and then infer behavior for the whole path; follow the full control flow across the relevant functions, configs, and callsites first.
 - If the issue spans multiple stages, read the entire affected chain end to end before proposing a diagnosis or fix.
+- When analyzing code behavior or experiment results, use the latest server-side logs under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/artifacts`; the local Mac copy has no experiment logs and is not sufficient for runtime analysis.
 - For code reading, code review, debugging, and profiling in this project, default to **multiple Codex read-only investigation workers** before answering or proposing changes.
 - Preferred split for `idea2_v3`:
   - **Server 1 worker:** read code, configs, docs, offline artifacts, and historical logs from `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`.
@@ -198,10 +201,22 @@ export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 
 - Server 1 and Server 2 share the same filesystem under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh`.
 - If SSH to one server fails or is unstable, it is valid to switch to the other server and continue working on the same project files.
+- Persistent reconnect rule: if Server 1 cannot be reached or disconnects, immediately try Server 2; if Server 2 cannot be reached or disconnects, immediately try Server 1.
+- Keep alternating and retrying between the two servers until the task is complete. Do not give up on server access after a single failure or a short burst of disconnections.
+- Frequent disconnects are expected in this project. Reconnect repeatedly, switch targets often when needed, and continue failover attempts instead of abandoning the task.
 - Any code/document/data path under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3` should be treated as shared across both servers unless proven otherwise.
 - Stable shared-filesystem access takes priority over attachment to a specific machine; prefer whichever server currently gives complete reads of code and logs.
-- If Server 2 session is stable, edit and test code there directly for training-related work instead of downloading locally and re-uploading.
-- Avoid local Mac edit → upload loops for server-side code unless remote editing is blocked. If forced to do so, record why and return to direct remote editing as soon as possible.
+
+### Local Mirror Sync Rule
+
+- High-priority rule: the local Mac source mirror at `/Users/cornell/Desktop/ssh_worker/AgenticVAU/code` is the primary code-reading location for this project and the default code-editing location for planning and normal edits.
+- Before modifying project code, first read the corresponding file from the local mirror under `/Users/cornell/Desktop/ssh_worker/AgenticVAU/code`.
+- Default edit path: modify the local mirror first, then immediately upload the modified file to the matching server-side project path under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`.
+- Stable-connection exception: if the SSH/session is stable and direct server-side editing is more practical, it is valid to edit the server copy first, but immediately after that change you must download the modified file back into the matching local mirror path.
+- When uploading to or downloading from the server project, obey that project's `.gitignore` rules. Do not sync files that are intentionally ignored on the server side.
+- Keep the local mirror and the server copy aligned at all times. Do not leave local-only edits or server-only edits pending across turns.
+- If a server-side file changes first for any reason, sync that change back into the local mirror before making further edits so the two trees remain identical.
+- When reporting work, assume `/Users/cornell/Desktop/ssh_worker/AgenticVAU/code` is the primary inspection and planning surface, while `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3` is the execution-side copy that must stay synchronized with local.
 
 ### Quick Start: Running Experiments
 
@@ -317,7 +332,7 @@ R(τ) = 1.0 × R_acc + 0.35 × R_fecv + 0.05 × R_protocol
 ```
 
 - GRPO group size G=8, lr=5e-7, KL=0.01, T_max=14 turns
-- DeepSpeed ZeRO-3, 3×H200
+- DeepSpeed ZeRO-2 (`configs/deepspeed/zero2_rl.json`), 3×H200
 
 #### Stage 4: RL Evaluation
 
@@ -651,15 +666,18 @@ Claude (design/plan) ──→ Codex-pro (implement/challenge) ──→ Claude 
 - Applies to: training scripts, config changes, reward function modifications, evaluation logic, data processing
 - For code reading/review tasks, start with read-only multi-Codex investigation on shared filesystem before making claims or edits.
 - When runtime behavior matters, pair static code reading with Server 2 live-process inspection (`tmux`, `nvidia-smi dmon`, `pidstat`, logs) before concluding bottleneck or failure cause.
+- Before every substantive answer, first restate the user's question in one tight sentence so the active task stays anchored and responses do not drift into unrelated material.
+- Default answer style for this project is `caveman`: compressed, pragmatic, low-filler, high-signal.
+- When reviewing code, default to `caveman-review`.
+- When answering questions/explaining findings, default to `caveman` plus `caveman-compress` style goals so the response stays concise and practical.
 
 ### Default Skill Bundles
 
-When user asks to review, read, inspect, or check code, default to these bundles:
+When user asks to review, read, inspect, or answer questions about code, default to exactly one of these three scenarios, using only 1-2 skills per turn unless the user explicitly asks for more:
 
-- **Read and understand logic:** `smart-explore` + `systematic-debugging`
-- **Performance / algorithm optimization:** `system-profile` + `test-driven-development` + `karpathy-guidelines`
-- **Research-style algorithm review:** `research-algorithm-checker`
-- **Large redesign / big refactor:** `writing-plans` + `subagent-driven-development` + `requesting-code-review` + `deep-interview`
+- **Read / understand code logic:** `smart-explore` + `systematic-debugging`
+- **Code review / code audit:** `caveman-review` + `systematic-debugging`
+- **Question answering / performance analysis / optimization discussion:** `caveman` + `system-profile`
 
 If an exact skill name is unavailable in the current harness, use the closest equivalent workflow and state the substitution once.
 
@@ -671,23 +689,25 @@ All code modifications can be executed via **two paths**:
 
 | Path | When to Use | How |
 |------|-------------|-----|
-| **Remote Codex-pro** | Code changes on server (training scripts, configs, data processing) | SSH to server → run Codex-pro in project dir |
-| **Local Mac Codex** | Code review, design docs, lightweight edits | Run Codex locally via MCP |
+| **Remote Codex-pro** | GPU-dependent execution/validation, dependency installs, or stable-connection server-side edits that will be synced back locally | SSH to server → run Codex-pro in project dir |
+| **Local Mac Codex** | Code reading, modification planning, default local edits, code review, design docs, experiment plans, paper edits | Run Codex locally via MCP |
 
-**Remote execution:** Codex-pro runs on the server with full access to the project at `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`. It can directly edit, test, and commit code.
+**Remote execution:** Codex-pro runs on the server with full access to the project at `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`. It handles server-side testing, training, validation, and may directly edit code when the connection is stable, but any such edit must be synced back to the local mirror immediately.
 
-**Local execution:** Codex on Mac handles design, review, and coordination. Code changes are pushed via SSH or delegated to remote Codex-pro.
+**Local execution:** Codex on Mac is the primary code-reading surface for understanding the repo and designing modifications. Default code changes are made in the local mirror and then uploaded to the server path.
 
 **Selection logic:**
-- GPU-dependent code (training, eval) → remote Codex-pro on Server 2
+- Code reading and modification planning → local Mac Codex against `/Users/cornell/Desktop/ssh_worker/AgenticVAU/code`
+- GPU-dependent execution and validation (training, eval) → remote Codex-pro on Server 2
 - Dependency installs → remote Codex-pro on Server 1
 - Design docs, experiment plans, paper edits → local Mac Codex
 - Code review of remote changes → either (shared FS)
 
 **Editing preference:**
-- If remote SSH session is stable, modify code directly on shared filesystem from server side.
-- Do not round-trip server code through local Mac unless remote editing is blocked.
-- For live-training issues, prefer Server 2 direct edits so code, logs, processes, and validation stay on same machine.
+- Read code from the local mirror first when forming a modification plan.
+- Default edit path: modify the local mirror, then upload the changed files to the matching server paths.
+- Stable-connection exception: for live-training issues or server-only debugging, direct server-side edits are allowed, but the changed files must then be downloaded back into the matching local mirror paths immediately.
+- Keep local and server copies synchronized; do not leave one-sided edits pending.
 
 ---
 
