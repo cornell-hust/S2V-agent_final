@@ -40,6 +40,15 @@ FINALIZE_CASE_SEMANTIC_PROPERTIES = {
 }
 
 
+def build_replay_decision_scaffold() -> Dict[str, Any]:
+    return {
+        # Shape-only replay scaffold: do not leak target labels into verifier prompts.
+        "existence": "<anomaly_or_normal>",
+        "category": "<canonical_category>",
+        "anomaly_interval_sec": [0.0, 1.0],
+    }
+
+
 def _json_dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -331,9 +340,9 @@ def render_semantic_answer_response(payload: Dict[str, Any], *, think_text: str 
 
 
 def build_semantic_answer_scaffold(*, finalized_case: Dict[str, Any] | None = None) -> str:
-    finalized_case = canonicalize_category_payload(copy.deepcopy(finalized_case or {}))
+    del finalized_case
     scaffold = {
-        "decision": finalized_case or {"existence": "normal", "category": "normal"},
+        "decision": build_replay_decision_scaffold(),
         "summary": "one concise case summary",
         "rationale": "brief evidence-grounded rationale",
         "event_chain_summary": {

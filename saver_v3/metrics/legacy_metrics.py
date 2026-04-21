@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from saver_v3.core.categories import canonicalize_saver_category
+from saver_v3.core.categories import canonicalize_saver_category, normalize_existence
 from saver_v3.core.event_chain import (
     compute_stage_f1,
     extract_stage_annotation_from_record,
@@ -262,8 +262,9 @@ def _predicted_existence_score(record: Dict[str, Any]) -> float:
 
 
 def _normalize_existence(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    return "anomaly" if text == "anomaly" else "normal"
+    # Share the canonical categorizer; legacy callers tolerate "" by
+    # treating unknown as non-anomaly in downstream category checks.
+    return normalize_existence(value)
 
 
 def _normalize_category(value: Any) -> str:

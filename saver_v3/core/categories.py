@@ -45,6 +45,49 @@ SAFE_CATEGORY_ALIASES: Dict[str, str] = {
 
 _SEPARATOR_PATTERN = re.compile(r"[\s\-\/]+")
 
+EXISTENCE_UNKNOWN = ""
+EXISTENCE_NORMAL = "normal"
+EXISTENCE_ANOMALY = "anomaly"
+
+_EXISTENCE_NORMAL_WORDS = frozenset({
+    "normal", "no", "false", "0", "absent", "negative", "none",
+    "ok", "benign", "clean", "nothing", "no_anomaly", "noanomaly",
+    "non_anomaly", "not_anomaly", "safe", "regular",
+})
+_EXISTENCE_ANOMALY_WORDS = frozenset({
+    "anomaly", "abnormal", "yes", "true", "1", "detected", "present",
+    "positive", "anomalous", "violating", "incident", "anomaly_detected",
+    "violation", "suspicious", "unsafe", "irregular",
+})
+
+
+def normalize_existence(value: Any) -> str:
+    """Canonicalize an existence label to anomaly / normal / unknown.
+
+    Returns ``EXISTENCE_UNKNOWN`` (empty string) when the value is missing or
+    cannot be resolved; callers should treat that as "no signal" and skip
+    scoring rather than silently biasing the sample toward the normal class
+    (which was the source of the exp4 anomaly-accuracy collapse).
+
+    Ambiguous non-empty text is biased toward ``EXISTENCE_ANOMALY`` on the
+    assumption that a non-empty synonym-like answer is more likely to mean
+    "the model flagged something" than "the model denied anomaly"; only
+    explicit normal-synonyms produce ``EXISTENCE_NORMAL``.
+    """
+    if value is None:
+        return EXISTENCE_UNKNOWN
+    if isinstance(value, bool):
+        return EXISTENCE_ANOMALY if value else EXISTENCE_NORMAL
+    text = str(value).strip().lower()
+    if not text:
+        return EXISTENCE_UNKNOWN
+    canonical = _SEPARATOR_PATTERN.sub("_", text).strip("_")
+    if text in _EXISTENCE_NORMAL_WORDS or canonical in _EXISTENCE_NORMAL_WORDS:
+        return EXISTENCE_NORMAL
+    if text in _EXISTENCE_ANOMALY_WORDS or canonical in _EXISTENCE_ANOMALY_WORDS:
+        return EXISTENCE_ANOMALY
+    return EXISTENCE_ANOMALY
+
 
 def _clean_category_text(value: Any) -> str:
     text = str(value or "").strip().lower()

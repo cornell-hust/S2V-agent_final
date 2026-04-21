@@ -262,6 +262,14 @@ def _build_vllm_trainer_class_transform(
             def __init__(self, *trainer_args: Any, **trainer_kwargs: Any) -> None:
                 super().__init__(*trainer_args, **trainer_kwargs)
                 self._vllm_runtime = vllm_runtime
+                # Let reward judge reuse the same-rank training vLLM engine so
+                # accuracy_reward semantic sub-rewards can batch through the
+                # already-loaded Qwen3-VL-8B without extra VRAM or external API.
+                judge = getattr(self, "reward_judge", None)
+                if judge is not None and vllm_runtime is not None:
+                    engine = getattr(vllm_runtime, "llm", None)
+                    if engine is not None and hasattr(judge, "attach_local_vllm"):
+                        judge.attach_local_vllm(engine)
 
             def _build_policy(self, model: Any, *, use_generation_cache: bool) -> QwenGenerationPolicy:
                 policy = VllmQwenGenerationPolicy(

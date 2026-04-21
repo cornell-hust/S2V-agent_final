@@ -176,13 +176,16 @@ def _normalize_existence(value: Any) -> str:
     if isinstance(value, bool):
         return "anomaly" if value else "normal"
     text = _clean_text(value).lower()
+    if not text:
+        # Empty input is unresolvable — do NOT bias toward "normal".
+        return ""
     if text in {"normal", "none", "no", "false", "0"}:
         return "normal"
     if text in {"anomaly", "yes", "true", "1"}:
         return "anomaly"
     if "no anomaly" in text or text.startswith("normal"):
         return "normal"
-    return "anomaly" if text else "normal"
+    return "anomaly"
 
 
 def _normalize_interval_sec(value: Any, *, duration_sec: float) -> Optional[List[float]]:
@@ -221,8 +224,12 @@ def _fallback_semantic_answer(
     raw_semantic: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     raw_semantic = dict(raw_semantic or {})
-    existence = str(decision.get("existence") or "normal").strip().lower()
-    category = str(decision.get("category") or "normal").strip()
+    # Historical bias-to-normal fallback removed: treat an absent existence
+    # label as "unknown" and let downstream text branches handle it, rather
+    # than silently labelling every un-decided rollout as normal.
+    existence_raw = decision.get("existence")
+    existence = _normalize_existence(existence_raw) if existence_raw is not None else ""
+    category = str(decision.get("category") or "").strip()
     anomaly_interval = list(decision.get("anomaly_interval_sec") or [])
     temporal_answer = (
         f"The anomaly occurs from {float(anomaly_interval[0]):.3f}s to {float(anomaly_interval[1]):.3f}s."

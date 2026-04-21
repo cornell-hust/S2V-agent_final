@@ -463,7 +463,6 @@ def build_rollout_eval_config(
         include_splits=parse_include_splits(args.eval_include_splits),
         max_records=args.eval_max_records,
         inline_rollout_eval=bool(args.inline_rollout_eval),
-        final_rollout_eval=bool(getattr(args, "final_rollout_eval", False)),
         rollout_max_turns=args.eval_rollout_max_turns,
         policy_max_new_tokens=args.eval_max_new_tokens_per_turn,
         max_total_images=_resolve_eval_max_total_images(args),

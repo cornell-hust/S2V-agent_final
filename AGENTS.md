@@ -1,4 +1,4 @@
-# AgenticVAU — S2V-Agent Project Guide
+# AgenticVAU — SEEK Project Guide
 
 > **Inherits from:** [`/Users/cornell/Desktop/ssh_worker/AGENTS.md`](../AGENTS.md)
 > All server config (SSH, paths, conda, git workflow, task routing) is defined in the parent document. This file covers project-specific flow, evaluation, and experiment plans.
@@ -7,7 +7,8 @@
 
 | Field | Value |
 |-------|-------|
-| Paper | Search-to-Verify: Agentic Event-Chain Search and Evidence-Faithful Learning for VAU |
+| Paper | SEEK-VAU: Agentic Event-Chain Search and Evidence-Faithful Learning for Video Anomaly Understanding |
+| Model short name | SEEK |
 | Venue | NeurIPS 2026 |
 | Remote path | `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3` |
 | Paper drafts | `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/docs/paper_drafts` |
@@ -48,20 +49,6 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
 - `saver_v3/tests/` and top-level `tests/` — package-local and repo-level tests.
 - `third_party_ports/timesearch_r/` — imported reference code/ports from TimeSearch-R kept inside this repo.
 
-### Top-Level Files To Reach First
-
-- `README.md` — current repo overview and official end-to-end pipeline description.
-- `docs/repo_layout.md` — design-level layout explanation.
-- `docs/数据预处理.md` — detailed preprocessing commands and file roles.
-- `convert_to_saver_agent.py` — canonical annotation to runtime JSONL conversion.
-- `prepare_materialized_cache.py` — offline cache materialization for SFT/runtime items.
-- `build_frame_cache.py` — builds required `.frame_cache`.
-- `build_feature_cache.py` — builds required `.feature_cache`.
-- `annotate_teacher_judge_sft.py` — teacher-judge branch generation for SFT prepared data.
-- `train_saver_rl.py` / `train_saver_rl_trl.py` — RL launch entrypoints.
-- `training.py`, `trl_grpo_trainer.py`, `timesearch_aligned_grpo_trainer.py`, `rollout.py` — top-level compatibility wrappers frequently touched during RL/SFT debugging.
-- `run_saver_rollout.py` / `batch_run_saver_rollout.py` — rollout execution helpers.
-
 ### Config And Script Map
 
 - `configs/model/` — model and attention backend configs.
@@ -81,24 +68,14 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
 
 ### RL Runtime Note
 
-- Active RL with `use_liger_loss=true` must not use `configs/deepspeed/zero3_offload_rl.json`.
 - As of 2026-04-17, the default RL DeepSpeed config should be `configs/deepspeed/zero2_rl.json`.
 - As of the current RL config, `gradient_accumulation_steps` for the active 3-GPU setup is `22`.
-- As of the current active RL run config, `rl_compute_loss_microbatch_size` is `2`.
-- `scripts/run_full_pipeline.sh` should not auto-derive RL grad accumulation from the old 8-GPU baseline formula when running the current 3-GPU RL path.
 - Optional RL memory-pressure fallback: `configs/deepspeed/zero2_cpuoffload_rl.json`.
   Use it only when `zero2_rl.json` still exceeds memory; expect it to be slower than plain Zero2 because optimizer state is offloaded to CPU.
 - As of 2026-04-17, the default RL `keep_recent_tool_image_messages` should be `3`, with a special rule:
   preserve the latest `scan_timeline` image tool message inside this budget, and use the remaining slots for the most recent other image-bearing tool messages.
 - As of 2026-04-17, active RL should not use `severity` or `counterfactual_type` as part of its output contract, reward computation, or FECV semantics.
   Preserve broad compatibility when reading old artifacts that still contain these fields, but treat them as ignored by active RL training.
-- `configs/rl/qwen3_vl_8b_grpo_train.yaml`, `scripts/run_full_pipeline.sh` (RL path), and `scripts/train_rl_qwen3_vl_8b_ds8.sh` should all point RL to `zero2_rl.json`.
-- The current `idea2_v3` stack should treat ZeRO-2 as the default RL training backend and reserve ZeRO-3 only for explicit debugging or memory-pressure experiments.
-- For the current `idea2_v3` stack (`Qwen3-VL + transformers + FA3 + DeepSpeed + TRL`), `Liger` is currently not a usable acceleration path. It repeatedly stalls in `compute_loss` even after removing param offload and aligning the dispatch path.
-- As of 2026-04-17, active RL should default to `use_liger_loss=false`.
-- If `Liger` is revisited later, treat it as a separate research/debug task rather than the default RL path.
-- Active RL pure-pack episode inputs are not packed sequences. The local RL process may patch `transformers.modeling_flash_attention_utils._is_packed_sequence` to always return `False`, but this is only an auxiliary mitigation and does not by itself make `Liger` workable in the current stack.
-- The current active TRL RL path does not have a working all-zero-advantage local replay fallback in the live trainer path; treat zero-advantage replay as inactive unless the implementation is explicitly restored.
 
 ### Data Prep File Map
 
@@ -163,8 +140,8 @@ Current official preprocessing outputs under `data_utils/`:
 ### Paper Draft Rule
 
 - Paper drafts live under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/docs/paper_drafts`.
-- When asked to read the paper, always read the numerically latest `search_to_verify_neurips_v*.md` draft in that directory.
-- Current latest draft observed on 2026-04-15: `search_to_verify_neurips_v10.md`.
+- When asked to read the paper, always read the numerically latest draft in that directory, regardless of filename prefix.
+- Current latest draft observed on 2026-04-15: `search_to_verify_neurips_v10.md` (legacy filename; current paper title is SEEK-VAU).
 
 ### Server Access
 
@@ -183,6 +160,13 @@ cd /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3
 export SAVER_V3_DATA_ROOT=/mnt/shared-storage-user/mineru2-shared/zengweijun
 export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 ```
+
+- Agent-started experiment rule: when an agent launches experiments autonomously, always do so on the GPU server via `ssh -CAXY ws-410ca32fa4aae17e-worker-mzzbd.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn`.
+- Do not start experiments on non-GPU servers or local machines when acting autonomously.
+- Agent-started experiment rule: when an agent launches experiments autonomously, always use the tmux session named `agent`.
+- If `agent` already exists, attach with `tmux a -t agent`.
+- If `agent` does not exist, create it with `tmux new -s agent` and run the experiment there.
+- Do not create ad hoc tmux session names for self-started experiments unless the user explicitly requests a different session.
 
 ### Remote Code Reading Rule
 
@@ -220,7 +204,7 @@ export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 
 ### Quick Start: Running Experiments
 
-**无数据预处理变更时**（大多数情况）：直接使用 `run_full_pipeline.sh`，脚本会自动校验缓存、执行 SFT 多 epoch 训练+逐 epoch eval+RL+RL eval。
+**无数据预处理变更时**（大多数情况）：直接使用 `run_full_pipeline.sh`，脚本会自动校验缓存、执行 SFT 3 epoch 训练+逐 epoch eval+RL+RL eval。
 
 ```bash
 EXP_NAME=exp_xxx bash scripts/run_full_pipeline.sh
@@ -228,18 +212,7 @@ EXP_NAME=exp_xxx bash scripts/run_full_pipeline.sh
 
 `EXP_NAME` 是实验名称，输出保存至 `artifacts/<EXP_NAME>/`。
 
-**涉及数据预处理修改时**：先按 README 中的 Data Preparation 章节执行数据转换和 SFT manifest 准备，再启动 pipeline。
-
-```bash
-# 1. 数据转换（参考 README "Data Preparation" 章节）
-python convert_to_saver_agent.py --input ... --adapter ... --mode oracle_sft --output ...
-
-# 2. 准备 SFT manifest
-bash scripts/prepare_sft_manifest.sh --run
-
-# 3. 启动 pipeline
-EXP_NAME=exp_xxx bash scripts/run_full_pipeline.sh
-```
+**涉及数据预处理修改时**：先执行下文 `Stage 0: Data Preparation` 的命令，再启动同一条 pipeline。
 
 > 完整参数和可选覆盖项见 README。
 
@@ -250,7 +223,7 @@ EXP_NAME=exp_xxx bash scripts/run_full_pipeline.sh
 ### 1.1 Full Pipeline Overview
 
 ```
-Data Prep ──→ SFT (5 epochs, per-epoch eval) ──→ RL (GRPO+FECV) ──→ RL Eval
+Data Prep ──→ SFT (3 epochs, per-epoch eval) ──→ RL (GRPO+FECV) ──→ RL Eval
                                                                       │
                                                           ┌───────────┴───────────┐
                                                      Ablations              Sensitivity
@@ -285,7 +258,7 @@ bash scripts/prepare_sft_manifest.sh --run
 # Config: configs/sft/qwen3_vl_8b_full_train.yaml
 # Key fields to check/modify:
 #   data.prepared_data_path → sft_train.compact_trace_v2.jsonl
-#   optimization.epochs → 5
+#   optimization.epochs → 3
 #   output_dir → artifacts/<EXP_NAME>/sft
 
 bash scripts/train_sft_qwen3_vl_8b_ds8.sh --run
@@ -325,14 +298,6 @@ bash scripts/run_sft_rollout_eval_vllm.sh --run
 
 bash scripts/train_rl_qwen3_vl_8b_ds8.sh --run
 ```
-
-**Reward (timesearch_v3):**
-```
-R(τ) = 1.0 × R_acc + 0.35 × R_fecv + 0.05 × R_protocol
-```
-
-- GRPO group size G=8, lr=5e-7, KL=0.01, T_max=14 turns
-- DeepSpeed ZeRO-2 (`configs/deepspeed/zero2_rl.json`), 3×H200
 
 #### Stage 4: RL Evaluation
 
@@ -400,7 +365,7 @@ IF any metric < threshold AND thresholds already calibrated:
     → Max 2 retune attempts per experiment before moving on and logging the gap.
 IF RL metrics < SFT metrics on any primary metric:
     → CRITICAL. Investigate reward function, learning rate, KL coefficient.
-    → This is a severe issue — log and pause (see Exception Handling).
+    → This is a severe issue — log and pause for review.
 ```
 
 ### 2.4 Claim Verification Matrix
@@ -409,7 +374,7 @@ Each experiment should map to at least one paper claim:
 
 | Claim | Tests | Key Metrics | Required Evidence |
 |-------|-------|-------------|-------------------|
-| **C1:** VAU as agentic event-chain search | Table 1 (vs baselines), Table 2 (event modeling) | Event-Chain F1, Evidence F1@3 | S2V-Agent > all baselines on novel metrics |
+| **C1:** VAU as agentic event-chain search | Table 1 (vs baselines), Table 2 (event modeling) | Event-Chain F1, Evidence F1@3 | SEEK > all baselines on novel metrics |
 | **C2:** Verification-as-action improves evidence quality | Table 3 (w/o verification ablation) | FECV Sufficiency, Protocol Compliance | Full model > w/o verify on FECV |
 | **C3:** FECV-grounded RL improves evidence faithfulness | Table 3 (w/o FECV reward ablation) | FECV Sufficiency, Evidence F1@3 | Full model > w/o FECV on faithfulness metrics |
 
@@ -422,7 +387,7 @@ Each experiment should map to at least one paper claim:
 | # | Experiment | Config | Script | Paper Target | Priority |
 |---|-----------|--------|--------|-------------|----------|
 | 1.1 | Data preparation | `configs/prepare_sft/qwen3_vl_8b_prepare.yaml` | `scripts/prepare_sft_manifest.sh --run` | Prerequisite | P0 |
-| 1.2 | SFT training (5 epochs) | `configs/sft/qwen3_vl_8b_full_train.yaml` | `scripts/train_sft_qwen3_vl_8b_ds8.sh --run` | Prerequisite | P0 |
+| 1.2 | SFT training (3 epochs) | `configs/sft/qwen3_vl_8b_full_train.yaml` | `scripts/train_sft_qwen3_vl_8b_ds8.sh --run` | Prerequisite | P0 |
 | 1.3 | SFT eval (per-epoch, pick best) | `configs/rollout_eval/vllm_qwen3_vl_8b.yaml` | `scripts/run_sft_rollout_eval_vllm.sh --run` | Partial Table 1 | P0 |
 
 ### Phase 2: Core RL
@@ -491,6 +456,7 @@ artifacts/
 │   ├── eval/
 │   │   ├── sft_epoch_1/   — Per-epoch SFT eval
 │   │   ├── sft_epoch_2/
+│   │   ├── sft_epoch_3/
 │   │   ├── sft_best/      — Best SFT eval
 │   │   └── rl/            — RL eval
 │   └── rl/                — RL checkpoints
@@ -504,45 +470,6 @@ artifacts/
 ├── abl_pre_trigger/       — Phase 4.2
 ├── sens_fecv_015/         — Phase 5.2
 └── sens_fecv_050/         — Phase 5.4
-```
-
----
-
-## Exception Handling
-
-### Tier 1: Auto-Fix (agent handles autonomously)
-
-| Issue | Action |
-|-------|--------|
-| OOM during training | Reduce per-device batch size by 50%, retry |
-| Single GPU fault | Restart with remaining GPUs (adjust NPROC_PER_NODE) |
-| Loss spike (not NaN) | Continue training, monitor for 100 steps |
-| vLLM eval OOM | Reduce `max_model_len` or `gpu_memory_utilization` |
-| Disk space warning | Clean `/data/tmp/`, old `__pycache__/` |
-| Git push failure | Retry with exponential backoff (3 attempts) |
-| WandB connection error | Continue training, logs saved locally |
-
-### Tier 2: Pause & Log (requires user review)
-
-| Issue | Action |
-|-------|--------|
-| Loss NaN persisting > 50 steps | Save state, log to `artifacts/<exp>/ISSUE.md`, pause |
-| 3+ consecutive OOM after batch reduction | Log hardware state, pause |
-| Data file missing or corrupted | Log error, pause |
-| RL metrics regress below SFT on all metrics | Log comparison, pause |
-| Checkpoint save fails (disk full) | Log disk state, pause |
-| Unknown Python exception during training | Log full traceback, pause |
-
-**Pause format:** Write `artifacts/<exp>/ISSUE.md` with:
-```markdown
-## Issue: <title>
-- **Time:** <timestamp>
-- **Experiment:** <exp_name>
-- **Phase:** <phase>
-- **Error:** <full error message / traceback>
-- **Actions Taken:** <what auto-fix was attempted>
-- **Recommended Fix:** <agent's diagnosis>
-- **Status:** PAUSED — awaiting user review
 ```
 
 ---
@@ -594,7 +521,7 @@ After all experiments in a phase complete, generate `artifacts/summary_table_<ph
 exp(<phase>): <brief description>
 
 Example:
-exp(sft): complete 5-epoch SFT training, best at epoch 3
+exp(sft): complete 3-epoch SFT training, best at epoch 3
 exp(ablation): w/o FECV reward — FECV Sufficiency drops 12 points
 exp(sensitivity): reward weight sweep w_fecv={0.0,0.15,0.35,0.50}
 ```
@@ -606,20 +533,6 @@ Commit after: each training completion, each evaluation completion, each report 
 ## Cross-Review Workflow (Claude × Codex)
 
 Every experiment step, code change, and design decision must pass cross-model adversarial review.
-
-### Code Review Flow
-
-```
-Claude (design/plan) ──→ Codex-pro (implement/challenge) ──→ Claude (review/accept)
-```
-
-| Step | Actor | Action | Tool |
-|------|-------|--------|------|
-| 1. Design | Claude | Draft experiment plan, algorithm design, config changes | — |
-| 2. Implement | Codex-pro | Write/modify code based on Claude's spec | Codex MCP (`xhigh` effort) |
-| 3. Review | Claude | Verify implementation matches spec, check for bugs/hallucinations | Read + Grep |
-| 4. Challenge | Codex-pro | Adversarial review of Claude's reasoning and experiment logic | Codex MCP (`xhigh` effort) |
-| 5. Resolve | Claude | Integrate feedback, finalize | — |
 
 ### Metrics-Driven Improvement Loop（指标驱动的对抗优化闭环）
 
@@ -661,15 +574,8 @@ Claude (design/plan) ──→ Codex-pro (implement/challenge) ──→ Claude 
 ### General Rules
 
 - No code merged without Codex-pro implementation or review pass
-- Codex calls use `xhigh` effort level for maximum reasoning depth
 - If Claude and Codex disagree, log both perspectives and escalate to user
-- Applies to: training scripts, config changes, reward function modifications, evaluation logic, data processing
-- For code reading/review tasks, start with read-only multi-Codex investigation on shared filesystem before making claims or edits.
-- When runtime behavior matters, pair static code reading with Server 2 live-process inspection (`tmux`, `nvidia-smi dmon`, `pidstat`, logs) before concluding bottleneck or failure cause.
-- Before every substantive answer, first restate the user's question in one tight sentence so the active task stays anchored and responses do not drift into unrelated material.
-- Default answer style for this project is `caveman`: compressed, pragmatic, low-filler, high-signal.
-- When reviewing code, default to `caveman-review`.
-- When answering questions/explaining findings, default to `caveman` plus `caveman-compress` style goals so the response stays concise and practical.
+- When launching multiple child Codex agents in parallel, default every subagent to `gpt-5.4` with `xhigh` reasoning effort.
 
 ### Default Skill Bundles
 
@@ -683,40 +589,7 @@ If an exact skill name is unavailable in the current harness, use the closest eq
 
 ---
 
-## Code Execution Policy
-
-All code modifications can be executed via **two paths**:
-
-| Path | When to Use | How |
-|------|-------------|-----|
-| **Remote Codex-pro** | GPU-dependent execution/validation, dependency installs, or stable-connection server-side edits that will be synced back locally | SSH to server → run Codex-pro in project dir |
-| **Local Mac Codex** | Code reading, modification planning, default local edits, code review, design docs, experiment plans, paper edits | Run Codex locally via MCP |
-
-**Remote execution:** Codex-pro runs on the server with full access to the project at `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`. It handles server-side testing, training, validation, and may directly edit code when the connection is stable, but any such edit must be synced back to the local mirror immediately.
-
-**Local execution:** Codex on Mac is the primary code-reading surface for understanding the repo and designing modifications. Default code changes are made in the local mirror and then uploaded to the server path.
-
-**Selection logic:**
-- Code reading and modification planning → local Mac Codex against `/Users/cornell/Desktop/ssh_worker/AgenticVAU/code`
-- GPU-dependent execution and validation (training, eval) → remote Codex-pro on Server 2
-- Dependency installs → remote Codex-pro on Server 1
-- Design docs, experiment plans, paper edits → local Mac Codex
-- Code review of remote changes → either (shared FS)
-
-**Editing preference:**
-- Read code from the local mirror first when forming a modification plan.
-- Default edit path: modify the local mirror, then upload the changed files to the matching server paths.
-- Stable-connection exception: for live-training issues or server-only debugging, direct server-side edits are allowed, but the changed files must then be downloaded back into the matching local mirror paths immediately.
-- Keep local and server copies synchronized; do not leave one-sided edits pending.
-
----
-
 ## Autonomy Policy
 
-- **Full autonomy:** Agent plans and executes experiments without human approval
-- **Self-planning:** After each phase, agent reviews results and decides:
-  - Whether to proceed to next phase
-  - Whether to adjust hyperparameters and re-run
-  - Whether ablation results suggest additional experiments
-- **Threshold update:** After Phase 1+2, agent recalibrates metric thresholds based on observed baseline performance
-- **Experiment plan update:** Agent may add new experiments to this plan if results suggest additional investigations needed for paper claims. New experiments are appended to the relevant phase with priority P3.
+- Agent may autonomously plan and execute experiments.
+- Agent may append new P3 experiments when current results are insufficient to support the paper claims.

@@ -20,7 +20,12 @@ from saver_v3.data.materialized_cache import (
 )
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp, write_json
 from saver_v3.model.qwen_policy import QwenGenerationPolicy
-from saver_v3.core.reward import DEFAULT_RL_REWARD_VERSION, build_open_ended_reward_judge, score_rollout_trace
+from saver_v3.core.reward import (
+    DEFAULT_RL_REWARD_VERSION,
+    _collect_semantic_queries,
+    build_open_ended_reward_judge,
+    score_rollout_trace,
+)
 from saver_v3.core.rollout import SaverRolloutRunner, _build_episode_training_feature
 from saver_v3.common.runtime import distributed_barrier, distributed_runtime_from_env, runtime_log
 from saver_v3.sft.training import (
@@ -66,7 +71,7 @@ class _RawItemDataset(torch.utils.data.Dataset):
         return len(self.items)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        return copy.deepcopy(self.items[int(index)])
+        return dict(self.items[int(index)])
 
 
 class RepeatSampler(torch.utils.data.Sampler[int]):
@@ -378,7 +383,7 @@ class ReplayBuffer:
     def sample(self) -> Dict[str, Any]:
         if not self.buffer:
             raise ValueError("Replay buffer is empty.")
-        return copy.deepcopy(self.buffer[0])
+        return dict(self.buffer[0])
 
 
 class SSRReplayBuffer(ReplayBuffer):
@@ -394,7 +399,7 @@ class SSRReplayBuffer(ReplayBuffer):
         if len(self.buffer) >= self.capacity:
             self.buffer.pop(0)
             self.advantages.pop(0)
-        self.buffer.append(copy.deepcopy(dict(experience or {})))
+        self.buffer.append(dict(experience or {}))
         self.advantages.append(priority)
 
     def sample(self) -> Dict[str, Any]:
@@ -402,7 +407,7 @@ class SSRReplayBuffer(ReplayBuffer):
             raise ValueError("Replay buffer is empty.")
         scaled = [max(1e-6, float(priority)) ** self.alpha for priority in self.advantages]
         selected = random.choices(range(len(self.buffer)), weights=scaled, k=1)[0]
-        return copy.deepcopy(self.buffer[int(selected)])
+        return dict(self.buffer[int(selected)])
 
 
 class DapoReplayBuffer(ReplayBuffer):
@@ -417,7 +422,7 @@ class DapoReplayBuffer(ReplayBuffer):
         if len(self.buffer) >= self.capacity:
             self.buffer.pop(0)
             self.weights.pop(0)
-        self.buffer.append(copy.deepcopy(dict(experience or {})))
+        self.buffer.append(dict(experience or {}))
         self.weights.append(1.0)
 
     def sample(self) -> Dict[str, Any]:
@@ -425,7 +430,7 @@ class DapoReplayBuffer(ReplayBuffer):
             raise ValueError("Replay buffer is empty.")
         scaled = [max(1e-6, float(weight)) ** self.alpha for weight in self.weights]
         selected = random.choices(range(len(self.buffer)), weights=scaled, k=1)[0]
-        return copy.deepcopy(self.buffer[int(selected)])
+        return dict(self.buffer[int(selected)])
 
 
 def get_replay_buffer(buffer_type: str, capacity: int, alpha: float = 1.0):
@@ -901,6 +906,92 @@ def _build_native_grpo_progress_callback(*, trainer: Any):
     return NativeGRPOProgressCallback()
 
 
+def _build_grad_norm_probe_callback(*, trainer: Any):
+    """Per-step grad_norm / loss / batch / param_group probe. Bypasses logging_steps.
+
+    Purpose: diagnose constant grad_norm=sqrt(2)=1.4142135381698608 observed
+    in pipeline_20260421_184636.log. Confirms whether the value is:
+      - a per-step reality (DeepSpeed stale sentinel), OR
+      - 2 param groups each clipped to 1.0 -> norm([1.0, 1.0]) = sqrt(2), OR
+      - a sparse logging artifact (only 2 samples at steps 10 and 20 matched coincidentally).
+
+    Emits GRAD_PROBE lines every step, rank 0 only.
+    """
+    try:
+        from transformers import TrainerCallback
+    except Exception:
+        class TrainerCallback:  # type: ignore[no-redef]
+            pass
+
+    class GradNormProbeCallback(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            try:
+                rank = int(getattr(trainer, "local_rank", 0) or 0)
+                if rank != 0:
+                    return control
+                opt = getattr(trainer, "optimizer", None)
+                deepspeed_engine = getattr(trainer, "deepspeed", None) or getattr(trainer, "model_wrapped", None)
+                num_groups = -1
+                group_summary = []
+                if opt is not None and hasattr(opt, "param_groups"):
+                    groups = list(opt.param_groups)
+                    num_groups = len(groups)
+                    for gi, g in enumerate(groups):
+                        params_in_group = g.get("params", []) or []
+                        trainable = sum(1 for p in params_in_group if getattr(p, "requires_grad", False))
+                        group_summary.append(f"g{gi}[n={len(params_in_group)},trainable={trainable},lr={g.get('lr','?')},wd={g.get('weight_decay','?')}]")
+                ds_type = type(deepspeed_engine).__name__ if deepspeed_engine is not None else "None"
+                print(
+                    f"GRAD_PROBE_INIT num_param_groups={num_groups} groups=[{', '.join(group_summary)}] "
+                    f"deepspeed_engine_type={ds_type} max_grad_norm={getattr(args,'max_grad_norm','?')}",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"GRAD_PROBE_INIT_ERR {type(exc).__name__}: {exc}", flush=True)
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            try:
+                rank = int(getattr(trainer, "local_rank", 0) or 0)
+                if rank != 0:
+                    return control
+                global_step = int(getattr(state, "global_step", 0) or 0)
+                epoch = float(getattr(state, "epoch", 0.0) or 0.0)
+                last_log = {}
+                log_history = getattr(state, "log_history", None) or []
+                if log_history:
+                    last_log = dict(log_history[-1])
+                loss_val = last_log.get("loss", None)
+                lr_val = last_log.get("learning_rate", None)
+                grad_norm_hf = last_log.get("grad_norm", None)
+                grad_norm_ds = None
+                deepspeed_engine = getattr(trainer, "deepspeed", None)
+                if deepspeed_engine is not None and hasattr(deepspeed_engine, "get_global_grad_norm"):
+                    try:
+                        raw = deepspeed_engine.get_global_grad_norm()
+                        grad_norm_ds = float(raw.item()) if hasattr(raw, "item") else float(raw) if raw is not None else None
+                    except Exception as exc:  # noqa: BLE001
+                        grad_norm_ds = f"ERR:{type(exc).__name__}"
+                batch_len = None
+                try:
+                    last_batch = getattr(trainer, "_last_rl_batch_size", None)
+                    batch_len = int(last_batch) if last_batch is not None else None
+                except Exception:
+                    batch_len = None
+                print(
+                    f"GRAD_PROBE step={global_step} epoch={epoch:.4f} "
+                    f"grad_norm_hf={grad_norm_hf!r} grad_norm_ds={grad_norm_ds!r} "
+                    f"loss={loss_val!r} lr={lr_val!r} last_batch_size={batch_len!r}",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"GRAD_PROBE_ERR {type(exc).__name__}: {exc}", flush=True)
+            return control
+
+    return GradNormProbeCallback()
+
+
 def _is_episode_feature_from_feature(feature: Dict[str, Any]) -> bool:
     return isinstance(feature.get("messages"), list) and isinstance(feature.get("assistant_supervision"), list)
 
@@ -924,7 +1015,7 @@ def _compute_group_relative_advantages(
         advantage_source = "zero_advantage" if std_reward <= eps else "group_relative"
         if clip_value is not None:
             advantage = max(-float(clip_value), min(float(clip_value), float(advantage)))
-        enriched = copy.deepcopy(rollout)
+        enriched = dict(rollout)
         enriched["group_reward"] = float(reward)
         enriched["group_reward_mean"] = float(mean_reward)
         enriched["group_reward_std"] = float(std_reward)
@@ -965,6 +1056,9 @@ def _log_rollout_reward_diagnostics(
     reward_mean = sum(reward_values) / float(len(reward_values))
     reward_variance = sum((value - reward_mean) ** 2 for value in reward_values) / float(len(reward_values))
     reward_std = math.sqrt(max(reward_variance, 0.0))
+    zero_variance_group_count = 1 if reward_std <= 1e-6 else 0
+    zero_variance_rollout_count = sum(1 for rollout in rollouts if bool(rollout.get("zero_variance_group")))
+    zero_variance_skipped_count = zero_variance_rollout_count if zero_variance_group_count > 0 else 0
     filtered_count = sum(1 for value in advantage_values if abs(float(value)) < float(min_weight))
     zero_advantage_count = sum(1 for value in advantage_values if abs(float(value)) <= 1e-8)
     fecv_failed_count = sum(1 for rollout in rollouts if bool(rollout.get("fecv_failed")))
@@ -977,6 +1071,9 @@ def _log_rollout_reward_diagnostics(
         f"min_weight={float(min_weight):.6f} "
         f"filtered_below_min_weight={int(filtered_count)} "
         f"zero_advantage_count={int(zero_advantage_count)} "
+        f"zero_variance_group_count={int(zero_variance_group_count)} "
+        f"zero_variance_rollout_count={int(zero_variance_rollout_count)} "
+        f"zero_variance_skipped_count={int(zero_variance_skipped_count)} "
         f"fecv_failed_count={int(fecv_failed_count)} "
         f"reward_mean={float(reward_mean):.6f} "
         f"reward_std={float(reward_std):.6f} "
@@ -1039,9 +1136,6 @@ def _log_rollout_reward_diagnostics(
                 ),
                 "sample_partition_type": str(rollout.get("sample_partition_type") or ""),
                 "advantage_source": str(rollout.get("advantage_source") or "group_relative"),
-                "fallback_partition": str(rollout.get("fallback_partition") or ""),
-                "fallback_baseline_mean": round(float(rollout.get("fallback_baseline_mean") or 0.0), 6),
-                "fallback_baseline_std": round(float(rollout.get("fallback_baseline_std") or 0.0), 6),
                 "fecv_trigger_necessity_delta": round(
                     float(reward_summary.get("fecv_trigger_necessity_delta") or 0.0),
                     6,
@@ -1209,16 +1303,14 @@ class _NativeGRPOTrainerMixin:
         self._replay_fill_batches = 0
         self._replay_fill_episode_specs = 0
         self._groups_all_zero_advantage = 0
+        self._zero_variance_group_count = 0
+        self._zero_variance_rollout_count = 0
+        self._zero_variance_skipped_count = 0
         self._groups_filtered_by_min_weight = 0
         self._fecv_failure_count = 0
         self._fecv_degraded_rollout_count = 0
         self._advantage_source_counts: Dict[str, int] = {}
         self._sample_partition_counts: Dict[str, int] = {}
-        self._advantage_partition_decay = 0.90
-        self._advantage_partition_min_history = 8
-        self._reward_partition_baselines: Dict[str, Dict[str, float]] = {
-            "__global__": {"count": 0.0, "mean": 0.0, "sq_mean": 0.0},
-        }
         self._native_rl_skip_next_optimizer_step = False
         self._native_rl_last_skip_reason = ""
         self.replay_buffer = get_replay_buffer(
@@ -1261,35 +1353,6 @@ class _NativeGRPOTrainerMixin:
             sample_partition_multipliers=getattr(self, "_sample_partition_multipliers", None),
         )
 
-    def _reward_baseline_stats(self, partition: str) -> Tuple[float, float, int]:
-        state = dict(self._reward_partition_baselines.get(partition) or {})
-        count = int(state.get("count") or 0)
-        if count <= 0:
-            return 0.0, 0.0, 0
-        mean = float(state.get("mean") or 0.0)
-        sq_mean = float(state.get("sq_mean") or (mean * mean))
-        variance = max(sq_mean - (mean * mean), 0.0)
-        return mean, math.sqrt(variance), count
-
-    def _update_reward_partition_baseline(self, partition: str, reward: float) -> None:
-        decay = float(self._advantage_partition_decay)
-        for key in ("__global__", str(partition or "__global__")):
-            state = self._reward_partition_baselines.setdefault(
-                key,
-                {"count": 0.0, "mean": 0.0, "sq_mean": 0.0},
-            )
-            count = int(state.get("count") or 0)
-            reward_f = float(reward)
-            if count <= 0:
-                mean = reward_f
-                sq_mean = reward_f * reward_f
-            else:
-                mean = decay * float(state.get("mean") or 0.0) + (1.0 - decay) * reward_f
-                sq_mean = decay * float(state.get("sq_mean") or 0.0) + (1.0 - decay) * (reward_f * reward_f)
-            state["count"] = float(count + 1)
-            state["mean"] = float(mean)
-            state["sq_mean"] = float(sq_mean)
-
     def _apply_zero_variance_advantage_fallback(
         self,
         rollouts: Sequence[Dict[str, Any]],
@@ -1300,59 +1363,24 @@ class _NativeGRPOTrainerMixin:
         if not rollouts:
             return updated
         group_std = float((rollouts[0] or {}).get("group_reward_std") or 0.0)
+        zero_variance_group = group_std <= float(eps)
         for rollout in rollouts:
-            enriched = copy.deepcopy(rollout)
-            reward_summary = dict(enriched.get("reward_summary") or {})
+            enriched = dict(rollout)
             partition = str(enriched.get("sample_partition") or self._classify_rollout_partition(enriched))
-            reward = float(reward_summary.get("total_reward") or 0.0)
             advantage = float(enriched.get("group_advantage") or 0.0)
             advantage_source = str(enriched.get("advantage_source") or "group_relative")
-            fallback_partition = ""
-            fallback_mean = 0.0
-            fallback_std = 0.0
-            if group_std <= float(eps):
+            if zero_variance_group:
+                advantage = 0.0
                 if partition == "easy_normal":
-                    advantage = 0.0
                     advantage_source = "zero_easy_normal"
                 else:
-                    baseline_partition = partition
-                    baseline_mean, baseline_std, baseline_count = self._reward_baseline_stats(partition)
-                    if baseline_count < int(self._advantage_partition_min_history):
-                        baseline_partition = "__global__"
-                        baseline_mean, baseline_std, baseline_count = self._reward_baseline_stats("__global__")
-                    if baseline_count <= 0:
-                        baseline_mean = 0.0
-                        baseline_std = 1.0
-                        advantage = float(reward)
-                        advantage_source = "ema_fallback"
-                        fallback_partition = baseline_partition
-                        fallback_mean = float(baseline_mean)
-                        fallback_std = float(baseline_std)
-                    else:
-                        denom = max(float(baseline_std), 0.05)
-                        advantage = (float(reward) - float(baseline_mean)) / float(denom)
-                        if abs(float(advantage)) <= float(eps):
-                            advantage = 0.0
-                            advantage_source = "ema_fallback"
-                        else:
-                            if self.advantage_clip is not None:
-                                advantage = max(-float(self.advantage_clip), min(float(self.advantage_clip), float(advantage)))
-                            advantage_source = "ema_fallback"
-                            fallback_partition = baseline_partition
-                            fallback_mean = float(baseline_mean)
-                            fallback_std = float(baseline_std)
+                    advantage_source = "zero_variance_skip"
             enriched["group_advantage"] = round(float(advantage), 6)
             enriched["sample_partition"] = str(partition)
             enriched["sample_partition_type"] = str(partition)
             enriched["advantage_source"] = str(advantage_source)
-            enriched["fallback_partition"] = str(fallback_partition)
-            enriched["fallback_baseline_mean"] = round(float(fallback_mean), 6)
-            enriched["fallback_baseline_std"] = round(float(fallback_std), 6)
+            enriched["zero_variance_group"] = bool(zero_variance_group)
             updated.append(enriched)
-        for enriched in updated:
-            partition = str(enriched.get("sample_partition_type") or "__global__")
-            reward = float(((enriched.get("reward_summary") or {}).get("total_reward")) or 0.0)
-            self._update_reward_partition_baseline(partition, reward)
         return updated
 
     def _prepare_for_training(self, max_steps, train_dataloader, resume_from_checkpoint):
@@ -1492,6 +1520,9 @@ class _NativeGRPOTrainerMixin:
             "local_fecv_failure_count": 0,
             "groups_filtered_by_min_weight": 0,
             "groups_all_zero_advantage": 0,
+            "zero_variance_group_count": 0,
+            "zero_variance_rollout_count": 0,
+            "zero_variance_skipped_count": 0,
             "replay_fill_batches": 0,
             "replay_fill_episode_specs": 0,
         }
@@ -1542,6 +1573,10 @@ class _NativeGRPOTrainerMixin:
             rollouts=scored_rollouts,
             min_weight=float(self.min_weight),
         )
+        if scored_rollouts and bool((scored_rollouts[0] or {}).get("zero_variance_group")):
+            runtime_stats["zero_variance_group_count"] += 1
+            runtime_stats["zero_variance_rollout_count"] += int(len(scored_rollouts))
+            runtime_stats["zero_variance_skipped_count"] += int(len(scored_rollouts))
         item_materialization_total = 0
         item_materialized_completed = 0
         for rollout in scored_rollouts:
@@ -1576,11 +1611,13 @@ class _NativeGRPOTrainerMixin:
                 _safe_float(components.get("fecv_specificity_reward"))
             )
             rollout_advantage = abs(float(rollout.get("group_advantage", 0.0) or 0.0))
+            if bool(rollout.get("zero_variance_group")):
+                runtime_stats["groups_all_zero_advantage"] += 1
+                continue
             if rollout_advantage < float(self.min_weight):
                 runtime_stats["groups_filtered_by_min_weight"] += 1
                 if rollout_advantage <= 0.0:
                     runtime_stats["groups_all_zero_advantage"] += 1
-            if rollout_advantage < float(self.min_weight):
                 continue
             item_materialization_total += 1
             if progress is not None:
@@ -1657,6 +1694,9 @@ class _NativeGRPOTrainerMixin:
                 runtime_stats = dict(payload.get("runtime_stats") or {})
                 self._groups_filtered_by_min_weight += int(runtime_stats.get("groups_filtered_by_min_weight", 0))
                 self._groups_all_zero_advantage += int(runtime_stats.get("groups_all_zero_advantage", 0))
+                self._zero_variance_group_count += int(runtime_stats.get("zero_variance_group_count", 0))
+                self._zero_variance_rollout_count += int(runtime_stats.get("zero_variance_rollout_count", 0))
+                self._zero_variance_skipped_count += int(runtime_stats.get("zero_variance_skipped_count", 0))
         if all_episode_specs:
             self._add_episode_specs_to_replay_buffer(all_episode_specs)
         step_payloads: List[Dict[str, Any]] = []
@@ -1764,6 +1804,40 @@ class _NativeGRPOTrainerMixin:
                 )
                 for rollout_item in rollout_items
             ]
+        # Batched semantic judge cache preload (2026-04-21): gather every
+        # (question, reference, prediction) triple across this group's
+        # rollouts and score them in ONE judge.score_batch() call. Results
+        # land in the judge's in-memory cache so the per-rollout
+        # score_rollout_trace() calls below hit cache instead of issuing
+        # individual judge calls. Harmless best-effort warm-up: any failure
+        # falls through to the existing per-item path. Requires scoring
+        # metadata to be pre-attached; we setdefault it here so the main
+        # loop below still works unchanged.
+        _judge = getattr(self, "reward_judge", None)
+        if _judge is not None and hasattr(_judge, "score_batch"):
+            _flat_queries: List[Tuple[str, str, str]] = []
+            for _rollout in generated_rollouts:
+                if isinstance(item.get("structured_target"), dict):
+                    _rollout.setdefault("scoring_target", copy.deepcopy(item["structured_target"]))
+                if isinstance(item.get("qa_pairs"), list):
+                    _rollout.setdefault("scoring_qa_pairs", copy.deepcopy(item.get("qa_pairs") or []))
+                _evidence_preload = item.get("evidence") or {}
+                if isinstance(_evidence_preload, dict) and isinstance(_evidence_preload.get("evidence_moments"), list):
+                    _rollout.setdefault(
+                        "scoring_evidence_moments",
+                        copy.deepcopy(_evidence_preload.get("evidence_moments") or []),
+                    )
+                try:
+                    _qmap = _collect_semantic_queries(_rollout, reward_version=self.reward_version)
+                except Exception:
+                    _qmap = {}
+                for _triple in _qmap.values():
+                    _flat_queries.append(_triple)
+            if _flat_queries:
+                try:
+                    _judge.score_batch(_flat_queries)
+                except Exception:
+                    pass
         for generation_id, rollout in enumerate(generated_rollouts):
             if progress is not None:
                 progress.advance_generation_stage(
@@ -2601,7 +2675,7 @@ class _NativeGRPOTrainerMixin:
             old_policy_token_log_probs = old_policy_token_log_probs.to(
                 policy_token_log_probs.device,
                 dtype=torch.float32,
-            )
+            ).detach()
             if old_policy_token_log_probs.ndim == 1:
                 old_policy_token_log_probs = old_policy_token_log_probs.view(1, -1)
         if tuple(old_policy_token_log_probs.shape) != tuple(policy_token_log_probs.shape):
@@ -2712,6 +2786,9 @@ class _NativeGRPOTrainerMixin:
                 "rl_replay_fill_batches": int(self._replay_fill_batches),
                 "rl_replay_fill_episode_specs": int(self._replay_fill_episode_specs),
                 "rl_groups_all_zero_advantage": int(self._groups_all_zero_advantage),
+                "rl_zero_variance_group_count": int(getattr(self, "_zero_variance_group_count", 0)),
+                "rl_zero_variance_rollout_count": int(getattr(self, "_zero_variance_rollout_count", 0)),
+                "rl_zero_variance_skipped_count": int(getattr(self, "_zero_variance_skipped_count", 0)),
                 "rl_groups_filtered_by_min_weight": int(self._groups_filtered_by_min_weight),
                 "rl_fecv_failure_count": int(self._fecv_failure_count),
                 "rl_fecv_degraded_rollout_count": int(self._fecv_degraded_rollout_count),
@@ -3078,6 +3155,7 @@ def create_native_grpo_trainer(
     if rollout_eval_callback is not None:
         trainer.add_callback(rollout_eval_callback)
     trainer.add_callback(_build_native_grpo_progress_callback(trainer=trainer))
+    trainer.add_callback(_build_grad_norm_probe_callback(trainer=trainer))
     return trainer
 
 

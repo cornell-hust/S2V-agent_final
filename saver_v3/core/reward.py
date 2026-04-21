@@ -6,7 +6,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from saver_v3.core.categories import canonicalize_saver_category
+from saver_v3.core.categories import canonicalize_saver_category, normalize_existence
 from saver_v3.core.event_chain import (
     compute_event_chain_score,
     compute_query_alignment_score,
@@ -94,8 +94,18 @@ _OPEN_ENDED_QUESTION_TYPES = (
     "rationale",
 ) + tuple(f"event_chain_summary.{stage}" for stage in SEMANTIC_EVENT_CHAIN_STAGES)
 
-# V3: metric-aligned subset — removed normal_reason and rationale (no primary metric)
-_OPEN_ENDED_QUESTION_TYPES_V3: tuple[str, ...] = ()
+# V3 (2026-04-21): metric-aligned semantic-quality subset. Included per paper:
+#   - trigger_evidence: what visible evidence makes anomaly actionable
+#   - summary: overall case narrative
+#   - event_chain_summary.{precursor,trigger,confirmation}: stage-wise reasoning
+# Excluded: normal_reason, rationale (no primary metric in paper).
+# Each qa_type is scored via OpenAICompatibleLlmJudge.score() — if the remote
+# judge service is not configured, falls back to normalized-exact + token-F1.
+# Sub-rewards contribute independently (one score each, weight 1/N) per Fix B.
+_OPEN_ENDED_QUESTION_TYPES_V3: tuple[str, ...] = (
+    "trigger_evidence",
+    "summary",
+) + tuple(f"event_chain_summary.{stage}" for stage in SEMANTIC_EVENT_CHAIN_STAGES)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -173,9 +183,41 @@ def build_timesearch_reward_funcs(
     judge = llm_judge or OpenAICompatibleLlmJudge()
 
     def accuracy_reward(*, rollout_traces: Sequence[Dict[str, Any]], **_: Any) -> List[float]:
+        traces = list(rollout_traces or [])
+        if not traces:
+            return []
+
+        # Phase A: per-rollout collect (question, reference, prediction) triples
+        # for every open-ended sub-reward (skip-empty gating already applied).
+        queries_per_rollout: List[Dict[str, Tuple[str, str, str]]] = [
+            _collect_semantic_queries(trace, reward_version=reward_version)
+            for trace in traces
+        ]
+
+        # Phase B: flatten across rollouts and batch-judge in a single call.
+        # Single rank, single engine.chat() -> continuous batching wins.
+        flat_queries: List[Tuple[str, str, str]] = []
+        index_map: List[Tuple[int, str]] = []  # (rollout_idx, qa_type)
+        for i, qmap in enumerate(queries_per_rollout):
+            for qa_type, triple in qmap.items():
+                flat_queries.append(triple)
+                index_map.append((i, qa_type))
+        flat_scores: List[float] = judge.score_batch(flat_queries) if flat_queries else []
+
+        # Fan out scores back to per-rollout override dicts.
+        overrides: List[Dict[str, float]] = [{} for _ in traces]
+        for (i, qa_type), score in zip(index_map, flat_scores):
+            overrides[i][qa_type] = float(score)
+
+        # Phase C: per-rollout final breakdown with semantic scores pre-supplied.
         return [
-            float(_compute_accuracy_breakdown(rollout_trace, llm_judge=judge, reward_version=reward_version)["accuracy_reward"])
-            for rollout_trace in list(rollout_traces or [])
+            float(_compute_accuracy_breakdown(
+                trace,
+                llm_judge=judge,
+                reward_version=reward_version,
+                semantic_override=overrides[i],
+            )["accuracy_reward"])
+            for i, trace in enumerate(traces)
         ]
 
     def fecv_evidence_faithfulness_reward(
@@ -207,7 +249,7 @@ def build_timesearch_reward_funcs(
 
 
 def _normalize_existence(value: Any) -> str:
-    return "anomaly" if str(value or "").strip().lower() == "anomaly" else "normal"
+    return normalize_existence(value)
 
 
 def _normalize_counterfactual_type(value: Any) -> str:
@@ -251,7 +293,17 @@ def _infer_final_prediction(rollout_trace: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _decision_matches(prediction: Dict[str, Any], target: Dict[str, Any]) -> bool:
+def _reward_uses_counterfactual_type(reward_version: str) -> bool:
+    return _normalize_reward_version(reward_version) != "timesearch_v3"
+
+
+def _decision_matches(
+    prediction: Dict[str, Any],
+    target: Dict[str, Any],
+    *,
+    use_counterfactual_type: bool = False,
+    use_severity: bool = False,
+) -> bool:
     if not prediction or not target:
         return False
     if _normalize_existence(prediction.get("existence")) != _normalize_existence(target.get("existence")):
@@ -262,11 +314,12 @@ def _decision_matches(prediction: Dict[str, Any], target: Dict[str, Any]) -> boo
         target_category = canonicalize_saver_category(target.get("category"), existence="anomaly")
         if target_category and pred_category != target_category:
             return False
-    target_counterfactual_type = _normalize_counterfactual_type(target.get("counterfactual_type"))
-    if target_counterfactual_type != "none":
-        if _normalize_counterfactual_type(prediction.get("counterfactual_type")) != target_counterfactual_type:
-            return False
-    if target.get("severity") is not None and prediction.get("severity") is not None:
+    if use_counterfactual_type:
+        target_counterfactual_type = _normalize_counterfactual_type(target.get("counterfactual_type"))
+        if target_counterfactual_type != "none":
+            if _normalize_counterfactual_type(prediction.get("counterfactual_type")) != target_counterfactual_type:
+                return False
+    if use_severity and target.get("severity") is not None and prediction.get("severity") is not None:
         if int(round(_safe_float(prediction.get("severity")))) != int(round(_safe_float(target.get("severity")))):
             return False
     return True
@@ -413,9 +466,14 @@ def _normal_case_type(
     *,
     target: Dict[str, Any],
     selected_window_count: int,
+    use_counterfactual_type: bool = True,
 ) -> str:
     final_prediction = _infer_final_prediction(rollout_trace)
-    if not _decision_matches(final_prediction, target):
+    if not _decision_matches(
+        final_prediction,
+        target,
+        use_counterfactual_type=use_counterfactual_type,
+    ):
         return "incorrect_normal"
     verifier_turn = _latest_verifier_turn(rollout_trace)
     num_scan, num_seek, num_verify = _normal_search_tool_counts(rollout_trace)
@@ -577,6 +635,7 @@ def _normal_skip_restraint_reward(
     selected_window_ids: Optional[Sequence[str]] = None,
     selected_by_stage: Optional[Dict[str, Any]] = None,
     selection_resolution_source: str = "",
+    use_counterfactual_type: bool = True,
 ) -> Dict[str, Any]:
     evidence_tool_turn_count = _normal_evidence_tool_turn_count(rollout_trace)
     final_prediction = _infer_final_prediction(rollout_trace)
@@ -584,6 +643,7 @@ def _normal_skip_restraint_reward(
         rollout_trace,
         target=target,
         selected_window_count=selected_window_count,
+        use_counterfactual_type=use_counterfactual_type,
     )
     provenance_score = _normal_provenance_score(selection_resolution_source)
     provenance_source_bucket = _normal_provenance_source_bucket(selection_resolution_source)
@@ -613,7 +673,11 @@ def _normal_skip_restraint_reward(
     easy_normal_sample_loss_multiplier = (
         float(EASY_NORMAL_SAMPLE_LOSS_MULTIPLIER) if case_type == "easy_normal" else 1.0
     )
-    if not _decision_matches(final_prediction, target):
+    if not _decision_matches(
+        final_prediction,
+        target,
+        use_counterfactual_type=use_counterfactual_type,
+    ):
         return {
             "normal_reward_mode": "restraint_v5",
             "normal_case_type": case_type,
@@ -742,7 +806,6 @@ def _extract_counterfactual_profile(rollout_trace: Dict[str, Any]) -> Dict[str, 
             "decision_sufficiency": bool(profile.get("decision_sufficiency")),
             "minimal_subset_sufficiency": bool(profile.get("minimal_subset_sufficiency")),
             "negative_specificity_pass": bool(profile.get("negative_specificity_pass")),
-            "counterfactual_type_supported": bool(profile.get("counterfactual_type_supported")),
             "stage_necessity": dict(profile.get("stage_necessity") or {}),
         }
         return {
@@ -769,7 +832,9 @@ def _counterfactual_branch_delta(profile: Dict[str, Any], branch_name: str, fiel
     return _safe_float((((matrix.get(branch_name) or {}).get("fields") or {}).get(field_name)), 0.0)
 
 
-def _target_requires_counterfactual_type(target: Dict[str, Any]) -> bool:
+def _target_requires_counterfactual_type(target: Dict[str, Any], *, reward_version: str) -> bool:
+    if not _reward_uses_counterfactual_type(reward_version):
+        return False
     return _normalize_counterfactual_type(target.get("counterfactual_type")) != "none"
 
 
@@ -786,6 +851,7 @@ def _fecv_specificity_reward(
     profile: Dict[str, Any],
     *,
     target: Dict[str, Any],
+    reward_version: str = "legacy",
 ) -> float:
     if not profile:
         return 0.0
@@ -817,7 +883,7 @@ def _fecv_specificity_reward(
             )
         negative_score = min(1.0, max(negative_drop, 0.0))
         terms.append(negative_score if bool(summary.get("negative_specificity_pass")) else -1.0)
-    if _target_requires_counterfactual_type(target):
+    if _target_requires_counterfactual_type(target, reward_version=reward_version):
         terms.append(1.0 if bool(summary.get("counterfactual_type_supported")) else -1.0)
     if not terms:
         return 0.0
@@ -911,7 +977,12 @@ def _score_rollout_trace_legacy(
     profile = _extract_counterfactual_profile(rollout_trace)
     profile_summary = _counterfactual_summary(profile)
 
-    final_decision_correct = 1.0 if _decision_matches(final_prediction, target) else 0.0
+    final_decision_correct = 1.0 if _decision_matches(
+        final_prediction,
+        target,
+        use_counterfactual_type=True,
+        use_severity=True,
+    ) else 0.0
     decision_sufficiency = 1.0 if bool(profile_summary.get("decision_sufficiency")) else 0.0
     minimal_subset_sufficiency = 1.0 if bool(profile_summary.get("minimal_subset_sufficiency")) else 0.0
     negative_specificity_pass = 1.0 if bool(profile_summary.get("negative_specificity_pass")) else 0.0
@@ -1165,11 +1236,49 @@ def _open_ended_prediction_map(semantic_payload: Optional[Dict[str, Any]]) -> Di
     return predictions
 
 
+def _collect_semantic_queries(
+    rollout_trace: Dict[str, Any],
+    *,
+    reward_version: str = "timesearch_v3",
+) -> Dict[str, Tuple[str, str, str]]:
+    """Collect (question, reference, prediction) triples for every measurable
+    open-ended sub-reward of this rollout, WITHOUT calling any LLM judge.
+
+    Mirrors the skip-empty / target-absent gating in _compute_accuracy_breakdown
+    so callers can batch-score many rollouts in one engine.chat() invocation,
+    then feed the resulting scores back via `semantic_override=` keyword.
+    """
+    structured_target = _infer_target(rollout_trace)
+    semantic_payload = _infer_semantic_payload(rollout_trace)
+    qa_pairs = _infer_scoring_qa_pairs(rollout_trace)
+    evidence_moments = _infer_scoring_evidence_moments(rollout_trace)
+    open_targets = _open_ended_target_map(
+        structured_target=structured_target,
+        qa_pairs=qa_pairs,
+        evidence_moments=evidence_moments,
+    )
+    open_predictions = _open_ended_prediction_map(semantic_payload)
+    _is_v3 = reward_version == "timesearch_v3"
+    _open_ended_types = _OPEN_ENDED_QUESTION_TYPES_V3 if _is_v3 else _OPEN_ENDED_QUESTION_TYPES
+    out: Dict[str, Tuple[str, str, str]] = {}
+    for qa_type in _open_ended_types:
+        target_entry = open_targets.get(qa_type)
+        if target_entry is None:
+            continue
+        question, reference = target_entry
+        prediction = str(open_predictions.get(qa_type) or "").strip()
+        if not prediction:
+            continue
+        out[qa_type] = (str(question or ""), str(reference or ""), prediction)
+    return out
+
+
 def _compute_accuracy_breakdown(
     rollout_trace: Dict[str, Any],
     *,
     llm_judge: Optional[OpenAICompatibleLlmJudge] = None,
     reward_version: str = "timesearch_v3",
+    semantic_override: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     structured_target = _infer_target(rollout_trace)
     semantic_payload = _infer_semantic_payload(rollout_trace)
@@ -1186,26 +1295,50 @@ def _compute_accuracy_breakdown(
         "open_ended": [],
     }
     type_scores: Dict[str, float] = {}
+    # Fix B (2026-04-21): each measurable sub-reward (existence / category / temporal /
+    # open-ended / etc.) contributes one independent score with equal weight 1/N.
+    # A sub-reward is only appended when it can actually be computed (prediction and
+    # target both present). Missing fields are skipped, never zero-padded — so one
+    # unparseable field cannot drag its siblings down. `family_scores` is kept below
+    # for the diagnostic `accuracy_by_family` output consumers, but the authoritative
+    # `accuracy_reward` is the flat mean of `all_scores`.
+    all_scores: List[float] = []
     _is_v3 = reward_version == "timesearch_v3"
 
     if structured_target:
         prediction_existence = _normalize_existence(final_prediction.get("existence"))
         target_existence = _normalize_existence(structured_target.get("existence"))
-        existence_score = 1.0 if prediction_existence == target_existence else 0.0
-        if not _is_v3:  # v3: category subsumes existence
+        if prediction_existence and target_existence:
+            existence_score = 1.0 if prediction_existence == target_existence else 0.0
+            all_scores.append(existence_score)
             family_scores["multiple_choice"].append(existence_score)
-        type_scores["existence"] = existence_score  # always compute for metrics
+            type_scores["existence"] = existence_score
+        else:
+            # Prediction or target existence could not be resolved — skip this
+            # sub-reward entirely (do NOT penalize with 0), only expose a zero
+            # for diagnostic visibility.
+            type_scores["existence"] = 0.0
 
         target_category = canonicalize_saver_category(structured_target.get("category"), existence=target_existence)
-        if target_category:
-            prediction_category = canonicalize_saver_category(final_prediction.get("category"), existence=prediction_existence)
+        prediction_category_raw = final_prediction.get("category")
+        if target_category and prediction_category_raw is not None and str(prediction_category_raw).strip():
+            prediction_category = canonicalize_saver_category(
+                prediction_category_raw,
+                existence=prediction_existence or None,
+            )
             category_score = 1.0 if prediction_category == target_category else 0.0
+            all_scores.append(category_score)
             family_scores["multiple_choice"].append(category_score)
             type_scores["category"] = category_score
+        elif target_category:
+            # Target expects a category but prediction omitted it — skip this
+            # sub-reward (missing ≠ wrong); record diagnostic zero.
+            type_scores["category"] = 0.0
 
         if structured_target.get("severity") is not None:
             severity_score = 1.0 if _normalize_severity(final_prediction.get("severity")) == _normalize_severity(structured_target.get("severity")) else 0.0
             if not _is_v3:  # v3: no primary metric for severity
+                all_scores.append(severity_score)
                 family_scores["multiple_choice"].append(severity_score)
             type_scores["severity"] = severity_score
 
@@ -1214,6 +1347,7 @@ def _compute_accuracy_breakdown(
             prediction_counterfactual_type = _normalize_counterfactual_type(final_prediction.get("counterfactual_type"))
             counterfactual_score = 1.0 if prediction_counterfactual_type == target_counterfactual_type else 0.0
             if not _is_v3:  # v3: no primary metric for counterfactual_type
+                all_scores.append(counterfactual_score)
                 family_scores["multiple_choice"].append(counterfactual_score)
             type_scores["counterfactual"] = counterfactual_score
 
@@ -1225,9 +1359,15 @@ def _compute_accuracy_breakdown(
                 qa_key="temporal",
                 fps=fps,
             )
-            temporal_score = _interval_iou(prediction_anomaly_interval, target_anomaly_interval)
-            family_scores["grounding"].append(temporal_score)
-            type_scores["temporal"] = temporal_score
+            if prediction_anomaly_interval is not None:
+                temporal_score = _interval_iou(prediction_anomaly_interval, target_anomaly_interval)
+                all_scores.append(temporal_score)
+                family_scores["grounding"].append(temporal_score)
+                type_scores["temporal"] = temporal_score
+            else:
+                # Prediction omitted temporal interval — skip sub-reward
+                # (align with existence/category skip semantics).
+                type_scores["temporal"] = 0.0
 
         target_precursor_interval = structured_target.get("precursor_interval_sec")
         if isinstance(target_precursor_interval, list) and len(target_precursor_interval) >= 2:
@@ -1237,10 +1377,14 @@ def _compute_accuracy_breakdown(
                 qa_key="precursor_temporal",
                 fps=fps,
             )
-            precursor_score = _interval_iou(prediction_precursor_interval, target_precursor_interval)
-            if not _is_v3:  # v3: no primary metric for precursor temporal
-                family_scores["grounding"].append(precursor_score)
-            type_scores["precursor_temporal"] = precursor_score
+            if prediction_precursor_interval is not None:
+                precursor_score = _interval_iou(prediction_precursor_interval, target_precursor_interval)
+                if not _is_v3:  # v3: no primary metric for precursor temporal
+                    all_scores.append(precursor_score)
+                    family_scores["grounding"].append(precursor_score)
+                type_scores["precursor_temporal"] = precursor_score
+            else:
+                type_scores["precursor_temporal"] = 0.0
 
     judge = llm_judge or OpenAICompatibleLlmJudge()
     open_targets = _open_ended_target_map(
@@ -1250,26 +1394,75 @@ def _compute_accuracy_breakdown(
     )
     open_predictions = _open_ended_prediction_map(semantic_payload)
     _open_ended_types = _OPEN_ENDED_QUESTION_TYPES_V3 if _is_v3 else _OPEN_ENDED_QUESTION_TYPES
+    # Callers (e.g. the batched accuracy_reward closure) may pre-compute
+    # semantic judge scores in one engine.chat() and feed them in via
+    # `semantic_override`. When a qa_type score is in the override dict, we
+    # skip the per-item judge.score() call but still apply skip-empty gating.
+    _override_scores: Dict[str, float] = dict(semantic_override or {})
     for qa_type in _open_ended_types:
         target_entry = open_targets.get(qa_type)
         if target_entry is None:
+            # No reference answer available — skip this sub-reward entirely.
             continue
         question, reference = target_entry
         prediction = str(open_predictions.get(qa_type) or "").strip()
-        score = judge.score(question=question, reference=reference, prediction=prediction)
+        if not prediction:
+            # Model did not emit this semantic field — skip (Fix B principle:
+            # unmeasurable sub-reward is skipped, not zero-padded).
+            type_scores[qa_type] = 0.0  # diagnostic only
+            continue
+        if qa_type in _override_scores:
+            score = float(_override_scores[qa_type])
+        else:
+            score = judge.score(question=question, reference=reference, prediction=prediction)
+        all_scores.append(score)
         family_scores["open_ended"].append(score)
         type_scores[qa_type] = score
 
-    # Family-weighted average: each family contributes equally regardless of sub-question count.
-    # This prevents multiple_choice (up to 4 items) from dominating over grounding (1-2 items)
-    # and open_ended (variable items). Mirrors TimeSearch-R design where each reward dimension
-    # gets an independent weight rather than being flattened.
+    # Fix B (2026-04-21): flat independent mean of all measurable sub-rewards.
+    # Each sub-reward (existence, category, temporal, open-ended QAs for non-v3)
+    # contributes 1/N weight. Missing/unmeasurable fields are skipped, not zeroed.
+    accuracy_reward = sum(all_scores) / float(len(all_scores)) if all_scores else 0.0
+    # `accuracy_by_family` is retained for diagnostic consumers (reward_summary
+    # output + tests). It reflects within-family means but is NOT used to compute
+    # `accuracy_reward` any more.
     accuracy_by_family = {
         family: (sum(scores) / float(len(scores)) if scores else 0.0)
         for family, scores in family_scores.items()
     }
-    active_families = {f: v for f, v in accuracy_by_family.items() if family_scores[f]}
-    accuracy_reward = sum(active_families.values()) / float(len(active_families)) if active_families else 0.0
+    # ACC_PROBE_START 2026-04-21 Fighting_6 accuracy-reward-0 investigation (Fix B)
+    try:
+        _vid = (
+            (rollout_trace.get("video_meta") or {}).get("video_id")
+            or rollout_trace.get("video_id")
+            or (structured_target or {}).get("video_id")
+            or "unknown"
+        )
+        _state = rollout_trace.get("state") or {}
+        print(
+            f"ACC_PROBE video_id={_vid} "
+            f"accuracy_reward={float(accuracy_reward):.4f} "
+            f"all_scores={all_scores} n={len(all_scores)} "
+            f"fp_empty={not bool(final_prediction)} "
+            f"fp_existence={final_prediction.get('existence') if final_prediction else None!r} "
+            f"fp_category={final_prediction.get('category') if final_prediction else None!r} "
+            f"fp_anomaly_interval={final_prediction.get('anomaly_interval_sec') if final_prediction else None!r} "
+            f"target_existence={(structured_target or {}).get('existence')!r} "
+            f"target_category={(structured_target or {}).get('category')!r} "
+            f"target_anomaly_interval={(structured_target or {}).get('anomaly_interval_sec')!r} "
+            f"sp_none={semantic_payload is None} "
+            f"sp_has_decision={bool((semantic_payload or {}).get('decision')) if semantic_payload else False} "
+            f"has_final_answer={bool(rollout_trace.get('final_answer'))} "
+            f"has_finalized_case={bool(_state.get('finalized_case'))} "
+            f"has_semantic_answer={bool(rollout_trace.get('semantic_answer'))} "
+            f"fs_lens={{'mc':{len(family_scores['multiple_choice'])},'gr':{len(family_scores['grounding'])},'oe':{len(family_scores['open_ended'])}}} "
+            f"family_scores={family_scores} "
+            f"type_scores={type_scores}",
+            flush=True,
+        )
+    except Exception as _probe_exc:
+        print(f"ACC_PROBE error: {_probe_exc}", flush=True)
+    # ACC_PROBE_END
     return {
         "accuracy_reward": round(float(accuracy_reward), 6),
         "accuracy_by_family": {
@@ -1288,6 +1481,7 @@ def _timesearch_selected_support_score(
     profile: Dict[str, Any],
     *,
     target: Dict[str, Any],
+    reward_version: str = "timesearch_v3",
 ) -> float:
     """Continuous evidence support score -- NO hard boolean gate.
 
@@ -1304,7 +1498,7 @@ def _timesearch_selected_support_score(
     decision_keys = ["existence", "category"]
     if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
         decision_keys.append("temporal")
-    if _target_requires_counterfactual_type(target):
+    if _target_requires_counterfactual_type(target, reward_version=reward_version):
         decision_keys.append("counterfactual_type")
     # Continuous scores -- no boolean gating. Each field contributes its raw score.
     decision_scores = [_safe_float((fields.get(key) or {}).get("score"), 0.0) for key in decision_keys if key in fields]
@@ -1323,6 +1517,7 @@ def _timesearch_selected_support_score_v2(
     profile: Dict[str, Any],
     *,
     target: Dict[str, Any],
+    reward_version: str = "timesearch_v3",
 ) -> float:
     full_selected = dict(((profile.get("branch_field_matrix") or {}).get("full_selected") or {}))
     if not bool(full_selected.get("available")):
@@ -1331,7 +1526,7 @@ def _timesearch_selected_support_score_v2(
     decision_keys = ["existence", "category"]
     if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
         decision_keys.append("temporal")
-    if _target_requires_counterfactual_type(target):
+    if _target_requires_counterfactual_type(target, reward_version=reward_version):
         decision_keys.append("counterfactual_type")
     decision_scores = [_safe_float((fields.get(key) or {}).get("score"), 0.0) for key in decision_keys]
     decision_field_support = (
@@ -1351,6 +1546,7 @@ def _timesearch_trigger_necessity_score_v2(
     profile: Dict[str, Any],
     *,
     target: Dict[str, Any],
+    reward_version: str = "timesearch_v3",
 ) -> float:
     branch_delta_matrix = dict(profile.get("branch_delta_matrix") or {})
     drop_trigger_delta = dict((branch_delta_matrix.get("drop_trigger") or {}).get("fields") or {})
@@ -1359,7 +1555,7 @@ def _timesearch_trigger_necessity_score_v2(
     required_keys = ["existence", "category"]
     if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
         required_keys.append("temporal")
-    if _target_requires_counterfactual_type(target):
+    if _target_requires_counterfactual_type(target, reward_version=reward_version):
         required_keys.append("counterfactual_type")
     delta_scores = [_safe_float(drop_trigger_delta.get(key), 0.0) for key in required_keys]
     if not delta_scores:
@@ -1426,7 +1622,9 @@ def _timesearch_fecv_diagnostics(
     *,
     target: Dict[str, Any],
     rollout_trace: Optional[Dict[str, Any]] = None,
+    reward_version: str = "timesearch_v3",
 ) -> Dict[str, Any]:
+    use_counterfactual_type = _reward_uses_counterfactual_type(reward_version)
     branch_field_matrix = dict(profile.get("branch_field_matrix") or {})
     branch_delta_matrix = dict(profile.get("branch_delta_matrix") or {})
     profile_source = str(
@@ -1487,6 +1685,7 @@ def _timesearch_fecv_diagnostics(
                 selected_window_ids=selected_window_ids,
                 selected_by_stage=selected_by_stage,
                 selection_resolution_source=selection_resolution_source,
+                use_counterfactual_type=use_counterfactual_type,
             )
             normal_reward_mode = str(normal_reward.get("normal_reward_mode") or "")
             normal_case_type = str(normal_reward.get("normal_case_type") or "")
@@ -1648,7 +1847,7 @@ def _timesearch_fecv_diagnostics(
     decision_keys = ["existence", "category"]
     if str(target.get("existence") or "").strip().lower() == "anomaly" and target.get("anomaly_interval_sec") is not None:
         decision_keys.append("temporal")
-    if _target_requires_counterfactual_type(target):
+    if _target_requires_counterfactual_type(target, reward_version=reward_version):
         decision_keys.append("counterfactual_type")
     decision_field_scores = {
         key: round(float(_safe_float((fields.get(key) or {}).get("score"), 0.0)), 6)
@@ -1661,14 +1860,26 @@ def _timesearch_fecv_diagnostics(
         for stage in required_stages
         if stage in fields
     }
-    selected_support = _timesearch_selected_support_score(profile, target=target)
-    selected_support_v2 = _timesearch_selected_support_score_v2(profile, target=target)
+    selected_support = _timesearch_selected_support_score(
+        profile,
+        target=target,
+        reward_version=reward_version,
+    )
+    selected_support_v2 = _timesearch_selected_support_score_v2(
+        profile,
+        target=target,
+        reward_version=reward_version,
+    )
     drop_trigger_delta = dict((branch_delta_matrix.get("drop_trigger") or {}).get("fields") or {})
     trigger_necessity_v1 = max(
         _safe_float(drop_trigger_delta.get("existence"), 0.0),
         _safe_float(drop_trigger_delta.get("category"), 0.0),
     ) if drop_trigger_delta else 0.0
-    trigger_necessity_v2 = _timesearch_trigger_necessity_score_v2(profile, target=target)
+    trigger_necessity_v2 = _timesearch_trigger_necessity_score_v2(
+        profile,
+        target=target,
+        reward_version=reward_version,
+    )
     stage_coverage_score = _timesearch_stage_coverage_score(
         profile,
         target=target,
@@ -1764,6 +1975,7 @@ def _timesearch_fecv_reward(
     *,
     target: Dict[str, Any],
     rollout_trace: Optional[Dict[str, Any]] = None,
+    reward_version: str = "timesearch_v3",
 ) -> float:
     """Continuous FECV reward.
 
@@ -1773,7 +1985,12 @@ def _timesearch_fecv_reward(
     """
     if not profile:
         return 0.0
-    diagnostics = _timesearch_fecv_diagnostics(profile, target=target, rollout_trace=rollout_trace)
+    diagnostics = _timesearch_fecv_diagnostics(
+        profile,
+        target=target,
+        rollout_trace=rollout_trace,
+        reward_version=reward_version,
+    )
     return float(diagnostics.get("evidence_faithfulness_reward") or 0.0)
 
 
@@ -1815,17 +2032,32 @@ def _score_rollout_trace_timesearch(
         llm_judge=llm_judge or OpenAICompatibleLlmJudge(),
         reward_version=normalized_reward_version,
     )
+    use_counterfactual_type = _reward_uses_counterfactual_type(normalized_reward_version)
 
-    final_decision_correct = 1.0 if _decision_matches(final_prediction, target) else 0.0
+    final_decision_correct = 1.0 if _decision_matches(
+        final_prediction,
+        target,
+        use_counterfactual_type=use_counterfactual_type,
+    ) else 0.0
     decision_sufficiency = 1.0 if bool(profile_summary.get("decision_sufficiency")) else 0.0
     minimal_subset_sufficiency = 1.0 if bool(profile_summary.get("minimal_subset_sufficiency")) else 0.0
     negative_specificity_pass = 1.0 if bool(profile_summary.get("negative_specificity_pass")) else 0.0
-    counterfactual_type_supported = 1.0 if bool(profile_summary.get("counterfactual_type_supported")) else 0.0
     fecv_full_selected_available = bool(((profile.get("branch_field_matrix") or {}).get("full_selected") or {}).get("available"))
     fecv_grounded_decision = 1.0 if final_decision_correct > 0.0 and decision_sufficiency > 0.0 else 0.0
     legacy_fecv_decision_reward = float(_fecv_decision_sufficiency_reward(profile))
-    legacy_fecv_specificity_reward = float(_fecv_specificity_reward(profile, target=target))
-    fecv_diagnostics = _timesearch_fecv_diagnostics(profile, target=target, rollout_trace=rollout_trace)
+    legacy_fecv_specificity_reward = float(
+        _fecv_specificity_reward(
+            profile,
+            target=target,
+            reward_version=normalized_reward_version,
+        )
+    )
+    fecv_diagnostics = _timesearch_fecv_diagnostics(
+        profile,
+        target=target,
+        rollout_trace=rollout_trace,
+        reward_version=normalized_reward_version,
+    )
     if not bool(fecv_diagnostics.get("full_selected_available")):
         logger.info(
             "fecv reward availability debug: video_id=%s generation_id=%s branch_profile=%s profile_source=%s "
@@ -2026,11 +2258,9 @@ def _score_rollout_trace_timesearch(
         "fecv_decision_sufficiency": float(decision_sufficiency),
         "fecv_minimal_subset_sufficiency": float(minimal_subset_sufficiency),
         "fecv_negative_specificity_pass": float(negative_specificity_pass),
-        "fecv_counterfactual_type_supported": float(counterfactual_type_supported),
         "counterfactual_decision_sufficiency": float(decision_sufficiency),
         "counterfactual_minimal_subset_sufficiency": float(minimal_subset_sufficiency),
         "negative_specificity_pass": float(negative_specificity_pass),
-        "counterfactual_type_supported": float(counterfactual_type_supported),
         "latest_verifier_turn_present": verifier_turn is not None,
         "verifier_source": str(verifier_turn.get("_verifier_source")) if verifier_turn is not None else "none",
         "uses_reference_conditioned_verifier": bool(

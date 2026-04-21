@@ -31,8 +31,14 @@ def _answer_block(payload: Dict[str, Any]) -> str:
 
 def _build_default_answer_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     final_decision = dict(row.get("oracle_final_decision") or row.get("structured_target") or {})
-    existence = str(final_decision.get("existence") or final_decision.get("decision") or "normal")
-    category = str(final_decision.get("category") or "normal")
+    # This synthesizes a default answer payload for debug/preview replay.
+    # Previously this fell back to "normal" when existence/category were
+    # absent, which propagated a bias-to-normal label into the replayed
+    # oracle traces. Preserve the original values verbatim so downstream
+    # code can detect the missing-label case instead of silently treating
+    # it as a normal sample.
+    existence = str(final_decision.get("existence") or final_decision.get("decision") or "")
+    category = str(final_decision.get("category") or "")
     summary = str(final_decision.get("summary") or "")
     if not summary:
         if existence == "anomaly":

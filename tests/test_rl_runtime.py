@@ -775,75 +775,6 @@ def test_native_build_episode_spec_entry_applies_easy_normal_partition_multiplie
     assert float(result["sample_partition_multiplier"]) == pytest.approx(0.2)
 
 
-def test_native_zero_variance_advantage_fallback_uses_partition_baseline_for_hard_normal():
-    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
-    trainer.advantage_clip = 3.0
-    trainer._advantage_partition_min_history = 1
-    trainer._reward_partition_baselines = {
-        "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-        "hard_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-    }
-    trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
-    trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
-    trainer._update_reward_partition_baseline = (
-        native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
-    )
-    trainer._apply_zero_variance_advantage_fallback = (
-        native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
-    )
-    rollouts = [
-        {
-            "group_reward_std": 0.0,
-            "group_advantage": 0.0,
-            "reward_summary": {"total_reward": 0.6, "fecv_normal_case_type": "suspicious_normal"},
-            "scoring_target": {"existence": "normal"},
-        }
-    ]
-
-    updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
-
-    assert updated[0]["sample_partition"] == "hard_normal"
-    assert float(updated[0]["group_advantage"]) == pytest.approx(0.35)
-    assert updated[0]["advantage_source"] == "partition_ema"
-    assert updated[0]["fallback_partition"] == "hard_normal"
-
-
-def test_native_zero_variance_advantage_fallback_keeps_easy_normal_zero():
-    trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
-    trainer.advantage_clip = 3.0
-    trainer._advantage_partition_min_history = 1
-    trainer._reward_partition_baselines = {
-        "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-        "easy_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-    }
-    trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
-    trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
-    trainer._update_reward_partition_baseline = (
-        native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
-    )
-    trainer._apply_zero_variance_advantage_fallback = (
-        native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
-    )
-    rollouts = [
-        {
-            "group_reward_std": 0.0,
-            "group_advantage": 0.0,
-            "reward_summary": {
-                "total_reward": 1.0,
-                "fecv_normal_case_type": "easy_normal",
-                "fecv_easy_normal_sample_loss_multiplier": 0.2,
-            },
-            "scoring_target": {"existence": "normal"},
-        }
-    ]
-
-    updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
-
-    assert updated[0]["sample_partition"] == "easy_normal"
-    assert float(updated[0]["group_advantage"]) == pytest.approx(0.0)
-    assert updated[0]["advantage_source"] == "zero_advantage"
-
-
 def test_select_iteration_indices_balances_anomaly_and_normal_when_records_available():
     records = [{"label": {"is_anomaly": False}} for _ in range(6)] + [
         {"label": {"is_anomaly": True}} for _ in range(2)
@@ -1123,6 +1054,99 @@ def test_select_iteration_indices_balances_anomaly_and_normal_when_records_avail
         self.assertIn("filtered_below_min_weight=1", joined)
         self.assertIn("rl reward components debug:", joined)
 
+    def test_zero_variance_groups_do_not_use_ema_fallback(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer._classify_rollout_partition = lambda rollout: "anomaly"
+        trainer.advantage_clip = 3.0
+
+        updated = trainer._apply_zero_variance_advantage_fallback(
+            [
+                {
+                    "reward_summary": {"total_reward": 0.25},
+                    "group_reward_std": 0.0,
+                    "group_advantage": 0.0,
+                    "advantage_source": "zero_advantage",
+                },
+                {
+                    "reward_summary": {"total_reward": 0.25},
+                    "group_reward_std": 0.0,
+                    "group_advantage": 0.0,
+                    "advantage_source": "zero_advantage",
+                },
+            ]
+        )
+
+        self.assertEqual(len(updated), 2)
+        for rollout in updated:
+            self.assertEqual(float(rollout["group_advantage"]), 0.0)
+            self.assertEqual(str(rollout["advantage_source"]), "zero_variance_skip")
+            self.assertTrue(bool(rollout["zero_variance_group"]))
+            self.assertNotIn("fallback_partition", rollout)
+            self.assertNotIn("fallback_baseline_mean", rollout)
+            self.assertNotIn("fallback_baseline_std", rollout)
+
+    def test_native_generation_item_payload_skips_zero_variance_groups_even_with_zero_min_weight(self) -> None:
+        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
+        trainer.args = types.SimpleNamespace(gradient_accumulation_steps=4)
+        trainer.steps_per_generation = 1
+        trainer.num_generations = 1
+        trainer.min_weight = 0.0
+        trainer._new_rollout_metric_lists = lambda: {
+            "reward_total": [],
+            "reward_accuracy": [],
+            "reward_fecv_evidence": [],
+            "reward_protocol_finalize": [],
+            "reward_fecv_decision": [],
+            "reward_fecv_specificity": [],
+        }
+        trainer._new_runtime_stats = lambda: {
+            "raw_local_episode_spec_count": 0,
+            "raw_local_prepared_batch_count": 0,
+            "raw_local_sample_count": 0,
+            "local_fecv_failure_count": 0,
+            "groups_filtered_by_min_weight": 0,
+            "groups_all_zero_advantage": 0,
+            "zero_variance_group_count": 0,
+            "zero_variance_rollout_count": 0,
+            "zero_variance_skipped_count": 0,
+            "replay_fill_batches": 0,
+            "replay_fill_episode_specs": 0,
+        }
+        trainer._generate_scored_rollouts = lambda item, rollout_model, progress=None: [
+            {
+                "video_id": "vid1",
+                "generation_id": 0,
+                "group_advantage": 0.0,
+                "zero_variance_group": True,
+                "advantage_source": "zero_variance_skip",
+                "reward_summary": {
+                    "total_reward": 0.25,
+                    "components": {
+                        "accuracy_reward": 0.0,
+                        "fecv_evidence_faithfulness_reward": 0.25,
+                        "protocol_finalize_reward": 0.0,
+                        "fecv_decision_sufficiency_reward": 0.0,
+                        "fecv_specificity_reward": 0.0,
+                    },
+                },
+                "fecv_failed": False,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+                "turns": [],
+            }
+        ]
+        trainer._build_episode_spec_entry_from_rollout = mock.Mock(side_effect=AssertionError("zero-variance groups should not materialize"))
+        trainer._populate_old_policy_log_probs = mock.Mock()
+
+        payload = trainer._build_generation_item_payload({"video_id": "vid1"}, rollout_model=object())
+
+        self.assertEqual(payload["episode_specs"], [])
+        self.assertEqual(payload["runtime_stats"]["zero_variance_group_count"], 1)
+        self.assertEqual(payload["runtime_stats"]["zero_variance_rollout_count"], 1)
+        self.assertEqual(payload["runtime_stats"]["zero_variance_skipped_count"], 1)
+        self.assertEqual(payload["runtime_stats"]["groups_all_zero_advantage"], 1)
+        trainer._build_episode_spec_entry_from_rollout.assert_not_called()
+        trainer._populate_old_policy_log_probs.assert_not_called()
+
     def test_build_episode_spec_entry_from_rollout_logs_drop_reason_details(self) -> None:
         trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
         trainer._budgeting_stats = mock.Mock()
@@ -1286,73 +1310,6 @@ def test_select_iteration_indices_balances_anomaly_and_normal_when_records_avail
         self.assertAlmostEqual(float(feature["sample_loss_multiplier"]), 0.2, places=6)
         self.assertEqual(result["sample_partition"], "easy_normal")
         self.assertAlmostEqual(float(result["sample_partition_multiplier"]), 0.2, places=6)
-
-    def test_zero_variance_advantage_fallback_uses_partition_baseline_for_hard_normal(self) -> None:
-        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
-        trainer.advantage_clip = 3.0
-        trainer._advantage_partition_min_history = 1
-        trainer._reward_partition_baselines = {
-            "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-            "hard_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-        }
-        trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
-        trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
-        trainer._update_reward_partition_baseline = (
-            native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
-        )
-        trainer._apply_zero_variance_advantage_fallback = (
-            native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
-        )
-        rollouts = [
-            {
-                "group_reward_std": 0.0,
-                "group_advantage": 0.0,
-                "reward_summary": {"total_reward": 0.6, "fecv_normal_case_type": "suspicious_normal"},
-                "scoring_target": {"existence": "normal"},
-            }
-        ]
-
-        updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
-
-        self.assertEqual(updated[0]["sample_partition"], "hard_normal")
-        self.assertAlmostEqual(float(updated[0]["group_advantage"]), 0.35, places=6)
-        self.assertEqual(updated[0]["advantage_source"], "partition_ema")
-        self.assertEqual(updated[0]["fallback_partition"], "hard_normal")
-
-    def test_zero_variance_advantage_fallback_keeps_easy_normal_zero(self) -> None:
-        trainer = object.__new__(native_grpo_module._NativeGRPOTrainerMixin)
-        trainer.advantage_clip = 3.0
-        trainer._advantage_partition_min_history = 1
-        trainer._reward_partition_baselines = {
-            "__global__": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-            "easy_normal": {"count": 1.0, "mean": 0.25, "sq_mean": 0.0625},
-        }
-        trainer._classify_rollout_partition = native_grpo_module._NativeGRPOTrainerMixin._classify_rollout_partition.__get__(trainer)
-        trainer._reward_baseline_stats = native_grpo_module._NativeGRPOTrainerMixin._reward_baseline_stats.__get__(trainer)
-        trainer._update_reward_partition_baseline = (
-            native_grpo_module._NativeGRPOTrainerMixin._update_reward_partition_baseline.__get__(trainer)
-        )
-        trainer._apply_zero_variance_advantage_fallback = (
-            native_grpo_module._NativeGRPOTrainerMixin._apply_zero_variance_advantage_fallback.__get__(trainer)
-        )
-        rollouts = [
-            {
-                "group_reward_std": 0.0,
-                "group_advantage": 0.0,
-                "reward_summary": {
-                    "total_reward": 1.0,
-                    "fecv_normal_case_type": "easy_normal",
-                    "fecv_easy_normal_sample_loss_multiplier": 0.2,
-                },
-                "scoring_target": {"existence": "normal"},
-            }
-        ]
-
-        updated = trainer._apply_zero_variance_advantage_fallback(rollouts)
-
-        self.assertEqual(updated[0]["sample_partition"], "easy_normal")
-        self.assertAlmostEqual(float(updated[0]["group_advantage"]), 0.0, places=6)
-        self.assertEqual(updated[0]["advantage_source"], "zero_advantage")
 
     def test_old_logprob_reuse_condition_matches_timesearch_r_rule(self) -> None:
         trainer = object.__new__(TimesearchAlignedGRPOTrainerMixin)
@@ -2363,7 +2320,6 @@ def test_select_iteration_indices_balances_anomaly_and_normal_when_records_avail
             "summary": {
                 "minimal_subset_sufficiency": False,
                 "negative_specificity_pass": False,
-                "counterfactual_type_supported": False,
             },
             "branch_field_matrix": {
                 "minimal_subset": {"available": True},

@@ -8,7 +8,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from saver_v3.core.adapter import TimeSearchRolloutAdapter
-from saver_v3.core.categories import canonicalize_saver_category
+from saver_v3.core.categories import canonicalize_saver_category, normalize_existence
 from saver_v3.core.environment import (
     _json_brace_balance,
     _repair_json_object_text,
@@ -18,6 +18,7 @@ from saver_v3.core.environment import (
 from saver_v3.core.proposal import compose_scene_anchored_query, normalize_description_query_phrases
 from saver_v3.core.protocol_guidance import summarize_evidence_ledger
 from saver_v3.core.semantic_answer import (
+    build_replay_decision_scaffold,
     build_semantic_answer_payload,
     build_semantic_answer_scaffold,
     extract_decision_from_semantic_answer,
@@ -35,7 +36,7 @@ ROLE_TO_STAGE = {
     "confirmation": "confirmation",
     "aftermath": "confirmation",
 }
-CORE_DECISION_FIELDS = ("existence", "category", "temporal", "counterfactual_type")
+CORE_DECISION_FIELDS = ("existence", "category", "temporal")
 STAGE_TEXT_THRESHOLD = 0.3
 BRANCH_ORDER = (
     "full_selected",
@@ -380,15 +381,13 @@ def _interval_iou(pred_interval: Sequence[float] | None, ref_interval: Sequence[
 def _normalize_decision_payload(payload: Dict[str, Any] | None) -> Dict[str, Any]:
     payload = dict(payload or {})
     normalized: Dict[str, Any] = {}
-    existence = str(payload.get("existence") or "").strip().lower()
-    normalized["existence"] = "anomaly" if existence == "anomaly" else "normal"
+    normalized["existence"] = normalize_existence(payload.get("existence"))
     normalized["category"] = canonicalize_saver_category(
         payload.get("category"),
-        existence=normalized["existence"],
+        existence=normalized["existence"] or None,
     ) or str(payload.get("category") or "").strip().lower()
     interval = payload.get("anomaly_interval_sec")
     normalized["anomaly_interval_sec"] = list(interval) if isinstance(interval, (list, tuple)) and len(interval) == 2 else None
-    normalized["counterfactual_type"] = str(payload.get("counterfactual_type") or "").strip().lower() or "none"
     return normalized
 
 
@@ -468,10 +467,14 @@ def _structured_decision_scores(
 ) -> Dict[str, float]:
     prediction = _extract_final_decision_payload(rollout)
     scores: Dict[str, float] = {}
-    target_existence = str(target.get("existence") or "").strip().lower()
-    scores["existence"] = 1.0 if prediction.get("existence") == ("anomaly" if target_existence == "anomaly" else "normal") else 0.0
-    target_category = canonicalize_saver_category(target.get("category"), existence=target_existence) or str(target.get("category") or "").strip().lower()
-    prediction_category = canonicalize_saver_category(prediction.get("category"), existence=prediction.get("existence")) or str(prediction.get("category") or "").strip().lower()
+    target_existence = normalize_existence(target.get("existence"))
+    prediction_existence = normalize_existence(prediction.get("existence"))
+    if prediction_existence and target_existence:
+        scores["existence"] = 1.0 if prediction_existence == target_existence else 0.0
+    else:
+        scores["existence"] = 0.0
+    target_category = canonicalize_saver_category(target.get("category"), existence=target_existence or None) or str(target.get("category") or "").strip().lower()
+    prediction_category = canonicalize_saver_category(prediction.get("category"), existence=prediction_existence or None) or str(prediction.get("category") or "").strip().lower()
     scores["category"] = 1.0 if target_category and prediction_category == target_category else 0.0
     target_interval = target.get("anomaly_interval_sec")
     prediction_interval = prediction.get("anomaly_interval_sec")
@@ -513,7 +516,6 @@ def _build_normal_skip_profile(
                 "decision_sufficiency": False,
                 "minimal_subset_sufficiency": False,
                 "negative_specificity_pass": False,
-                "counterfactual_type_supported": True,
                 "stage_necessity": {},
             },
             "branch_field_matrix": {},
@@ -782,8 +784,9 @@ def _build_compact_semantic_scaffold(
     branch_name: str,
 ) -> str:
     del branch_name
+    del target
     scaffold = {
-        "decision": dict(target or {"existence": "normal", "category": "normal"}),
+        "decision": build_replay_decision_scaffold(),
         "covered_stages": [],
         "missing_required_stages": [],
         "stage_selected_moment_ids": {},
@@ -835,17 +838,6 @@ def _compare_temporal(prediction_payload: Dict[str, Any] | None, reference_paylo
     return (1.0 if supported else 0.0), supported
 
 
-def _compare_counterfactual_type(prediction_payload: Dict[str, Any] | None, reference_payload: Dict[str, Any]) -> Tuple[float, bool]:
-    pred_decision = (prediction_payload or {}).get("decision") or {}
-    ref_decision = reference_payload.get("decision") or {}
-    reference = str(ref_decision.get("counterfactual_type") or "").strip().lower()
-    prediction = str(pred_decision.get("counterfactual_type") or "").strip().lower()
-    if not reference or reference == "none":
-        return 1.0, True
-    supported = bool(prediction) and prediction == reference
-    return (1.0 if supported else 0.0), supported
-
-
 def _compare_stage_text(
     prediction_payload: Dict[str, Any] | None,
     reference_payload: Dict[str, Any],
@@ -869,7 +861,6 @@ def _field_support(
         ("existence", _compare_existence),
         ("category", _compare_category),
         ("temporal", _compare_temporal),
-        ("counterfactual_type", _compare_counterfactual_type),
     ):
         score, supported = compare_fn(prediction_payload, reference_payload)
         support[field_name] = {"score": round(float(score), 6), "supported": bool(supported)}
@@ -890,10 +881,6 @@ def _core_decision_supported(
         return False
     if existence == "anomaly" and target.get("anomaly_interval_sec") is not None:
         if not bool(field_support.get("temporal", {}).get("supported")):
-            return False
-    target_counterfactual = str(target.get("counterfactual_type") or "").strip().lower()
-    if target_counterfactual and target_counterfactual != "none":
-        if not bool(field_support.get("counterfactual_type", {}).get("supported")):
             return False
     return True
 
@@ -1007,19 +994,16 @@ def _derive_stage_necessity_from_deltas(
         _safe_float(trigger_delta.get("existence"), 0.0),
         _safe_float(trigger_delta.get("category"), 0.0),
         _safe_float(trigger_delta.get("temporal"), 0.0),
-        _safe_float(trigger_delta.get("counterfactual_type"), 0.0),
     )
     precursor_decision_drop = max(
         _safe_float(precursor_delta.get("existence"), 0.0),
         _safe_float(precursor_delta.get("category"), 0.0),
         _safe_float(precursor_delta.get("temporal"), 0.0),
-        _safe_float(precursor_delta.get("counterfactual_type"), 0.0),
     )
     confirmation_decision_drop = max(
         _safe_float(confirmation_delta.get("existence"), 0.0),
         _safe_float(confirmation_delta.get("category"), 0.0),
         _safe_float(confirmation_delta.get("temporal"), 0.0),
-        _safe_float(confirmation_delta.get("counterfactual_type"), 0.0),
     )
 
     precursor_available = bool((branch_field_matrix.get("drop_precursor") or {}).get("available"))
@@ -2300,7 +2284,6 @@ def run_counterfactual_verification_batch(
         }
         branch_delta_matrix = _build_branch_delta_matrix(branch_field_matrix)
         full_selected_branch = dict(branches.get("full_selected") or {})
-        full_support = dict(full_selected_branch.get("field_support") or {})
         # Continuous delta scores for the redesigned R_fecv (used by reward.py)
         _hn_delta_fields = dict((branch_delta_matrix.get("hard_negative_swap") or {}).get("fields") or {})
         _dt_delta_fields = dict((branch_delta_matrix.get("drop_trigger") or {}).get("fields") or {})
@@ -2314,7 +2297,6 @@ def run_counterfactual_verification_batch(
                 _safe_float(_hn_delta_fields.get("existence"), 0.0) >= 0.5
                 or _safe_float(_hn_delta_fields.get("category"), 0.0) >= 0.5
             ),
-            "counterfactual_type_supported": bool(full_support.get("counterfactual_type", {}).get("supported", False)),
             "stage_necessity": _derive_stage_necessity_from_deltas(
                 branch_field_matrix=branch_field_matrix,
                 branch_delta_matrix=branch_delta_matrix,

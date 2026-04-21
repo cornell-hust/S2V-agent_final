@@ -66,9 +66,9 @@ distributed:
   bf16: true
 
 logging:
-  inline_rollout_eval: false
-  rollout_eval_start_iteration: 1
-  rollout_eval_interval_iterations: 10
+  inline_rollout_eval: true
+  rollout_eval_start_iteration: 40
+  rollout_eval_interval_iterations: 40
   final_rollout_eval: true
 
 rewards:

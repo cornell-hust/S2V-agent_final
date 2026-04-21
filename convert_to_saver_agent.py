@@ -21,9 +21,26 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+_logger = logging.getLogger(__name__)
+_ANOMALY_ANNOTATION_GAPS: Dict[str, int] = {"missing_category": 0, "missing_interval": 0}
+_ANOMALY_ANNOTATION_WARN_LIMIT = 10
+
+
+def log_annotation_stats() -> None:
+    total = _ANOMALY_ANNOTATION_GAPS["missing_category"] + _ANOMALY_ANNOTATION_GAPS["missing_interval"]
+    if total == 0:
+        _logger.info("anomaly annotation audit: no gaps detected")
+        return
+    _logger.warning(
+        "anomaly annotation gaps detected: missing_category=%d missing_interval=%d",
+        _ANOMALY_ANNOTATION_GAPS["missing_category"],
+        _ANOMALY_ANNOTATION_GAPS["missing_interval"],
+    )
 
 from split_utils import parse_include_splits
 from saver_v3.core.categories import CANONICAL_POLICY_CATEGORIES, canonicalize_saver_category
@@ -811,6 +828,21 @@ class CanonicalSaverAdapter:
             "summary": language.get("summary"),
             "rationale": language.get("rationale"),
         }
+        if existence == "anomaly":
+            if not structured_target.get("category"):
+                _ANOMALY_ANNOTATION_GAPS["missing_category"] += 1
+                if _ANOMALY_ANNOTATION_GAPS["missing_category"] <= _ANOMALY_ANNOTATION_WARN_LIMIT:
+                    _logger.warning(
+                        "anomaly sample missing category: record_id=%s",
+                        base.get("record_id") or base.get("id"),
+                    )
+            if not structured_target.get("anomaly_interval_sec"):
+                _ANOMALY_ANNOTATION_GAPS["missing_interval"] += 1
+                if _ANOMALY_ANNOTATION_GAPS["missing_interval"] <= _ANOMALY_ANNOTATION_WARN_LIMIT:
+                    _logger.warning(
+                        "anomaly sample missing anomaly_interval_sec: record_id=%s",
+                        base.get("record_id") or base.get("id"),
+                    )
         semantic_payload = build_semantic_answer_payload(
             structured_target=structured_target,
             qa_pairs=base.get("qa_pairs") or [],
@@ -1647,6 +1679,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for record in input_records
     )
     write_jsonl(output_path, converted_rows)
+    log_annotation_stats()
     print("finished\n--------------------------------\n")
     return 0
 
