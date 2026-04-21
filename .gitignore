@@ -41,3 +41,5 @@ tests/
 wandb/
 /AGENTS.md
 /.omx
+tmp/
+tmp_sync_placeholder/
