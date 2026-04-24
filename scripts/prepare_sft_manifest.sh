@@ -25,7 +25,7 @@ printf '  %q' "${CMD[@]}"
 printf '\n'
 
 if [[ "${RUN_MODE}" != "run" ]]; then
-  printf 'Dry run only. Pass --run to execute compact_trace_v2 SFT preparation.\n'
+  printf 'Dry run only. Pass --run to execute compact_trace_v5 SFT preparation.\n'
   exit 0
 fi
 

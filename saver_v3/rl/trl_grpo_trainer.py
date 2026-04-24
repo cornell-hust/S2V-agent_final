@@ -14,6 +14,8 @@ from saver_v3.data.materialized_cache import (
     MaterializedRuntimeItemDataset,
     ensure_materialized_cache_metadata,
 )
+from saver_v3.data.config import DEFAULT_ROLLOUT_MAX_TURNS
+from saver_v3.data.protocol_signature import DEFAULT_TEACHER_ROLE, build_protocol_signature
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp, write_json
 from saver_v3.rl.grpo_trainer_env import (
     _build_rl_authority_checkpoint_callback,
@@ -27,6 +29,7 @@ from saver_v3.model.qwen_policy import QwenGenerationPolicy, load_generation_pro
 from saver_v3.core.reward import DEFAULT_RL_REWARD_VERSION
 from saver_v3.core.rollout import SaverRolloutRunner
 from saver_v3.common.runtime import distributed_runtime_from_env, runtime_log
+from saver_v3.rl.resume import RLTrainingResumeState, load_trainer_resume_state
 from saver_v3.sft.training import _unwrap_model, load_qwen_model_and_processor, run_rollout_eval_with_policy
 from saver_v3.rl.trl_compat import patch_vllm_guided_decoding_params
 from saver_v3.model import vllm_generation as shared_vllm_generation
@@ -268,8 +271,12 @@ def _build_vllm_trainer_class_transform(
                 judge = getattr(self, "reward_judge", None)
                 if judge is not None and vllm_runtime is not None:
                     engine = getattr(vllm_runtime, "llm", None)
-                    if engine is not None and hasattr(judge, "attach_local_vllm"):
-                        judge.attach_local_vllm(engine)
+                    if engine is None or not hasattr(judge, "attach_local_vllm"):
+                        raise RuntimeError(
+                            "Active RL semantic reward requires a local vLLM judge backend, "
+                            "but the colocated runtime did not expose an attachable engine."
+                        )
+                    judge.attach_local_vllm(engine)
 
             def _build_policy(self, model: Any, *, use_generation_cache: bool) -> QwenGenerationPolicy:
                 policy = VllmQwenGenerationPolicy(
@@ -385,6 +392,10 @@ def _attach_vllm_route_to_trainer(*args: Any, **kwargs: Any) -> Optional[_VllmCo
 
 def _iteration_dir_name(iteration_index: int) -> str:
     return f"iter_{int(iteration_index):03d}"
+
+
+def _rollout_eval_iteration_dir_name(iteration_index: int) -> str:
+    return f"rl_iter_{int(iteration_index) + 1:03d}"
 
 
 def _resolve_standard_trainer_checkpoint_path(output_dir: str | Path, global_step: int) -> Path:
@@ -534,8 +545,6 @@ def _build_continuous_iteration_callback(
                 raise RuntimeError("Continuous RL expected a standard Trainer checkpoint after save, but none was found.")
             checkpoint_path = Path(checkpoint)
             self.last_saved_checkpoint = checkpoint_path
-            self.owner.latest_checkpoint = str(checkpoint_path)
-            self.owner.current_model_path = str(checkpoint_path)
             runtime_log(
                 (
                     f"continuous RL standard checkpoint published: iteration={int(iteration_index)} "
@@ -544,13 +553,25 @@ def _build_continuous_iteration_callback(
                 runtime=self.owner.runtime,
                 main_process_only=True,
             )
+            loadable_authority_checkpoint = _save_loadable_hf_authority_checkpoint(
+                trainer=self.trainer,
+                processor=self.processor,
+                checkpoint_root=checkpoint_path,
+                epoch_index=int(iteration_index) + 1,
+                runtime=self.owner.runtime,
+            )
+            self.owner.latest_checkpoint = str(loadable_authority_checkpoint)
+            self.owner.current_model_path = str(loadable_authority_checkpoint)
             summary = self.owner._build_iteration_summary(
                 iteration=int(iteration_index),
                 items=self.mutable_dataset.snapshot_items(),
             )
             summary.update(
                 {
-                    "latest_checkpoint": str(checkpoint_path),
+                    "latest_checkpoint": str(loadable_authority_checkpoint),
+                    "trainer_resume_checkpoint": str(checkpoint_path),
+                    "standard_trainer_checkpoint": str(checkpoint_path),
+                    "loadable_authority_checkpoint": str(loadable_authority_checkpoint),
                     "checkpoint_root": str(checkpoint_path),
                     "checkpoint_strategy": _checkpoint_strategy_label(
                         eval_start_iteration=self.eval_start_iteration,
@@ -581,8 +602,8 @@ def _build_continuous_iteration_callback(
                 append_jsonl(self.owner.resolved_log_dir / "rl_iteration_metrics.jsonl", summary)
             rollout_eval_config = self.owner.eval_config_builder(
                 args=self.owner.args,
-                current_model_path=str(checkpoint_path),
-                reference_model_path=str(checkpoint_path),
+                current_model_path=str(loadable_authority_checkpoint),
+                reference_model_path=str(loadable_authority_checkpoint),
                 config=self.owner.config_builder(self.owner.args),
             )
             if bool(getattr(rollout_eval_config, "inline_rollout_eval", False)):
@@ -615,7 +636,9 @@ def _build_continuous_iteration_callback(
                     policy,
                     rollout_eval_config=rollout_eval_config,
                     output_dir=args.output_dir,
-                    rollout_eval_output_dir=str(self.owner.rollout_eval_output_root / _iteration_dir_name(int(iteration_index))),
+                    rollout_eval_output_dir=str(
+                        self.owner.rollout_eval_output_root / _rollout_eval_iteration_dir_name(int(iteration_index))
+                    ),
                     epoch_index=int(iteration_index) + 1,
                     epoch_value=float(getattr(state, "epoch", float(iteration_index + 1)) or float(iteration_index + 1)),
                     runtime=self.owner.runtime,
@@ -649,20 +672,27 @@ def _build_continuous_iteration_callback(
             checkpoint = get_last_checkpoint(args.output_dir) or str(args.output_dir)
             checkpoint_path = Path(checkpoint)
             self.last_saved_checkpoint = checkpoint_path
-            self.owner.latest_checkpoint = str(checkpoint_path)
-            self.owner.current_model_path = str(checkpoint_path)
+            loadable_authority_checkpoint = _save_loadable_hf_authority_checkpoint(
+                trainer=self.trainer,
+                processor=self.processor,
+                checkpoint_root=checkpoint_path,
+                epoch_index=int(max(0, int(self._iteration_from_epoch_end(state))) + 1),
+                runtime=self.owner.runtime,
+            )
+            self.owner.latest_checkpoint = str(loadable_authority_checkpoint)
+            self.owner.current_model_path = str(loadable_authority_checkpoint)
             iteration_index = max(0, int(self._iteration_from_epoch_end(state)))
             if iteration_index < int(getattr(self.owner.args, "num_iterations", 1) or 1) - 1:
                 iteration_index = int(getattr(self.owner.args, "num_iterations", 1) or 1) - 1
             runtime_log(
-                f"continuous RL final checkpoint saved: checkpoint={checkpoint_path} iteration={iteration_index}",
+                f"continuous RL final checkpoint saved: checkpoint={checkpoint_path} loadable_hf={loadable_authority_checkpoint} iteration={iteration_index}",
                 runtime=self.owner.runtime,
                 main_process_only=True,
             )
             rollout_eval_config = self.owner.eval_config_builder(
                 args=self.owner.args,
-                current_model_path=str(checkpoint_path),
-                reference_model_path=str(checkpoint_path),
+                current_model_path=str(loadable_authority_checkpoint),
+                reference_model_path=str(loadable_authority_checkpoint),
                 config=self.owner.config_builder(self.owner.args),
             )
             eval_model = _unwrap_model(model)
@@ -805,21 +835,18 @@ def create_trl_vllm_grpo_trainer(
         keep_recent_tool_image_messages=args.keep_recent_tool_image_messages,
         keep_recent_text_messages=args.keep_recent_text_messages,
         max_seq_length=args.max_seq_length,
-        counterfactual_max_images=12,
         policy_do_sample=args.policy_do_sample,
         policy_temperature=args.policy_temperature,
         policy_top_p=args.policy_top_p,
         policy_top_k=args.policy_top_k,
         policy_repetition_penalty=args.policy_repetition_penalty,
         rollout_use_generation_cache=args.rl_rollout_use_cache,
-        fecv_use_generation_cache=args.rl_fecv_use_cache,
         compute_loss_microbatch_size=args.rl_compute_loss_microbatch_size,
         steps_per_generation=max(1, int(getattr(args, "rl_steps_per_generation", 1))),
         replay_buffer_enable=False,
         replay_buffer_type="none",
         replay_buffer_capacity=0,
         replay_buffer_alpha=1.0,
-        fecv_failure_policy=args.rl_fecv_failure_policy,
         all_empty_policy="true_skip",
         log_empty_batch_rank_summary=args.rl_log_empty_batch_rank_summary,
         reward_version=getattr(args, "rl_reward_version", DEFAULT_RL_REWARD_VERSION),
@@ -827,8 +854,11 @@ def create_trl_vllm_grpo_trainer(
         iteration_index=int(iteration_index),
         num_iterations=int(num_iterations),
         rollout_eval_callback=rollout_eval_callback,
+        ddp_find_unused_parameters=False,
         deepspeed=str(getattr(args, "deepspeed", "") or "") or None,
         save_strategy=str(save_strategy),
+        proposal_runtime=proposal_runtime,
+        strict_feature_guided_proposal=bool(strict_feature_guided_proposal),
         trainer_class_transform=_build_vllm_trainer_class_transform(
             args=args,
             vllm_runtime=vllm_runtime,
@@ -868,13 +898,25 @@ class TrlVllmGrpoRunner:
             Path(str(log_dir).strip()) if str(log_dir or "").strip() else self.output_dir / "logs"
         )
 
+        self._cached_base_dataset = None
         self.raw_records = self._load_raw_records()
         (
             self.strict_feature_guided_proposal,
             self.proposal_runtime,
         ) = self._resolve_training_proposal_support()
         self.dataset = self._build_dataset()
-        self.current_model_path = str(self.args.model_path)
+        self.resume_state: Optional[RLTrainingResumeState] = None
+        resume_from_checkpoint = str(getattr(self.args, "resume_from_checkpoint", "") or "").strip()
+        if resume_from_checkpoint:
+            self.resume_state = load_trainer_resume_state(
+                resume_from_checkpoint,
+                source="args.resume_from_checkpoint",
+            )
+        self.current_model_path = (
+            str(self.resume_state.checkpoint_path)
+            if self.resume_state is not None
+            else str(self.args.model_path)
+        )
         self.latest_checkpoint = self.current_model_path
         self.reference_model_mode = "per_iteration_trainer_init"
         self.reference_model_source_path = str(self.current_model_path)
@@ -893,38 +935,49 @@ class TrlVllmGrpoRunner:
     def _load_raw_records(self) -> List[Dict[str, Any]]:
         materialized_train_items_path = str(getattr(self.args, "materialized_train_items_path", "") or "").strip()
         include_splits_value = getattr(self.args, "include_splits", "")
+        saver_config = self.config_builder(self.args)
         if materialized_train_items_path:
+            expected_protocol_signature = build_protocol_signature(
+                config=saver_config,
+                max_turns=int(
+                    getattr(self.args, "rollout_max_turns", DEFAULT_ROLLOUT_MAX_TURNS) or DEFAULT_ROLLOUT_MAX_TURNS
+                ),
+                policy_max_new_tokens=int(getattr(self.args, "policy_max_new_tokens", 0) or 0),
+                teacher_role=DEFAULT_TEACHER_ROLE,
+            )
             ensure_materialized_cache_metadata(
                 materialized_train_items_path,
                 expected_format=MATERIALIZED_RUNTIME_ITEMS_FORMAT,
                 expected_source_path=self.args.data,
                 expected_include_splits=include_splits_value,
+                expected_config=saver_config,
+                expected_protocol_signature=expected_protocol_signature,
+                require_config_match=True,
                 require_source=True,
             )
             dataset = MaterializedRuntimeItemDataset(
                 materialized_train_items_path,
                 include_splits=include_splits_value,
+                config=saver_config,
                 require_frame_cache=True,
                 require_feature_cache=True,
             )
+            self._cached_base_dataset = dataset
             return [dict(record) for record in list(getattr(dataset, "records", []) or [])]
         if bool(getattr(self.args, "require_materialized_runtime_cache", False)):
             raise ValueError(
                 "Active RL requires --materialized-train-items-path when --require-materialized-runtime-cache=true."
             )
-        records = [
-            json.loads(line)
-            for line in Path(self.args.data).read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        if getattr(self.args, "include_splits", ""):
-            allowed = {
-                str(value).strip()
-                for value in str(self.args.include_splits).split(",")
-                if str(value).strip()
-            }
-            records = [record for record in records if str(record.get("split") or "").strip() in allowed]
-        return records
+        dataset = SaverAgentDataset(
+            self.args.data,
+            data_root=self.args.data_root,
+            config=saver_config,
+            include_splits=include_splits_value,
+            require_frame_cache=True,
+            require_feature_cache=True,
+        )
+        self._cached_base_dataset = dataset
+        return [dict(record) for record in list(getattr(dataset, "records", []) or [])]
 
     def _resolve_training_proposal_support(self) -> Tuple[bool, Any]:
         strict_feature_guided_proposal = _raw_records_require_feature_guided_proposal(self.raw_records)
@@ -945,8 +998,12 @@ class TrlVllmGrpoRunner:
         return bool(strict_feature_guided_proposal), proposal_runtime
 
     def _build_dataset(self) -> Any:
+        cached_dataset = getattr(self, "_cached_base_dataset", None)
+        if cached_dataset is not None:
+            return cached_dataset
         materialized_train_items_path = str(getattr(self.args, "materialized_train_items_path", "") or "").strip()
         include_splits_value = getattr(self.args, "include_splits", "")
+        saver_config = self.config_builder(self.args)
         if bool(getattr(self.args, "require_materialized_runtime_cache", False)) and not materialized_train_items_path:
             raise ValueError(
                 "Active RL requires --materialized-train-items-path when --require-materialized-runtime-cache=true."
@@ -955,13 +1012,14 @@ class TrlVllmGrpoRunner:
             return MaterializedRuntimeItemDataset(
                 materialized_train_items_path,
                 include_splits=include_splits_value,
+                config=saver_config,
                 require_frame_cache=True,
                 require_feature_cache=True,
             )
         return SaverAgentDataset(
             self.args.data,
             data_root=self.args.data_root,
-            config=self.config_builder(self.args),
+            config=saver_config,
             include_splits=include_splits_value,
             require_frame_cache=True,
             require_feature_cache=True,
@@ -1001,7 +1059,9 @@ class TrlVllmGrpoRunner:
             "reference_model_mode": str(self.reference_model_mode),
             "reference_model_source_path": str(self.current_model_path),
             "reference_model_backend": str(self.reference_model_backend),
-            "rollout_eval_output_dir": str(self.rollout_eval_output_root / f"iter_{int(iteration):03d}"),
+            "rollout_eval_output_dir": str(
+                self.rollout_eval_output_root / _rollout_eval_iteration_dir_name(int(iteration))
+            ),
             "inline_rollout_eval": bool(getattr(self.args, "inline_rollout_eval", False)),
             "rollout_eval_start_iteration": int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
             "rollout_eval_interval_iterations": int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
@@ -1012,7 +1072,6 @@ class TrlVllmGrpoRunner:
             "vllm_tensor_parallel_size": int(getattr(self.args, "vllm_tensor_parallel_size", 1)),
             "vllm_gpu_memory_utilization": float(getattr(self.args, "vllm_gpu_memory_utilization", 0.35)),
             "rl_rollout_use_cache": bool(self.args.rl_rollout_use_cache),
-            "rl_fecv_use_cache": bool(self.args.rl_fecv_use_cache),
             "rl_compute_loss_microbatch_size": int(self.args.rl_compute_loss_microbatch_size),
             "rl_steps_per_generation": int(getattr(self.args, "rl_steps_per_generation", 1)),
             "use_liger_loss_requested": bool(getattr(self.args, "use_liger_loss", True)),
@@ -1020,7 +1079,6 @@ class TrlVllmGrpoRunner:
             "liger_disable_reason": "",
             "rl_replay_buffer_supported": False,
             "rl_replay_buffer_mode": "disabled_episode_grpo",
-            "rl_fecv_failure_policy": str(self.args.rl_fecv_failure_policy),
             "rl_log_empty_batch_rank_summary": bool(self.args.rl_log_empty_batch_rank_summary),
         }
 
@@ -1032,7 +1090,11 @@ class TrlVllmGrpoRunner:
             select_iteration_indices_fn=self.select_iteration_indices_fn,
             rollout_count=int(self.args.rollout_count),
             rollout_start_index=int(self.args.rollout_start_index),
-            iteration_index=0,
+            iteration_index=(
+                int(self.resume_state.resume_iteration)
+                if self.resume_state is not None
+                else 0
+            ),
             seed=int(getattr(self.args, "seed", 42) or 42),
         )
 
@@ -1069,7 +1131,13 @@ class TrlVllmGrpoRunner:
         )
         trainer.add_callback(continuous_callback)
         try:
-            train_result = trainer.train()
+            train_result = trainer.train(
+                resume_from_checkpoint=(
+                    str(self.resume_state.checkpoint_path)
+                    if self.resume_state is not None
+                    else None
+                )
+            )
             self.reference_model_backend = str(getattr(trainer, "reference_model_backend", "none"))
             self.reference_model_source_path = str(
                 getattr(trainer, "reference_model_source_path", self.reference_model_source_path)
@@ -1085,6 +1153,16 @@ class TrlVllmGrpoRunner:
                 "output_dir": str(self.output_dir),
                 "rollout_eval_output_root": str(self.rollout_eval_output_root),
                 "latest_checkpoint": str(self.latest_checkpoint),
+                "trainer_resume_checkpoint": (
+                    str(self.last_saved_checkpoint)
+                    if self.last_saved_checkpoint is not None
+                    else ""
+                ),
+                "standard_trainer_checkpoint": (
+                    str(self.last_saved_checkpoint)
+                    if self.last_saved_checkpoint is not None
+                    else ""
+                ),
                 "num_iterations": int(self.args.num_iterations),
                 "reference_model_mode": str(self.reference_model_mode),
                 "reference_model_source_path": str(self.reference_model_source_path),
@@ -1095,6 +1173,16 @@ class TrlVllmGrpoRunner:
                 "rollout_eval_start_iteration": int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
                 "rollout_eval_interval_iterations": int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
                 "final_rollout_eval": bool(getattr(self.args, "final_rollout_eval", False)),
+                "resume_from_checkpoint": (
+                    str(self.resume_state.checkpoint_path)
+                    if self.resume_state is not None
+                    else ""
+                ),
+                "resume_iteration": (
+                    int(self.resume_state.resume_iteration)
+                    if self.resume_state is not None
+                    else 0
+                ),
                 "checkpoint_strategy": _checkpoint_strategy_label(
                     eval_start_iteration=int(getattr(self.args, "rollout_eval_start_iteration", 1) or 1),
                     eval_every_iterations=int(getattr(self.args, "rollout_eval_interval_iterations", 1) or 1),
@@ -1104,7 +1192,6 @@ class TrlVllmGrpoRunner:
                 "vllm_tensor_parallel_size": int(getattr(self.args, "vllm_tensor_parallel_size", 1)),
                 "vllm_gpu_memory_utilization": float(getattr(self.args, "vllm_gpu_memory_utilization", 0.35)),
                 "rl_rollout_use_cache": bool(self.args.rl_rollout_use_cache),
-                "rl_fecv_use_cache": bool(self.args.rl_fecv_use_cache),
                 "rl_compute_loss_microbatch_size": int(self.args.rl_compute_loss_microbatch_size),
                 "rl_steps_per_generation": int(getattr(self.args, "rl_steps_per_generation", 1)),
                 "use_liger_loss_requested": bool(self.use_liger_loss_requested),
@@ -1115,7 +1202,6 @@ class TrlVllmGrpoRunner:
                 "train_loss": float(getattr(train_result, "training_loss", 0.0)),
                 "rl_replay_buffer_supported": False,
                 "rl_replay_buffer_mode": "disabled_episode_grpo",
-                "rl_fecv_failure_policy": str(self.args.rl_fecv_failure_policy),
                 "rl_log_empty_batch_rank_summary": bool(self.args.rl_log_empty_batch_rank_summary),
             }
             if self.runtime.is_main_process:
@@ -1180,7 +1266,7 @@ class TrlVllmGrpoRunner:
         rollout_eval_callback = _build_rl_authority_checkpoint_callback(
             processor=processor,
             rollout_eval_config=rollout_eval_config,
-            rollout_eval_output_dir=self.rollout_eval_output_root / f"iter_{int(iteration):03d}",
+            rollout_eval_output_dir=self.rollout_eval_output_root / _rollout_eval_iteration_dir_name(int(iteration)),
             iteration_index=int(iteration),
             policy_factory=(
                 _build_inline_vllm_policy_factory(args=self.args, vllm_runtime=self.persistent_vllm_runtime)
@@ -1300,12 +1386,14 @@ class TrlVllmGrpoRunner:
                 "trl-vllm RL startup: "
                 f"num_iterations={int(self.args.num_iterations)} rollout_count={int(self.args.rollout_count)} "
                 f"num_generations={int(self.args.num_generations)} model_path={self.current_model_path} "
+                f"resume_from_checkpoint={str(self.resume_state.checkpoint_path) if self.resume_state is not None else ''} "
+                f"resume_iteration={int(self.resume_state.resume_iteration) if self.resume_state is not None else 0} "
                 f"reference_mode={self.reference_model_mode} "
                 f"steps_per_generation={int(getattr(self.args, 'rl_steps_per_generation', 1))} "
                 f"reward_version={str(getattr(self.args, 'rl_reward_version', DEFAULT_RL_REWARD_VERSION))} "
                 f"use_vllm={bool(getattr(self.args, 'use_vllm', True))} "
                 f"vllm_mode={str(getattr(self.args, 'vllm_mode', 'colocate'))} "
-                f"rollout_cache={bool(self.args.rl_rollout_use_cache)} fecv_cache={bool(self.args.rl_fecv_use_cache)} "
+                f"rollout_cache={bool(self.args.rl_rollout_use_cache)} "
                 f"loss_microbatch={int(self.args.rl_compute_loss_microbatch_size)} "
                 f"rollout_eval_mode={'inline' if bool(getattr(self.args, 'inline_rollout_eval', False)) else 'deferred'} "
                 f"rollout_eval_start_iteration={int(getattr(self.args, 'rollout_eval_start_iteration', 1) or 1)} "

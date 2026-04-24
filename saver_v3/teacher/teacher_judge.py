@@ -18,7 +18,11 @@ from saver_v3.model.qwen_policy import (
     _to_pil_image,
     load_auto_processor_with_compat,
 )
-from saver_v3.core.self_verification import PRIMARY_STATUS_TO_DECISION, SELF_VERIFICATION_DECISIONS, parse_self_verification_payload
+from saver_v3.core.self_verification import (
+    PRIMARY_STATUS_TO_DECISION,
+    SELF_VERIFICATION_DECISIONS,
+    parse_self_verification_payload,
+)
 
 
 DEFAULT_TEACHER_JUDGE_MODEL_PATH = os.environ.get(
@@ -39,7 +43,6 @@ TEACHER_JUDGE_SCORE_KEYS = (
     "sufficiency",
     "necessity",
     "finalize_readiness",
-    "counterfactual_faithfulness",
 )
 
 
@@ -49,6 +52,25 @@ def _clamp_score(value: Any) -> float:
     except Exception:
         return 0.0
     return max(0.0, min(1.0, score))
+
+
+def _sanitize_teacher_next_tool_text(text: str) -> str:
+    sanitized = str(text or "")
+    replacements = (
+        (r"\bcontinue_search\b", "seek_evidence"),
+        (r"\brefine_evidence\b", "seek_evidence"),
+        (r"\brevise_claim\b", "seek_evidence"),
+        (r"\bcontinue searching\b", "call seek_evidence"),
+        (r"\bcontinue the search\b", "call seek_evidence"),
+        (r"\bcontinuing the search\b", "calling seek_evidence"),
+        (r"\brefine the selected evidence subset\b", "call seek_evidence on a better evidence subset"),
+        (r"\brevise the claim\b", "call seek_evidence to gather aligned evidence"),
+        (r"\bshould finalize\b", "should call finalize_case"),
+        (r"\bbefore finalize\b", "before calling finalize_case"),
+    )
+    for pattern, replacement in replacements:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+    return sanitized
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -77,7 +99,6 @@ def _output_schema_example() -> str:
             "sufficiency": 0.0,
             "necessity": 0.0,
             "finalize_readiness": 0.0,
-            "counterfactual_faithfulness": 0.0,
         },
         "teacher_judge_decision": "insufficient",
         "teacher_judge_rationale": "",
@@ -118,13 +139,9 @@ def _normalize_teacher_decision(payload: Dict[str, Any], scores: Dict[str, float
         return "misaligned"
     if primary_status == "redundant":
         return "redundant"
-    recommended_action = str(payload.get("recommended_action") or "").strip().lower()
-    if recommended_action == "finalize":
+    next_tool = str(payload.get("next_tool") or "").strip().lower()
+    if next_tool == "finalize_case":
         return "sufficient"
-    if recommended_action == "revise_claim":
-        return "misaligned"
-    if recommended_action == "refine_evidence":
-        return "redundant"
     if scores["sufficiency"] >= 0.75 and scores["necessity"] >= 0.35:
         return "sufficient"
     return "insufficient"
@@ -147,17 +164,12 @@ def normalize_teacher_judge_result(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ),
             )
         ),
-        "counterfactual_faithfulness": _clamp_score(
-            score_payload.get(
-                "counterfactual_faithfulness",
-                payload.get("counterfactual_faithfulness_score", payload.get("counterfactual_faithfulness")),
-            )
-        ),
     }
     decision = _normalize_teacher_decision(payload, scores)
     rationale = str(
         payload.get("teacher_judge_rationale") or payload.get("rationale") or payload.get("explanation") or ""
     ).strip()
+    rationale = _sanitize_teacher_next_tool_text(rationale)
     return {
         "teacher_judge_scores": {key: round(value, 6) for key, value in scores.items()},
         "teacher_judge_decision": decision,
@@ -188,14 +200,10 @@ def _extract_verify_decision_from_example(example: Dict[str, Any]) -> str:
     decision = str(verify_payload.get("verification_decision") or "").strip().lower()
     if decision in SELF_VERIFICATION_DECISIONS:
         return decision
-    recommended_action = str(verify_payload.get("recommended_action") or "").strip().lower()
-    if recommended_action == "finalize":
+    next_tool = str(verify_payload.get("next_tool") or "").strip().lower()
+    if next_tool == "finalize_case":
         return "sufficient"
-    if recommended_action == "revise_claim":
-        return "misaligned"
-    if recommended_action == "refine_evidence":
-        return "redundant"
-    if recommended_action == "continue_search":
+    if next_tool == "seek_evidence":
         return "insufficient"
     return ""
 
@@ -217,7 +225,7 @@ def compute_teacher_judge_weight_multiplier(example: Dict[str, Any]) -> float:
     score_payload = dict(example.get("teacher_judge_scores") or {})
     score_values = [
         _clamp_score(score_payload.get(key))
-        for key in ("sufficiency", "necessity", "finalize_readiness", "counterfactual_faithfulness")
+        for key in ("sufficiency", "necessity", "finalize_readiness")
         if key in score_payload
     ]
     confidence = sum(score_values) / float(len(score_values)) if score_values else 0.5
@@ -703,7 +711,7 @@ def build_teacher_judge_package(
     selected_evidence_ids = list(parsed_payload.get("selected_evidence_ids") or [])
     selected_evidence_moment_ids = list(parsed_payload.get("selected_evidence_moment_ids") or [])
     decision = str(parsed_payload.get("verification_decision") or normalized_preview.get("teacher_judge_decision") or "")
-    recommended_action = str(parsed_payload.get("recommended_action") or "")
+    next_tool = str(parsed_payload.get("next_tool") or "")
     selected_window_id_set = {str(value) for value in selected_window_ids if str(value).strip()}
     keep_window_records = [
         record for record in window_records if str(record.get("window_id") or "").strip() in selected_window_id_set
@@ -715,8 +723,8 @@ def build_teacher_judge_package(
     hard_reasons: List[str] = []
     if decision in {"insufficient", "misaligned", "redundant"}:
         hard_reasons.append(f"verification_decision={decision}")
-    if recommended_action and recommended_action != "finalize":
-        hard_reasons.append(f"recommended_action={recommended_action}")
+    if next_tool and next_tool != "finalize_case":
+        hard_reasons.append(f"next_tool={next_tool}")
     if len(selected_window_ids) > 1:
         hard_reasons.append("multiple_selected_windows")
 
@@ -850,7 +858,7 @@ def build_teacher_judge_messages(
             "text": (
                 "Teacher judge task: assess the policy's verify_hypothesis output.\n"
                 "Use the policy self-verification output together with the full / keep / drop views "
-                "to judge whether the policy should continue_search, revise_claim, refine_evidence, or finalize.\n"
+                "to judge whether the policy should call seek_evidence or finalize_case next.\n"
                 "Return JSON with this exact schema:\n"
                 f"{_output_schema_example()}\n"
                 f"Active judge input mode: {actual_input_mode}\n"

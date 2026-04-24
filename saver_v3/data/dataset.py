@@ -12,7 +12,9 @@ import torch
 
 from split_utils import filter_records_by_split, parse_include_splits
 
+from saver_v3.core.initial_observation import is_preview_initial_observation
 from saver_v3.data.config import PreviewConfig, SaverAgentConfig
+from saver_v3.data.runtime_contract import validate_runtime_record_contract
 from saver_v3.core.proposal import coerce_feature_cache_payload
 from saver_v3.core.prompts import build_system_prompt, build_user_prompt
 from saver_v3.core.tool_registry import get_tool_schemas
@@ -46,12 +48,16 @@ def _load_jsonl(path: Path, *, skip_invalid_lines: bool = False) -> List[Dict]:
             if not line.strip():
                 continue
             try:
-                rows.append(json.loads(line))
+                rows.append(validate_runtime_record_contract(json.loads(line)))
             except json.JSONDecodeError as exc:
                 message = _jsonl_decode_error_message(path, line_number, line, exc)
                 if not skip_invalid_lines:
                     raise ValueError(message) from exc
                 invalid_messages.append(message)
+            except ValueError as exc:
+                if not skip_invalid_lines:
+                    raise
+                invalid_messages.append(str(exc))
     if invalid_messages:
         warnings.warn(
             f"Skipped {len(invalid_messages)} invalid JSONL lines while loading {path}. "
@@ -197,6 +203,7 @@ class SaverAgentDataset(torch.utils.data.Dataset):
         user_prompt = build_user_prompt(
             record,
             preview_available=bool(multimodal_cache.get("preview_frames") is not None),
+            initial_observation=self.config.initial_observation,
             prompt_config=self.config.prompt,
         )
         user_content = self._build_user_content(user_prompt, multimodal_cache)
@@ -243,11 +250,10 @@ class SaverAgentDataset(torch.utils.data.Dataset):
                 fps = float(feature_cache.get("fps") or fps)
                 if not frame_indices:
                     frame_indices = [int(index) for index in list(feature_cache.get("frame_indices") or [])]
-        preview_frames, preview_timestamps, preview_frame_indices = (
-            self._build_preview(frames, float(fps))
-            if frames is not None
-            else (None, [], [])
-        )
+        if is_preview_initial_observation(self.config.initial_observation) and frames is not None:
+            preview_frames, preview_timestamps, preview_frame_indices = self._build_preview(frames, float(fps))
+        else:
+            preview_frames, preview_timestamps, preview_frame_indices = (None, [], [])
         return {
             "video": frames,
             "embedding": feature_cache,

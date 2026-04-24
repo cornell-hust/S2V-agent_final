@@ -580,6 +580,10 @@ def _log_rollout_reward_components(
                 "generation_id": _generation_id(rollout),
                 "total_reward": round(float(reward_summary.get("total_reward") or 0.0), 6),
                 "accuracy_reward": round(float(components.get("accuracy_reward") or 0.0), 6),
+                "anomaly_false_normal_penalty": round(
+                    float(components.get("anomaly_false_normal_penalty") or 0.0),
+                    6,
+                ),
                 "fecv_evidence_faithfulness_reward": round(
                     float(components.get("fecv_evidence_faithfulness_reward") or 0.0),
                     6,
@@ -631,6 +635,8 @@ def _log_rollout_sample_reward_details(
             f"final_answer={final_answer if isinstance(final_answer, dict) else None} "
             f"accuracy_reward={float(components.get('accuracy_reward') or 0.0):.6f} "
             f"weighted_accuracy_reward={float(weighted_components.get('accuracy_reward') or 0.0):.6f} "
+            f"anomaly_false_normal_penalty={float(components.get('anomaly_false_normal_penalty') or 0.0):.6f} "
+            f"weighted_anomaly_false_normal_penalty={float(weighted_components.get('anomaly_false_normal_penalty') or 0.0):.6f} "
             f"fecv_evidence_faithfulness_reward={float(components.get('fecv_evidence_faithfulness_reward') or 0.0):.6f} "
             f"weighted_fecv_evidence_faithfulness_reward={float(weighted_components.get('fecv_evidence_faithfulness_reward') or 0.0):.6f} "
             f"protocol_finalize_reward={float(components.get('protocol_finalize_reward') or 0.0):.6f} "
@@ -913,7 +919,7 @@ class TimesearchAlignedGRPOTrainerMixin:
             self._liger_runtime_disable_reason = "zero3_param_offload_incompatible_with_liger"
             raise RuntimeError(
                 "idea2_v3 RL Liger path is incompatible with DeepSpeed ZeRO-3 parameter offload because it makes "
-                "compute_loss forwards pathologically slow. Switch RL to configs/deepspeed/zero2_rl.json "
+                "compute_loss forwards pathologically slow. Switch RL to configs/deepspeed/zero3_full_model.json "
                 "or another non-offload config."
             )
         self.use_liger_loss_effective = True

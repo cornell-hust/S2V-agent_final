@@ -1,0 +1,43 @@
+base_model: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+server:
+  # Fixed baseline uses direct HF inference under torchrun.
+  mode: colocate
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+
+client:
+  batch_size: 1
+  max_tokens: 768
+  max_total_images: 16
+  max_seq_length: 16384
+  max_image_side: 640
+  max_image_pixels: 0
+  num_preview_frames: 16
+  use_generation_cache: true
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+
+io:
+  data_path: data_utils/msad_saver_runtime_test.jsonl
+  output_dir: artifacts/fixed_baseline_16/qwen3_vl_8b
+  data_root: /mnt/shared-storage-user/mineru2-shared/zengweijun
+  include_splits: test
+  max_records: 0
+
+baseline:
+  protocol: fixed_observation_single_shot
+  strict_json: true
+  evidence_top_k: 3
+  use_storyboard: false
+  prompt_version: v1
+
+evaluation:
+  progress_every: 10
+  enable_semantic_metrics: true
+  semantic_bertscore_model_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/roberta-large
+  semantic_metrics:
+    - qa_accuracy

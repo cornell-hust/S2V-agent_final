@@ -16,6 +16,7 @@ from saver_v3.common.runtime import (
 from saver_v3.core.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH
 from saver_v3.data.config import (
     DEFAULT_POLICY_MAX_NEW_TOKENS,
+    DEFAULT_ROLLOUT_MAX_TURNS,
     DEFAULT_RECOMMENDED_KEEP_RECENT_TEXT_MESSAGES,
     DEFAULT_RECOMMENDED_MAX_SEQ_LENGTH,
     DEFAULT_RECOMMENDED_MAX_TOTAL_IMAGES,
@@ -130,7 +131,12 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--rollout-count", type=int, default=16, help="Number of videos per iteration.")
     parser.add_argument("--num-generations", type=int, default=4, help="Number of sampled rollouts per video per iteration.")
     parser.add_argument("--rollout-start-index", type=int, default=0, help="Start index for the first iteration.")
-    parser.add_argument("--rollout-max-turns", type=int, default=14, help="Maximum rollout turns.")
+    parser.add_argument(
+        "--rollout-max-turns",
+        type=int,
+        default=DEFAULT_ROLLOUT_MAX_TURNS,
+        help="Maximum rollout turns.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Collect/score examples but skip gradient updates.")
     parser.add_argument("--min-weight", type=float, default=0.1, help="Minimum absolute rollout advantage kept for updates.")
     parser.add_argument("--advantage-clip", type=float, default=3.0, help="Absolute clip value for group-relative advantages.")
@@ -202,7 +208,12 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--eval-data-root", default="", help="Root path used to resolve relative video paths for epoch-end rollout eval.")
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on eval records per epoch-end rollout eval.")
-    parser.add_argument("--eval-rollout-max-turns", type=int, default=14, help="Maximum rollout turns for epoch-end rollout eval.")
+    parser.add_argument(
+        "--eval-rollout-max-turns",
+        type=int,
+        default=DEFAULT_ROLLOUT_MAX_TURNS,
+        help="Maximum rollout turns for epoch-end rollout eval.",
+    )
     parser.add_argument("--eval-max-new-tokens-per-turn", type=int, default=DEFAULT_POLICY_MAX_NEW_TOKENS, help="Generation length budget for each epoch-end rollout eval turn.")
     parser.add_argument("--eval-total-visual-budget", type=int, default=0, help="Alias for a coarse epoch-end rollout visual budget.")
     parser.add_argument("--eval-max-total-images", type=int, default=0, action=_StoreEvalMaxTotalImages, help="Optional hard cap on total images preserved in each epoch-end rollout eval prompt.")

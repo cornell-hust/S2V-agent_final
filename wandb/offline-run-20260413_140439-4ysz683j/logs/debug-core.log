@@ -1,0 +1,7 @@
+{"time":"2026-04-13T14:04:41.002527+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmp_p22bif0/port-92074.txt","pid":92074,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
+{"time":"2026-04-13T14:04:41.003405138+08:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":92074}
+{"time":"2026-04-13T14:04:41.003416998+08:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/wandb-92074-93704-3486563465/socket","Net":"unix"}}
+{"time":"2026-04-13T14:04:41.066641564+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
+{"time":"2026-04-13T14:04:41.093130426+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"4ysz683j","id":"1(@)"}
+{"time":"2026-04-13T14:04:41.982067286+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"4ysz683j","id":"1(@)"}
+{"time":"2026-04-13T16:07:28.223144457+08:00","level":"INFO","msg":"server: parent process exited, terminating service process"}

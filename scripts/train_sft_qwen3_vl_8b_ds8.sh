@@ -47,7 +47,7 @@ printf '  %q' "${CMD[@]}"
 printf '\n'
 
 if [[ "${RUN_MODE}" != "run" ]]; then
-  printf 'Dry run only. Pass --run to execute the 8-GPU DeepSpeed compact_trace_v2 SFT job.\n'
+  printf 'Dry run only. Pass --run to execute the 8-GPU DeepSpeed compact_trace_v5 SFT job.\n'
   exit 0
 fi
 

@@ -53,12 +53,9 @@ def infer_required_stages_from_target(
     if str(payload.get("existence") or "").strip().lower() != "anomaly":
         return []
 
-    inferred: List[str] = []
-    if _has_interval(payload.get("precursor_interval_sec")):
-        inferred.append("precursor")
     if _has_interval(payload.get("anomaly_interval_sec")):
-        inferred.append("trigger")
-    return normalize_event_chain_stages(inferred or ["trigger"])
+        return ["trigger"]
+    return ["trigger"]
 
 
 def _normalize_stage_annotation(payload: Any) -> Dict[str, Any]:
@@ -67,21 +64,23 @@ def _normalize_stage_annotation(payload: Any) -> Dict[str, Any]:
     stage_selected_moment_ids = normalize_stage_selected_moment_ids(payload.get("stage_selected_moment_ids"))
     covered_stages = normalize_event_chain_stages(payload.get("covered_stages") or stage_selected_moment_ids.keys())
     missing_required_stages = normalize_event_chain_stages(payload.get("missing_required_stages"))
-    recommended_action = str(payload.get("recommended_action") or "").strip().lower()
+    next_tool = str(payload.get("next_tool") or "").strip().lower()
     verification_decision = str(
         payload.get("verification_decision")
         or payload.get("self_verification_decision")
         or ""
     ).strip().lower()
-    claim = payload.get("claim") or {}
+    claim = payload.get("claim")
+    if not isinstance(claim, dict):
+        claim = {}
     existence = str(claim.get("existence") or payload.get("existence") or "").strip().lower()
-    if not (covered_stages or missing_required_stages or stage_selected_moment_ids or recommended_action or verification_decision):
+    if not (covered_stages or missing_required_stages or stage_selected_moment_ids or next_tool or verification_decision):
         return {}
     return {
         "covered_stages": covered_stages,
         "missing_required_stages": missing_required_stages,
         "stage_selected_moment_ids": stage_selected_moment_ids,
-        "recommended_action": recommended_action,
+        "next_tool": next_tool,
         "verification_decision": verification_decision,
         "existence": existence,
         "has_stage_signal": bool(covered_stages or missing_required_stages or stage_selected_moment_ids),
@@ -177,7 +176,7 @@ def compute_event_chain_score(
     grounded_ratio = (
         sum(1 for stage in required if list(stage_selected_moment_ids.get(stage) or [])) / float(len(required_set))
     )
-    recommended_action = str(normalized.get("recommended_action") or "").strip().lower()
+    next_tool = str(normalized.get("next_tool") or "").strip().lower()
     verification_decision = str(normalized.get("verification_decision") or "").strip().lower()
 
     score = (
@@ -185,9 +184,9 @@ def compute_event_chain_score(
         + 0.20 * (2.0 * grounded_ratio - 1.0)
         - 0.35 * missing_ratio
     )
-    if recommended_action == "finalize" or terminal:
+    if next_tool == "finalize_case" or terminal:
         score += 0.35 if has_complete_event_chain(required, normalized) else -0.60
-    elif recommended_action in {"continue_search", "refine_evidence", "revise_claim"}:
+    elif next_tool == "seek_evidence":
         score += 0.20 if not has_complete_event_chain(required, normalized) else -0.20
 
     if verification_decision == "sufficient" and not has_complete_event_chain(required, normalized):

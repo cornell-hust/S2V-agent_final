@@ -23,23 +23,7 @@ def _mean(values: Sequence[float]) -> float:
 
 
 def _extract_counterfactual_profile(record: Dict[str, Any]) -> Dict[str, Any]:
-    profile = record.get("counterfactual_profile")
-    if isinstance(profile, dict) and profile:
-        if "summary" in profile:
-            return dict(profile)
-        return {
-            "summary": {
-                "decision_sufficiency": bool(profile.get("decision_sufficiency")),
-                "minimal_subset_sufficiency": bool(profile.get("minimal_subset_sufficiency")),
-                "negative_specificity_pass": bool(profile.get("negative_specificity_pass")),
-                "counterfactual_type_supported": bool(profile.get("counterfactual_type_supported")),
-                "stage_necessity": dict(profile.get("stage_necessity") or {}),
-            },
-            "branch_field_matrix": dict(profile.get("branch_field_matrix") or {}),
-            "branch_delta_matrix": dict(profile.get("branch_delta_matrix") or {}),
-            "stage_packages": dict(profile.get("stage_packages") or {}),
-            "selection_metadata": dict(profile.get("selection_metadata") or {}),
-        }
+    del record
     return {}
 
 
@@ -174,9 +158,9 @@ def _resolve_turn_stage(turn: Dict[str, Any]) -> str:
         return "answer"
     if tool_name != "verify_hypothesis":
         return "unknown"
-    if verification_mode == "search_step_check" or "search_anchor" in tags:
+    if verification_mode == "stage_check" or "search_anchor" in tags:
         return "search_verification"
-    if verification_mode in {"full_keep_drop", "final_check", "reward_only"}:
+    if verification_mode in {"stage_check", "final_check"}:
         return "evidence_verification"
     if "evidence_anchor" in tags:
         return "evidence_verification"
@@ -320,6 +304,10 @@ def _verify_health_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     invalid_selected_turns = 0
     unresolved_selection_turns = 0
     verify_invalid_turns = 0
+    total_invalid_attempts = 0
+    invalid_attempt_reason_counts = Counter()
+    repeated_search_attempts = 0
+    finalize_loop_attempts = 0
 
     for record in records:
         for turn in record.get("turns") or []:
@@ -340,11 +328,27 @@ def _verify_health_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 or str(turn.get("selection_resolution_source") or "") == "unresolved"
             ):
                 unresolved_selection_turns += 1
-            if not bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"})):
+            if not bool(turn.get("valid_action", turn.get("action") in {"tool_call"})):
                 verify_invalid_turns += 1
+        for attempt in record.get("invalid_attempts") or []:
+            total_invalid_attempts += 1
+            reason = (
+                str(attempt.get("guardrail_reason") or "").strip()
+                or str(attempt.get("action") or "").strip()
+                or "unknown"
+            )
+            invalid_attempt_reason_counts[reason] += 1
+            if reason == "repeated_search_signature":
+                repeated_search_attempts += 1
+            if reason == "tool_after_finalize_case" or str(attempt.get("tool_name") or "") == "finalize_case":
+                finalize_loop_attempts += 1
 
     return {
         "verify_parse_mode_counts": _counter_to_sorted_dict(parse_mode_counter),
+        "invalid_attempt_reason_counts": _counter_to_sorted_dict(invalid_attempt_reason_counts),
+        "repeated_search_rate": _safe_rate(repeated_search_attempts, total_invalid_attempts),
+        "empty_selection_verify_rate": _safe_rate(unresolved_selection_turns, total_verify_turns),
+        "finalize_loop_rate": _safe_rate(finalize_loop_attempts, total_invalid_attempts),
         "invalid_selected_window_rate": _safe_rate(invalid_selected_turns, total_verify_turns),
         "unresolved_selection_rate": _safe_rate(unresolved_selection_turns, total_verify_turns),
         "verify_invalid_turn_rate": _safe_rate(verify_invalid_turns, total_verify_turns),
@@ -411,11 +415,6 @@ def summarize_scored_rollouts(
     num_turns: List[float] = []
     teacher_alignment_values: List[float] = []
     teacher_reward_values: List[float] = []
-    fecv_full_selected_available_values: List[float] = []
-    fecv_grounded_decision_values: List[float] = []
-    fecv_decision_sufficiency_values: List[float] = []
-    fecv_minimal_subset_values: List[float] = []
-    fecv_negative_specificity_values: List[float] = []
     component_values: Dict[str, List[float]] = {}
 
     for record in records:
@@ -438,46 +437,6 @@ def summarize_scored_rollouts(
         total_rewards.append(_safe_float((record.get("reward_summary") or {}).get("total_reward"), 0.0))
         num_turns.append(_safe_float(record.get("num_turns"), 0.0))
         reward_summary = record.get("reward_summary") or {}
-        counterfactual_profile = _extract_counterfactual_profile(record)
-        counterfactual_summary = _counterfactual_summary(counterfactual_profile)
-        branch_field_matrix = dict(counterfactual_profile.get("branch_field_matrix") or {})
-        full_selected_entry = dict(branch_field_matrix.get("full_selected") or {})
-        fecv_full_selected_available_values.append(
-            1.0
-            if (
-                bool(full_selected_entry.get("available"))
-                or bool(reward_summary.get("fecv_full_selected_available"))
-            )
-            else 0.0
-        )
-        fecv_grounded_decision_values.append(
-            _safe_float(reward_summary.get("fecv_grounded_decision"), 0.0)
-        )
-        fecv_decision_sufficiency_values.append(
-            1.0
-            if (
-                bool(counterfactual_summary.get("decision_sufficiency"))
-                or bool(reward_summary.get("fecv_decision_sufficiency"))
-            )
-            else 0.0
-        )
-        fecv_minimal_subset_values.append(
-            1.0
-            if (
-                bool(counterfactual_summary.get("minimal_subset_sufficiency"))
-                or bool(reward_summary.get("fecv_minimal_subset_sufficiency"))
-            )
-            else 0.0
-        )
-        fecv_negative_specificity_values.append(
-            1.0
-            if (
-                bool(counterfactual_summary.get("negative_specificity_pass"))
-                or bool(reward_summary.get("fecv_negative_specificity_pass"))
-            )
-            else 0.0
-        )
-
         reward_components = reward_summary.get("components") or {}
         for key, value in reward_components.items():
             component_values.setdefault(str(key), []).append(_safe_float(value, 0.0))
@@ -548,10 +507,5 @@ def summarize_scored_rollouts(
         "mean_num_turns": _mean(num_turns),
         "min_num_turns": min(num_turns) if num_turns else 0.0,
         "max_num_turns": max(num_turns) if num_turns else 0.0,
-        "fecv_full_selected_available_rate": _mean(fecv_full_selected_available_values),
-        "fecv_grounded_decision_rate": _mean(fecv_grounded_decision_values),
-        "fecv_decision_sufficiency_rate": _mean(fecv_decision_sufficiency_values),
-        "fecv_minimal_subset_rate": _mean(fecv_minimal_subset_values),
-        "fecv_negative_specificity_rate": _mean(fecv_negative_specificity_values),
         "mean_reward_components": mean_component_values,
     }

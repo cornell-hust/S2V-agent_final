@@ -5,8 +5,11 @@ import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Sequence
 
-from saver_v3.data.config import PromptConfig
-from saver_v3.core.protocol_guidance import build_counterfactual_type_legend
+from saver_v3.core.initial_observation import (
+    is_explicit_first_scan_initial_observation,
+    is_preview_initial_observation,
+)
+from saver_v3.data.config import InitialObservationConfig, PromptConfig
 
 
 def _json_dumps(payload: Any) -> str:
@@ -107,18 +110,6 @@ def _extract_finalize_case_required_fields(function_schemas: Sequence[Dict[str, 
     return []
 
 
-def _finalize_case_has_counterfactual_enum(function_schemas: Sequence[Dict[str, Any]]) -> bool:
-    for schema in function_schemas:
-        if str(schema.get("name") or "") != "finalize_case":
-            continue
-        parameters = schema.get("parameters") or {}
-        properties = parameters.get("properties") or {}
-        counterfactual_schema = properties.get("counterfactual_type") or {}
-        if list(counterfactual_schema.get("enum") or []):
-            return True
-    return False
-
-
 def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
     tool_contract = (
         'Valid tool format example: <think>inspect</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":4}}</tool_call>. '
@@ -136,13 +127,6 @@ def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
             + ", ".join(finalize_required_fields)
             + "."
         )
-    counterfactual_contract = ""
-    if _finalize_case_has_counterfactual_enum(function_schemas):
-        counterfactual_contract = (
-            " For counterfactual_type, use one allowed enum value such as "
-            + build_counterfactual_type_legend(include_descriptions=False)
-            + "."
-        )
     return (
         "You are SAVER, an active video anomaly agent. "
         "Think carefully before each action. "
@@ -156,12 +140,11 @@ def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
         "When you call seek_evidence, make query a concrete visual event description rather than a category word. "
         "Prefer short grounded phrases such as actions, interactions, or scene-specific evidence, for example 'person raises a fist toward another person in the aisle', not just 'assault'. "
         "Use the search anchor in tool observations to decide what stage to search next; do not stuff long protocol explanations into the query itself. "
-        "verify_hypothesis must report selected_window_ids plus verification_decision, recommended_action, "
-        "sufficiency_score, necessity_score, finalize_readiness_score, counterfactual_faithfulness, covered_stages, missing_required_stages, and stage_selected_moment_ids. "
+        "verify_hypothesis must report selected_window_ids plus verification_decision, next_tool, "
+        "sufficiency_score, necessity_score, finalize_readiness_score, covered_stages, missing_required_stages, and stage_selected_moment_ids. "
         "If you use a tool, respond as <think>...</think><tool_call>{...}</tool_call>. "
         "Do not skip finalize_case when the protocol requires a structured final decision. "
         f"{finalize_contract}"
-        f"{counterfactual_contract}"
         f"{tool_contract}\n"
         f"{tool_use_prompt}"
     )
@@ -171,9 +154,11 @@ def build_user_prompt(
     record: Dict,
     *,
     preview_available: bool = False,
+    initial_observation: InitialObservationConfig | None = None,
     prompt_config: PromptConfig | None = None,
 ) -> str:
     prompt_config = prompt_config or PromptConfig()
+    initial_observation = initial_observation or InitialObservationConfig()
     scene = record.get("scene", {}).get("scenario", "unknown")
     duration = record.get("video_meta", {}).get("duration_sec", "unknown")
     task_prompt = record.get("agent_task", {}).get("task_prompt", "")
@@ -189,8 +174,13 @@ def build_user_prompt(
         task_prompt=task_prompt,
         criteria_text=criteria_text,
     )
-    if preview_available and prompt_config.preview_instruction:
+    if is_preview_initial_observation(initial_observation) and preview_available and prompt_config.preview_instruction:
         prompt += f"\n{prompt_config.preview_instruction}"
+    if (
+        is_explicit_first_scan_initial_observation(initial_observation)
+        and prompt_config.explicit_first_scan_instruction
+    ):
+        prompt += f"\n{prompt_config.explicit_first_scan_instruction}"
     return prompt
 
 

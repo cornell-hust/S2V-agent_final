@@ -18,9 +18,11 @@ This layer targets single-node 8 GPU full-model training for
 - `saver_v3.cli.train_sft_ds`
 - `saver_v3.cli.train_rl_ds`
 
-`train_sft_ds` now delegates to `saver_v3.sft.training.run_standard_sft`, so the official v3 SFT path uses `compact_trace_v2` episode-format data and the v3-owned SFT training/runtime stack instead of the broken step-format dataset.
+`train_sft_ds` now delegates to `saver_v3.sft.training.run_standard_sft`, so the official v3 SFT path uses `compact_trace_v5` episode-format data and the v3-owned SFT training/runtime stack instead of the broken step-format dataset.
 
 `train_rl_ds` launches the trajectory-level TRL + colocated-vLLM GRPO route. The active RL contract now requires materialized runtime item caches and only accepts message-only rollout supervision with `messages + assistant_supervision + advantage`. During generation, each scored rollout is immediately materialized into a final `episode_spec`; training then consumes only `episode_specs` and prepared batches, without an intermediate feature-layer contract. Episode-level completion-only tensors (`prompt_ids`, `prompt_mask`, `completion_ids`, `completion_mask`, `advantage`, `old_policy_token_log_probs`, multimodal inputs) are derived online from that unified schema. Replay-buffer flags, legacy empty-batch flags, and trace-only active RL payloads are removed and fail fast.
+
+The active verification contract is `next_tool` only. Legacy `recommended_action` payloads and retired wrappers such as `training.py`, `rollout.py`, `saver_v3/sft_training.py`, and `saver_v3/common/training.py` are no longer valid entrypoints.
 
 ## Wrapper Commands
 

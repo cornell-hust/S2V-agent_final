@@ -8,18 +8,24 @@ server:
   gpu_memory_utilization: 0.9
 
 client:
-  max_tokens: 512
+  max_tokens: 1024
   max_total_images: 28
   max_seq_length: 8192
   keep_recent_text_messages: 20
   keep_recent_tool_image_messages: 0
   max_image_side: 640
   max_image_pixels: 0
-  num_preview_frames: 8
   temperature: 0.0
   top_p: 1.0
   top_k: -1
   guided_decoding_regex: ""
+
+initial_observation:
+  mode: explicit_first_scan
+  scan_num_frames: 8
+  scan_purpose: global_overview
+  protect_from_visual_budget: true
+  error_on_seq_prune: true
 
 io:
   data_path: /abs/path/to/raw_saver_agent_eval.jsonl
@@ -31,7 +37,7 @@ io:
   log_dir: artifacts/vllm/logs
 
 rollout:
-  max_turns: 14
+  max_turns: 10
   rollout_batch_size: 4
   progress_every: 10
   proposal_model_path: /abs/path/to/proposal_model

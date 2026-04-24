@@ -32,8 +32,14 @@ from saver_v3.metrics.evaluation import RolloutEvaluationConfig, run_rollout_eva
 from saver_v3.common.message_budget import apply_message_budget, drop_oldest_history_turn
 from saver_v3.common.message_budget import summarize_visual_budget
 from saver_v3.model.model_loading import build_hf_model_init_kwargs, ensure_flash_attention_supported_dtype
-from saver_v3.data.prepared_metadata import PREPARED_SFT_FORMAT, ensure_prepared_sft_metadata
-from saver_v3.data.materialized_cache import MATERIALIZED_SFT_MESSAGES_FORMAT, ensure_materialized_cache_metadata
+from saver_v3.data.prepared_metadata import PREPARED_SFT_FORMAT, ensure_prepared_sft_metadata, load_prepared_sft_metadata
+from saver_v3.data.materialized_cache import (
+    MATERIALIZED_SFT_MESSAGES_FORMAT,
+    default_sft_materialized_messages_path,
+    ensure_materialized_cache_metadata,
+    load_materialized_cache_metadata,
+)
+from saver_v3.data.protocol_signature import build_protocol_signature, infer_teacher_role_from_metadata
 from saver_v3.core.proposal import SiglipFeatureEncoder
 from saver_v3.model.qwen_policy import _resize_image_for_budget, _to_pil_image, load_auto_processor_with_compat
 from saver_v3.common.runtime import (
@@ -43,6 +49,10 @@ from saver_v3.common.runtime import (
     resolve_inference_device_map,
     runtime_log,
     should_log_progress,
+)
+from saver_v3.core.initial_observation import (
+    error_on_initial_scan_seq_prune,
+    is_initial_global_scan_message,
 )
 from saver_v3.core.tool_registry import execute_tool_call
 from saver_v3.data.training_data import (
@@ -1187,6 +1197,8 @@ def _has_multimodal_content(messages: List[Dict[str, Any]]) -> bool:
 
 def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
     for message_index, message in enumerate(messages):
+        if is_initial_global_scan_message(message) and error_on_initial_scan_seq_prune(message):
+            continue
         content = list(message.get("content", []))
         for content_index, item in enumerate(content):
             item_type = item.get("type")
@@ -1217,6 +1229,30 @@ def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
                     messages[message_index]["content"] = []
                 return True
     return False
+
+
+def _has_protected_initial_global_scan(messages: List[Dict[str, Any]]) -> bool:
+    return any(
+        is_initial_global_scan_message(message) and error_on_initial_scan_seq_prune(message)
+        for message in messages
+    )
+
+
+def _raise_multimodal_budget_error(
+    *,
+    messages: List[Dict[str, Any]],
+    max_length: int,
+    context_label: str,
+) -> None:
+    if _has_protected_initial_global_scan(messages):
+        raise ValueError(
+            f"Unable to fit {context_label} within max_seq_length={max_length} without pruning the canonical initial global scan. "
+            "Increase max_seq_length or reduce later multimodal context."
+        )
+    raise ValueError(
+        f"Unable to fit {context_label} within max_seq_length={max_length}. "
+        "Increase the sequence budget or reduce retained multimodal context."
+    )
 
 
 def _is_timestamp_text_item(item: Dict[str, Any]) -> bool:
@@ -1270,9 +1306,10 @@ def _fit_messages_to_budget(
             continue
 
         if has_multimodal:
-            raise ValueError(
-                f"Unable to fit multimodal example within max_seq_length={max_length}. "
-                "Increase the sequence budget or reduce retained multimodal context."
+            _raise_multimodal_budget_error(
+                messages=fitted_prompt_messages,
+                max_length=max_length,
+                context_label="multimodal example",
             )
         return fitted_prompt_messages, full_messages, prompt_text, full_text, full_inputs
 
@@ -1379,6 +1416,97 @@ def _apply_cached_message_plan(
         rebuilt_message["content"] = rebuilt_content
         rebuilt_messages.append(rebuilt_message)
     return rebuilt_messages
+
+
+def _summarize_assistant_supervision_entries(
+    assistant_supervision: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    summary: List[Dict[str, Any]] = []
+    for entry in list(assistant_supervision or []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            assistant_message_index = int(entry.get("assistant_message_index"))
+        except Exception:
+            continue
+        normalized_entry: Dict[str, Any] = {
+            "assistant_message_index": assistant_message_index,
+        }
+        if entry.get("turn_index") is not None:
+            try:
+                normalized_entry["turn_index"] = int(entry.get("turn_index"))
+            except Exception:
+                pass
+        for key in ("turn_kind", "tool_name"):
+            value = entry.get(key)
+            if value is not None and str(value).strip():
+                normalized_entry[key] = str(value)
+        if entry.get("loss_weight") is not None:
+            try:
+                normalized_entry["loss_weight"] = float(entry.get("loss_weight"))
+            except Exception:
+                pass
+        summary.append(normalized_entry)
+    return summary
+
+
+def _capture_retained_image_provenance(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    retained: List[Dict[str, Any]] = []
+    for fallback_message_index, message in enumerate(list(messages or [])):
+        if not isinstance(message, dict):
+            continue
+        message_index = message.get("_cache_message_index", fallback_message_index)
+        try:
+            normalized_message_index = int(message_index)
+        except Exception:
+            normalized_message_index = int(fallback_message_index)
+        for fallback_content_index, item in enumerate(list(message.get("content", []) or [])):
+            if not isinstance(item, dict) or str(item.get("type") or "") != "image":
+                continue
+            content_index = item.get("_cache_content_index", fallback_content_index)
+            try:
+                normalized_content_index = int(content_index)
+            except Exception:
+                normalized_content_index = int(fallback_content_index)
+            provenance = item.get("_visual_provenance")
+            if isinstance(provenance, dict) and provenance:
+                normalized_provenance = _normalize_visual_provenance_payload(provenance)
+            else:
+                rebuilt = _build_visual_item_provenance(
+                    item,
+                    fallback_message_index=normalized_message_index,
+                    fallback_content_index=normalized_content_index,
+                )
+                normalized_provenance = (
+                    _normalize_visual_provenance_payload(rebuilt)
+                    if isinstance(rebuilt, dict) and rebuilt
+                    else {}
+                )
+            retained_entry: Dict[str, Any] = {
+                "message_index": normalized_message_index,
+                "content_index": normalized_content_index,
+                "provenance": normalized_provenance,
+            }
+            if item.get("timestamp_sec") is not None:
+                try:
+                    retained_entry["timestamp_sec"] = float(item.get("timestamp_sec"))
+                except Exception:
+                    pass
+            retained.append(retained_entry)
+    return retained
+
+
+def _build_episode_feature_debug_metadata(
+    *,
+    fitted_messages: Sequence[Dict[str, Any]],
+    assistant_supervision: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "message_plan": _capture_message_plan(list(fitted_messages)),
+        "retained_image_provenance": _capture_retained_image_provenance(fitted_messages),
+        "assistant_supervision": _summarize_assistant_supervision_entries(assistant_supervision),
+        "retained_message_count": int(len(list(fitted_messages or []))),
+    }
 
 
 def _build_response_labels(
@@ -1502,6 +1630,42 @@ def _is_episode_feature(feature: Dict[str, Any]) -> bool:
     return isinstance(feature.get("messages"), list) and isinstance(feature.get("assistant_supervision"), list)
 
 
+def _trim_episode_feature_messages_to_last_supervised_assistant(
+    feature: Dict[str, Any],
+) -> Dict[str, Any]:
+    messages = feature.get("messages")
+    assistant_supervision = feature.get("assistant_supervision")
+    if not isinstance(messages, list) or not isinstance(assistant_supervision, list):
+        return feature
+    if not messages or not assistant_supervision:
+        return feature
+
+    last_supervised_assistant_index: Optional[int] = None
+    for entry in assistant_supervision:
+        try:
+            assistant_message_index = int(entry.get("assistant_message_index"))
+        except Exception:
+            continue
+        if not 0 <= assistant_message_index < len(messages):
+            continue
+        if str(messages[assistant_message_index].get("role") or "") != "assistant":
+            continue
+        if (
+            last_supervised_assistant_index is None
+            or assistant_message_index > last_supervised_assistant_index
+        ):
+            last_supervised_assistant_index = assistant_message_index
+
+    if last_supervised_assistant_index is None:
+        return feature
+    if last_supervised_assistant_index >= len(messages) - 1:
+        return feature
+
+    trimmed_feature = dict(feature)
+    trimmed_feature["messages"] = list(messages[: last_supervised_assistant_index + 1])
+    return trimmed_feature
+
+
 def _fit_episode_messages_to_budget(
     processor: Any,
     messages: List[Dict[str, Any]],
@@ -1531,9 +1695,10 @@ def _fit_episode_messages_to_budget(
             continue
 
         if has_multimodal:
-            raise ValueError(
-                f"Unable to fit episode-format multimodal example within max_seq_length={max_length}. "
-                "Increase the sequence budget or reduce retained multimodal context."
+            _raise_multimodal_budget_error(
+                messages=fitted_messages,
+                max_length=max_length,
+                context_label="episode-format multimodal example",
             )
         return fitted_messages, full_text, full_inputs
 
@@ -1655,12 +1820,13 @@ def _build_episode_batch_from_feature(
     )
 
     base_advantage = float(feature.get("advantage", feature.get("sample_weight", 1.0)) or 0.0)
+    assistant_supervision = list(feature.get("assistant_supervision") or [])
     labels, token_advantages = _build_episode_labels_and_token_advantages(
         processor=processor,
         messages=fitted_messages,
         full_text=full_text,
         full_inputs=full_inputs,
-        assistant_supervision=list(feature.get("assistant_supervision") or []),
+        assistant_supervision=assistant_supervision,
         base_advantage=base_advantage,
     )
 
@@ -1674,9 +1840,13 @@ def _build_episode_batch_from_feature(
         batch["advantage"] = torch.tensor([float(feature.get("advantage", 0.0))], dtype=torch.float32)
     if completion_token_count > 0:
         batch["token_advantages"] = token_advantages
+        debug_metadata = _build_episode_feature_debug_metadata(
+            fitted_messages=fitted_messages,
+            assistant_supervision=assistant_supervision,
+        )
         return BatchBuildResult(
             batch=batch,
-            cached_plan=None,
+            cached_plan=debug_metadata,
             completion_token_count=completion_token_count,
             drop_reason=None,
             budgeting_attempted=True,
@@ -1747,6 +1917,7 @@ def _build_message_only_completion_episode_spec_from_feature(
     batch = episode_batch_result.batch
     if batch is None:
         return episode_batch_result
+    debug_metadata = copy.deepcopy(dict(episode_batch_result.cached_plan or {}))
 
     input_ids = batch.get("input_ids")
     attention_mask = batch.get("attention_mask")
@@ -1760,7 +1931,7 @@ def _build_message_only_completion_episode_spec_from_feature(
     ):
         return BatchBuildResult(
             batch=None,
-            cached_plan=None,
+            cached_plan=debug_metadata,
             completion_token_count=0,
             drop_reason="missing_episode_message_tensors",
             budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
@@ -1771,7 +1942,7 @@ def _build_message_only_completion_episode_spec_from_feature(
     if not bool(torch.any(response_positions)):
         return BatchBuildResult(
             batch=None,
-            cached_plan=None,
+            cached_plan=debug_metadata,
             completion_token_count=0,
             drop_reason="zero_response_after_budgeting",
             budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
@@ -1782,7 +1953,7 @@ def _build_message_only_completion_episode_spec_from_feature(
     if response_indices.numel() <= 0:
         return BatchBuildResult(
             batch=None,
-            cached_plan=None,
+            cached_plan=debug_metadata,
             completion_token_count=0,
             drop_reason="zero_response_after_budgeting",
             budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
@@ -1792,7 +1963,7 @@ def _build_message_only_completion_episode_spec_from_feature(
     if suffix_start <= 0:
         return BatchBuildResult(
             batch=None,
-            cached_plan=None,
+            cached_plan=debug_metadata,
             completion_token_count=int(response_positions.sum().item()),
             drop_reason="zero_prompt_after_budgeting",
             budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
@@ -1817,6 +1988,36 @@ def _build_message_only_completion_episode_spec_from_feature(
     else:
         token_loss_weight = labels[:, suffix_start:].ne(-100).to(dtype=torch.float32)
     token_loss_weight = token_loss_weight * completion_mask.to(dtype=torch.float32)
+    # Safe tail trim: text-only batches can drop pure trailing zero-weight tokens
+    # without changing conditioning semantics. Multimodal batches cannot, because
+    # the sliced completion tokens must stay aligned with image/video placeholder
+    # tokens and the retained visual feature tensors.
+    has_multimodal_inputs = any(
+        key in batch
+        for key in (
+            "pixel_values",
+            "pixel_values_videos",
+            "image_grid_thw",
+            "video_grid_thw",
+            "second_per_grid_ts",
+            "image_sizes",
+        )
+    )
+    if not has_multimodal_inputs:
+        positive_weight_positions = token_loss_weight.gt(0).nonzero(as_tuple=False)
+        if positive_weight_positions.numel() <= 0:
+            return BatchBuildResult(
+                batch=None,
+                cached_plan=debug_metadata,
+                completion_token_count=0,
+                drop_reason="zero_response_after_budgeting",
+                budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
+                is_episode_feature=True,
+            )
+        last_positive_completion_index = int(positive_weight_positions[:, 1].max().item()) + 1
+        completion_ids = completion_ids[:, :last_positive_completion_index].clone()
+        completion_mask = completion_mask[:, :last_positive_completion_index].clone()
+        token_loss_weight = token_loss_weight[:, :last_positive_completion_index].clone()
 
     episode_spec: Dict[str, Any] = {
         "prompt_ids": prompt_ids.detach().cpu(),
@@ -1852,7 +2053,7 @@ def _build_message_only_completion_episode_spec_from_feature(
             episode_spec[key] = copy.deepcopy(value)
     return BatchBuildResult(
         batch=episode_spec,
-        cached_plan=None,
+        cached_plan=debug_metadata,
         completion_token_count=int(completion_mask.sum().item()),
         drop_reason=None,
         budgeting_attempted=bool(episode_batch_result.budgeting_attempted),
@@ -1889,9 +2090,10 @@ def _build_rl_completion_episode_spec_from_feature(
         )
     if "advantage" not in feature:
         raise ValueError("Active RL message-only episode features must include singular `advantage`.")
+    trimmed_feature = _trim_episode_feature_messages_to_last_supervised_assistant(feature)
     return _build_message_only_completion_episode_spec_from_feature(
         processor,
-        feature,
+        trimmed_feature,
         max_image_side=max_image_side,
         max_image_pixels=max_image_pixels,
         keep_recent_tool_image_messages=keep_recent_tool_image_messages,
@@ -2375,7 +2577,7 @@ class WeightedExampleDataset(torch.utils.data.Dataset):
 def _compact_trace_row_to_runtime_record(row: Dict[str, Any]) -> Dict[str, Any]:
     if not _is_compact_trace_sft_row(row):
         raise ValueError(
-            "SFT training now requires compact_trace_v2 prepared rows. "
+            "SFT training now requires compact_trace_v5 prepared rows. "
             f"Got legacy row keys={sorted(list(row.keys()))[:12]}"
         )
     runtime_record = {
@@ -2733,9 +2935,10 @@ def _fit_batch_episode_messages_to_budget(
             if _drop_oldest_history_message(fitted_batches[global_index]):
                 next_pending.append(global_index)
                 continue
-            raise ValueError(
-                f"Unable to fit episode-format multimodal example within max_seq_length={max_length}. "
-                "Increase the sequence budget or reduce retained multimodal context."
+            _raise_multimodal_budget_error(
+                messages=fitted_batches[global_index],
+                max_length=max_length,
+                context_label="episode-format multimodal example",
             )
         pending_indices = next_pending
     raise RuntimeError("Exceeded pruning attempts while fitting an episode-format batch to the sequence budget.")
@@ -2988,10 +3191,10 @@ def validate_prepared_examples(
         prefix = f"example[{idx}]"
         if _is_compact_trace_sft_row(example):
             if not str(example.get("video_path") or "").strip():
-                summary["errors"].append(f"{prefix}: compact_trace_v2 row is missing video_path")
+                summary["errors"].append(f"{prefix}: compact_trace_v5 row is missing video_path")
                 error_examples.add(idx)
             if not isinstance(example.get("oracle_trajectory"), list):
-                summary["errors"].append(f"{prefix}: compact_trace_v2 row is missing oracle_trajectory")
+                summary["errors"].append(f"{prefix}: compact_trace_v5 row is missing oracle_trajectory")
                 error_examples.add(idx)
             completed = idx + 1
             if should_log_progress(completed, total_examples, int(progress_every)):
@@ -3654,10 +3857,7 @@ def _annotate_json_like_span_weights(
     critical_keys = {
         "existence",
         "category",
-        "severity",
         "anomaly_interval_sec",
-        "precursor_interval_sec",
-        "earliest_actionable_sec",
         "earliest_alert_sec",
         "decision",
         "alert_sec",
@@ -3666,7 +3866,6 @@ def _annotate_json_like_span_weights(
         "window_id",
         "evidence_id",
         "evidence_moment_ids",
-        "counterfactual_type",
         "name",
         "arguments",
     }
@@ -3857,26 +4056,23 @@ def _build_component_response_char_weights(
             "confirmation",
             "aftermath",
             "verification_decision",
-            "recommended_action",
+            "next_tool",
             "finalize_readiness_score",
-            "continue_search",
-            "finalize",
+            "seek_evidence",
+            "finalize_case",
         ],
         "teacher_local": [
             "verification_decision",
-            "recommended_action",
+            "next_tool",
             "sufficiency_score",
             "necessity_score",
             "finalize_readiness_score",
-            "counterfactual_faithfulness",
             "selected_window_ids",
             "selected_evidence_ids",
             "selected_evidence_moment_ids",
             "rationale",
-            "continue_search",
-            "revise_claim",
-            "refine_evidence",
-            "finalize",
+            "seek_evidence",
+            "finalize_case",
         ],
     }
     _apply_focus_term_weights(
@@ -4675,9 +4871,17 @@ def _load_materialized_messages_sft_dataset(
     require_materialized_cache: bool = False,
     runtime: Any,
 ) -> Any | None:
+    metadata = load_materialized_cache_metadata(materialized_messages_path)
+    expected_protocol_signature = build_protocol_signature(
+        config=config,
+        teacher_role=infer_teacher_role_from_metadata(metadata),
+    )
     ensure_materialized_cache_metadata(
         materialized_messages_path,
         expected_format=MATERIALIZED_SFT_MESSAGES_FORMAT,
+        expected_config=config,
+        expected_protocol_signature=expected_protocol_signature,
+        require_config_match=config is not None,
         require_source=False,
     )
     try:
@@ -5145,13 +5349,22 @@ def run_standard_sft(
     resolved_rollout_eval_output_dir = (
         Path(str(rollout_eval_output_dir).strip()) if str(rollout_eval_output_dir or "").strip() else output_dir
     )
+    resolved_materialized_messages_path = str(materialized_messages_path or "").strip()
+    if not resolved_materialized_messages_path and bool(require_materialized_cache):
+        prepared_metadata = load_prepared_sft_metadata(prepared_data_path)
+        resolved_materialized_messages_path = str(
+            default_sft_materialized_messages_path(
+                prepared_data_path,
+                teacher_role=infer_teacher_role_from_metadata(prepared_metadata),
+            )
+        )
     resolved_log_dir.mkdir(parents=True, exist_ok=True)
     resolved_rollout_eval_output_dir.mkdir(parents=True, exist_ok=True)
 
     runtime_log(
         (
             f"SFT setup: prepared_data={prepared_data_path} "
-            f"materialized_messages={materialized_messages_path or '(none)'} "
+            f"materialized_messages={resolved_materialized_messages_path or '(none)'} "
             f"output_dir={output_dir} model_path={model_path}"
         ),
         runtime=runtime,
@@ -5187,9 +5400,9 @@ def run_standard_sft(
     effective_dataloader_persistent_workers = bool(dataloader_persistent_workers)
     train_dataset = None
     strict_feature_guided_proposal = False
-    if str(materialized_messages_path or "").strip():
+    if resolved_materialized_messages_path:
         train_dataset = _load_materialized_messages_sft_dataset(
-            materialized_messages_path=materialized_messages_path,
+            materialized_messages_path=resolved_materialized_messages_path,
             include_splits=include_splits,
             config=saver_config,
             require_materialized_cache=require_materialized_cache,
@@ -5204,7 +5417,7 @@ def run_standard_sft(
             raise ValueError(f"No prepared SFT examples were loaded from {prepared_data_path}")
         if not all(_is_compact_trace_sft_row(example) for example in examples):
             raise ValueError(
-                "Prepared SFT training now only accepts compact_trace_v2 rows. "
+                "Prepared SFT training now only accepts compact_trace_v5 rows. "
                 "Regenerate the prepared JSONL with the new lazy video-level format instead of legacy step/episode rows."
             )
         frame_cache_summary = summarize_example_frame_cache_status(examples)
@@ -5355,7 +5568,7 @@ def run_standard_sft(
             resolved_log_dir / "run_standard_sft_config.json",
             {
                 "prepared_data_path": str(prepared_data_path),
-                "materialized_messages_path": str(materialized_messages_path or ""),
+                "materialized_messages_path": str(resolved_materialized_messages_path or ""),
                 "require_materialized_cache": bool(require_materialized_cache),
                 "include_splits": list(parse_include_splits(include_splits) or []),
                 "model_path": str(model_path),
@@ -5449,7 +5662,7 @@ def run_standard_sft(
         authoritative_model_path = output_dir.resolve()
     result = {
         "prepared_data_path": str(prepared_data_path),
-        "materialized_messages_path": str(materialized_messages_path or ""),
+        "materialized_messages_path": str(resolved_materialized_messages_path or ""),
         "num_examples": len(train_dataset),
         "output_dir": str(output_dir),
         "log_dir": str(resolved_log_dir),

@@ -13,6 +13,10 @@ import numpy as np
 import torch
 from PIL import Image
 
+from saver_v3.core.initial_observation import (
+    error_on_initial_scan_seq_prune,
+    is_initial_global_scan_message,
+)
 from saver_v3.common.message_budget import (
     apply_message_budget,
     drop_oldest_history_turn,
@@ -33,11 +37,10 @@ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 _ANSWER_BLOCK_RE = re.compile(r"<answer>.*?</answer>", re.DOTALL)
 _VERIFY_COMPACT_KEYS = {
     "verification_decision",
-    "recommended_action",
+    "next_tool",
     "sufficiency_score",
     "necessity_score",
     "finalize_readiness_score",
-    "counterfactual_faithfulness",
     "selected_window_ids",
     "selected_evidence_moment_ids",
 }
@@ -326,6 +329,8 @@ def _has_multimodal_content(messages: List[Dict[str, Any]]) -> bool:
 
 def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
     for message_index, message in enumerate(messages):
+        if is_initial_global_scan_message(message) and error_on_initial_scan_seq_prune(message):
+            continue
         content = list(message.get("content", []))
         for content_index, item in enumerate(content):
             item_type = item.get("type")
@@ -348,6 +353,13 @@ def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
                 messages[message_index]["content"] = []
             return True
     return False
+
+
+def _has_protected_initial_global_scan(messages: List[Dict[str, Any]]) -> bool:
+    return any(
+        is_initial_global_scan_message(message) and error_on_initial_scan_seq_prune(message)
+        for message in messages
+    )
 
 
 def _drop_oldest_history_message(messages: List[Dict[str, Any]]) -> bool:
@@ -731,7 +743,11 @@ class QwenGenerationPolicy:
         state: Any,
         step_index: int,
     ) -> str:
-        return _compact_verify_tool_call(self.generate_from_messages(messages))
+        del multimodal_cache, state, step_index
+        return self.generate_from_messages(messages)
+
+    def postprocess_generated_output(self, output_text: str) -> str:
+        return _compact_verify_tool_call(_trim_to_first_structured_block(str(output_text)))
 
     def generate_from_messages_batch(
         self,
@@ -757,7 +773,7 @@ class QwenGenerationPolicy:
         del inputs
         del output_ids
         del generated_ids_trimmed
-        return [_trim_to_first_structured_block(str(text)) for text in output_texts]
+        return [self.postprocess_generated_output(text) for text in output_texts]
 
     def generate_from_messages(self, messages: List[Dict[str, Any]]) -> str:
         if self.model is None:
@@ -778,7 +794,7 @@ class QwenGenerationPolicy:
         del inputs
         del output_ids
         del generated_ids_trimmed
-        return _trim_to_first_structured_block(output_text[0])
+        return self.postprocess_generated_output(output_text[0])
 
     def _trim_generated_ids(self, inputs: Any, output_ids: Any) -> List[Any]:
         prompt_width = _model_input_padded_width(inputs)
@@ -938,6 +954,11 @@ class QwenGenerationPolicy:
                 continue
 
             if _has_multimodal_content(fitted_messages):
+                if _has_protected_initial_global_scan(fitted_messages):
+                    raise ValueError(
+                        f"Unable to fit rollout prompt within max_seq_length={max_length} without pruning the canonical initial global scan. "
+                        "Increase max_seq_length or reduce later multimodal context."
+                    )
                 raise ValueError(
                     f"Unable to fit rollout prompt within max_seq_length={max_length}. "
                     "Increase the sequence budget or reduce retained multimodal context."

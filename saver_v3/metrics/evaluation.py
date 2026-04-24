@@ -12,14 +12,14 @@ from typing import Any, Dict, Optional, Sequence
 
 from run_saver_rollout import _serialize_result
 from saver_v3.core.adapter import TimeSearchRolloutAdapter
-from saver_v3.data.config import DEFAULT_POLICY_MAX_NEW_TOKENS, SaverAgentConfig
-from saver_v3.core.counterfactual_verification import infer_counterfactual_window_ids
+from saver_v3.data.config import DEFAULT_POLICY_MAX_NEW_TOKENS, DEFAULT_ROLLOUT_MAX_TURNS, SaverAgentConfig
 from saver_v3.data.dataset import SaverAgentDataset
 from saver_v3.data.materialized_cache import (
     MATERIALIZED_RUNTIME_ITEMS_FORMAT,
     MaterializedRuntimeItemDataset,
     ensure_materialized_cache_metadata,
 )
+from saver_v3.data.protocol_signature import DEFAULT_TEACHER_ROLE, build_protocol_signature
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp
 from saver_v3.metrics.legacy_metrics import summarize_saver_metrics
 from saver_v3.metrics.offline_scoring import (
@@ -70,7 +70,7 @@ class RolloutEvaluationConfig:
     include_splits: Optional[Sequence[str] | str] = None
     max_records: int = 0
     inline_rollout_eval: bool = False
-    rollout_max_turns: int = 14
+    rollout_max_turns: int = DEFAULT_ROLLOUT_MAX_TURNS
     rollout_batch_size: int = 1
     policy_max_new_tokens: int = DEFAULT_POLICY_MAX_NEW_TOKENS
     use_generation_cache: bool = True
@@ -103,6 +103,7 @@ class RolloutEvaluationConfig:
     semantic_judge_model: str = ""
     semantic_judge_cache_path: str | Path = ""
     semantic_judge_timeout_sec: float = 30.0
+    semantic_bertscore_model_path: str | Path = ""
 
 
 def _semantic_replay_enabled(eval_config: RolloutEvaluationConfig) -> bool:
@@ -111,6 +112,21 @@ def _semantic_replay_enabled(eval_config: RolloutEvaluationConfig) -> bool:
 
 def _resolve_rollout_batch_size(eval_config: RolloutEvaluationConfig) -> int:
     return max(1, int(getattr(eval_config, "rollout_batch_size", 1) or 1))
+
+
+def _resolve_rollout_eval_saver_configs(
+    eval_config: RolloutEvaluationConfig,
+) -> tuple[SaverAgentConfig, SaverAgentConfig]:
+    artifact_saver_config = (
+        copy.deepcopy(eval_config.saver_config) if eval_config.saver_config is not None else SaverAgentConfig()
+    )
+    runtime_saver_config = copy.deepcopy(artifact_saver_config)
+    runtime_saver_config.rollout_trace.record_message_history = False
+    runtime_saver_config.rollout_trace.record_observation_content = False
+    # Search/query metrics depend on per-turn state deltas and new evidence traces.
+    runtime_saver_config.rollout_trace.record_state_deltas = True
+    runtime_saver_config.rollout_trace.record_counterfactual_trace = False
+    return artifact_saver_config, runtime_saver_config
 
 
 def _claim_dynamic_rollout_batch_indices(
@@ -453,6 +469,7 @@ def _build_rollout_eval_metadata(eval_config: RolloutEvaluationConfig) -> Dict[s
         "semantic_metrics": _normalize_eval_semantic_metrics(eval_config.semantic_metrics),
         "semantic_judge_base_url": str(eval_config.semantic_judge_base_url or ""),
         "semantic_judge_model": str(eval_config.semantic_judge_model or ""),
+        "semantic_bertscore_model_path": str(eval_config.semantic_bertscore_model_path or ""),
     }
 
 
@@ -478,8 +495,32 @@ def _window_record_lookup(rollout: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return lookup
 
 
+def _infer_selected_window_ids(rollout: Dict[str, Any]) -> list[str]:
+    for turn in reversed(list(rollout.get("turns") or [])):
+        if str(turn.get("tool_name") or "").strip() != "verify_hypothesis":
+            continue
+        selected = [
+            str(value).strip()
+            for value in (
+                turn.get("verifier_verified_window_ids")
+                or turn.get("verified_window_ids")
+                or turn.get("selected_window_ids")
+                or []
+            )
+            if str(value).strip()
+        ]
+        if selected:
+            return selected
+    state = dict(rollout.get("state") or {})
+    return [
+        str(value).strip()
+        for value in list(state.get("active_evidence_window_ids") or [])
+        if str(value).strip()
+    ]
+
+
 def _semantic_replay_window_ids(rollout: Dict[str, Any]) -> list[str]:
-    window_ids = [str(value).strip() for value in list(infer_counterfactual_window_ids(rollout) or []) if str(value).strip()]
+    window_ids = _infer_selected_window_ids(rollout)
     if window_ids:
         return window_ids
     state = dict(rollout.get("state") or {})
@@ -1001,12 +1042,7 @@ def run_rollout_evaluation(
     runtime = runtime or distributed_runtime_from_env()
     init_torch_distributed(runtime)
     shard_spec = resolve_shard_spec(runtime=runtime)
-    saver_config = copy.deepcopy(eval_config.saver_config) if eval_config.saver_config is not None else SaverAgentConfig()
-    saver_config.rollout_trace.record_message_history = False
-    saver_config.rollout_trace.record_observation_content = False
-    # Search/query metrics depend on per-turn state deltas and new evidence traces.
-    saver_config.rollout_trace.record_state_deltas = True
-    saver_config.rollout_trace.record_counterfactual_trace = False
+    artifact_saver_config, saver_config = _resolve_rollout_eval_saver_configs(eval_config)
     runtime_log(
         (
             "rollout eval policy budget: "
@@ -1057,16 +1093,26 @@ def run_rollout_evaluation(
             pass
     strict_feature_guided_proposal = bool(str(eval_config.proposal_model_path or "").strip())
     if str(eval_config.materialized_items_path or "").strip():
+        expected_protocol_signature = build_protocol_signature(
+            config=artifact_saver_config,
+            max_turns=int(eval_config.rollout_max_turns),
+            policy_max_new_tokens=int(eval_config.policy_max_new_tokens),
+            teacher_role=DEFAULT_TEACHER_ROLE,
+        )
         ensure_materialized_cache_metadata(
             eval_config.materialized_items_path,
             expected_format=MATERIALIZED_RUNTIME_ITEMS_FORMAT,
             expected_source_path=eval_config.data_path,
             expected_include_splits=eval_config.include_splits,
+            expected_config=artifact_saver_config,
+            expected_protocol_signature=expected_protocol_signature,
+            require_config_match=True,
             require_source=True,
         )
         dataset = MaterializedRuntimeItemDataset(
             eval_config.materialized_items_path,
             include_splits=eval_config.include_splits,
+            config=artifact_saver_config,
             require_frame_cache=True,
             require_feature_cache=True,
         )
@@ -1429,6 +1475,7 @@ def run_rollout_evaluation(
                         judge_model=eval_config.semantic_judge_model,
                         judge_cache_path=eval_config.semantic_judge_cache_path,
                         judge_timeout_sec=eval_config.semantic_judge_timeout_sec,
+                        bertscore_model_path=eval_config.semantic_bertscore_model_path,
                     )
                     semantic_metrics_path.write_text(
                         json.dumps(semantic_metrics, ensure_ascii=False, indent=2),

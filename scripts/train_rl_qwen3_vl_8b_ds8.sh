@@ -93,7 +93,7 @@ for arg in "$@"; do
 done
 
 NNODES="${NNODES:-1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
@@ -101,7 +101,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 CONFIG="${RL_CONFIG:-${ROOT_DIR}/configs/rl/qwen3_vl_8b_grpo_train.yaml}"
 MODEL_CONFIG="${MODEL_CONFIG:-${ROOT_DIR}/configs/model/qwen3_vl_8b_full.yaml}"
 ATTENTION_CONFIG="${ATTENTION_CONFIG:-${ROOT_DIR}/configs/model/attention_fa3_only.yaml}"
-DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero2_rl.json}"
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
 
 CMD=(
   deepspeed

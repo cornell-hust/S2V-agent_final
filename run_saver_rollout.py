@@ -13,10 +13,12 @@ from split_utils import parse_include_splits
 
 from saver_v3.data.config import (
     DEFAULT_POLICY_MAX_NEW_TOKENS,
+    DEFAULT_ROLLOUT_MAX_TURNS,
     DEFAULT_RECOMMENDED_KEEP_RECENT_TEXT_MESSAGES,
     DEFAULT_RECOMMENDED_MAX_SEQ_LENGTH,
     DEFAULT_RECOMMENDED_MAX_TOTAL_IMAGES,
     DEFAULT_TOTAL_VISUAL_BUDGET,
+    InitialObservationConfig,
     PromptConfig,
     PreviewConfig,
     RolloutTraceConfig,
@@ -57,7 +59,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data.")
     parser.add_argument("--index", type=int, default=0, help="Dataset sample index.")
-    parser.add_argument("--max-turns", type=int, default=14, help="Maximum rollout turns.")
+    parser.add_argument("--max-turns", type=int, default=DEFAULT_ROLLOUT_MAX_TURNS, help="Maximum rollout turns.")
     parser.add_argument(
         "--policy-backend",
         choices=["replay", "qwen"],
@@ -163,8 +165,32 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=None, help="Sampling top-p.")
     parser.add_argument("--top-k", type=int, default=None, help="Sampling top-k.")
     parser.add_argument("--repetition-penalty", type=float, default=None, help="Optional repetition penalty.")
-    parser.add_argument("--num-preview-frames", type=int, default=8, help="Maximum preview frames injected into the first user turn.")
-    parser.add_argument("--preview-sampling-fps", type=float, default=None, help="Target preview sampling fps before capping by preview frame count.")
+    parser.add_argument(
+        "--initial-observation-mode",
+        choices=["preview", "explicit_first_scan"],
+        default="explicit_first_scan",
+        help="Canonical initial observation mode for SEEK mainline.",
+    )
+    parser.add_argument(
+        "--initial-scan-num-frames",
+        type=int,
+        default=8,
+        help='Number of frames retained by the canonical first scan_timeline call when initial-observation-mode=explicit_first_scan.',
+    )
+    parser.add_argument(
+        "--protect-initial-scan-from-visual-budget",
+        type=_parse_bool_flag,
+        default=True,
+        help="Keep the canonical first global scan exempt from visual-budget pruning.",
+    )
+    parser.add_argument(
+        "--error-on-initial-scan-seq-prune",
+        type=_parse_bool_flag,
+        default=True,
+        help="Raise an explicit error if max_seq_length fitting would need to prune the canonical first global scan.",
+    )
+    parser.add_argument("--num-preview-frames", type=int, default=8, help="Legacy preview frame count. Used only when --initial-observation-mode=preview.")
+    parser.add_argument("--preview-sampling-fps", type=float, default=None, help="Legacy preview sampling fps. Used only when --initial-observation-mode=preview.")
     parser.add_argument("--initial-user-template", default="", help="Optional custom template for the first user prompt.")
     parser.add_argument("--preview-instruction", default="", help="Optional custom preview instruction.")
     parser.add_argument("--tool-response-template", default="", help="Optional custom tool follow-up prompt template.")
@@ -269,6 +295,13 @@ def main() -> None:
             num_preview_frames=args.num_preview_frames,
             preview_sampling_fps=args.preview_sampling_fps,
             max_preview_frames=args.num_preview_frames,
+        ),
+        initial_observation=InitialObservationConfig(
+            mode=str(args.initial_observation_mode or "explicit_first_scan"),
+            scan_num_frames=max(1, int(args.initial_scan_num_frames or 8)),
+            scan_purpose="global_overview",
+            protect_from_visual_budget=bool(args.protect_initial_scan_from_visual_budget),
+            error_on_seq_prune=bool(args.error_on_initial_scan_seq_prune),
         ),
         prompt=PromptConfig(
             initial_user_template=args.initial_user_template or PromptConfig().initial_user_template,

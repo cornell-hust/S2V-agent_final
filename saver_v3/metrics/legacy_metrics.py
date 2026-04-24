@@ -225,12 +225,10 @@ def _extract_reference_target(record: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "existence": "anomaly" if label.get("is_anomaly") else "normal",
         "category": label.get("category"),
-        "severity": label.get("severity"),
         "hard_normal": label.get("hard_normal"),
         "anomaly_interval_sec": temporal.get("anomaly_interval_sec"),
         "precursor_interval_sec": temporal.get("precursor_interval_sec"),
         "earliest_actionable_sec": temporal.get("earliest_actionable_sec", temporal.get("earliest_alert_sec")),
-        "counterfactual_type": (record.get("counterfactual") or {}).get("type", "none"),
     }
 
 
@@ -272,11 +270,6 @@ def _normalize_category(value: Any) -> str:
     return text or "unknown"
 
 
-def _normalize_counterfactual_type(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    return text or "none"
-
-
 def _infer_claim_from_rollout(record: Dict[str, Any]) -> Dict[str, Any]:
     state = record.get("state") or {}
     finalized_case = state.get("finalized_case")
@@ -289,23 +282,7 @@ def _infer_claim_from_rollout(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_counterfactual_profile(record: Dict[str, Any]) -> Dict[str, Any]:
-    profile = record.get("counterfactual_profile")
-    if isinstance(profile, dict) and profile:
-        if "summary" in profile:
-            return dict(profile)
-        return {
-            "summary": {
-                "decision_sufficiency": bool(profile.get("decision_sufficiency")),
-                "minimal_subset_sufficiency": bool(profile.get("minimal_subset_sufficiency")),
-                "negative_specificity_pass": bool(profile.get("negative_specificity_pass")),
-                "counterfactual_type_supported": bool(profile.get("counterfactual_type_supported")),
-                "stage_necessity": dict(profile.get("stage_necessity") or {}),
-            },
-            "branch_field_matrix": dict(profile.get("branch_field_matrix") or {}),
-            "branch_delta_matrix": dict(profile.get("branch_delta_matrix") or {}),
-            "stage_packages": dict(profile.get("stage_packages") or {}),
-            "selection_metadata": dict(profile.get("selection_metadata") or {}),
-        }
+    del record
     return {}
 
 
@@ -507,6 +484,10 @@ def _verify_health_summary(scored_records: Sequence[Dict[str, Any]]) -> Dict[str
     invalid_selected_turns = 0
     unresolved_selection_turns = 0
     verify_invalid_turns = 0
+    total_invalid_attempts = 0
+    invalid_attempt_reason_counts = Counter()
+    repeated_search_attempts = 0
+    finalize_loop_attempts = 0
 
     for record in scored_records:
         for turn in record.get("turns") or []:
@@ -523,11 +504,29 @@ def _verify_health_summary(scored_records: Sequence[Dict[str, Any]]) -> Dict[str
                 or str(turn.get("selection_resolution_source") or "") == "unresolved"
             ):
                 unresolved_selection_turns += 1
-            if not bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"})):
+            if not bool(turn.get("valid_action", turn.get("action") in {"tool_call"})):
                 verify_invalid_turns += 1
+        for attempt in record.get("invalid_attempts") or []:
+            total_invalid_attempts += 1
+            reason = (
+                str(attempt.get("guardrail_reason") or "").strip()
+                or str(attempt.get("action") or "").strip()
+                or "unknown"
+            )
+            invalid_attempt_reason_counts[reason] += 1
+            if reason == "repeated_search_signature":
+                repeated_search_attempts += 1
+            if reason == "tool_after_finalize_case" or str(attempt.get("tool_name") or "") == "finalize_case":
+                finalize_loop_attempts += 1
 
     return {
         "verify_parse_mode_counts": {str(key): int(value) for key, value in sorted(verify_parse_mode_counts.items())},
+        "invalid_attempt_reason_counts": {
+            str(key): int(value) for key, value in sorted(invalid_attempt_reason_counts.items())
+        },
+        "repeated_search_rate": _safe_rate(repeated_search_attempts, total_invalid_attempts),
+        "empty_selection_verify_rate": _safe_rate(unresolved_selection_turns, total_verify_turns),
+        "finalize_loop_rate": _safe_rate(finalize_loop_attempts, total_invalid_attempts),
         "invalid_selected_window_rate": _safe_rate(invalid_selected_turns, total_verify_turns),
         "unresolved_selection_rate": _safe_rate(unresolved_selection_turns, total_verify_turns),
         "verify_invalid_turn_rate": _safe_rate(verify_invalid_turns, total_verify_turns),
@@ -552,10 +551,8 @@ def summarize_saver_metrics(
     evidence_precisions: List[float] = []
     evidence_recalls: List[float] = []
     evidence_f1s: List[float] = []
-    counterfactual_hits: List[float] = []
     event_chain_f1_values: List[float] = []
     event_chain_finalize_flags: List[float] = []
-    severity_errors: List[float] = []
     inspected_clip_ratios: List[float] = []
     total_turns: List[float] = []
     tool_validity_values: List[float] = []
@@ -564,17 +561,14 @@ def summarize_saver_metrics(
     null_final_answer_flags: List[float] = []
     finalized_case_flags: List[float] = []
     max_turn_termination_flags: List[float] = []
-    fecv_decision_sufficiency_flags: List[float] = []
-    fecv_minimal_subset_flags: List[float] = []
-    fecv_negative_specificity_flags: List[float] = []
-    fecv_trigger_drop_effects: List[float] = []
-    fecv_confirmation_drop_effects: List[float] = []
-    fecv_precursor_drop_effects: List[float] = []
-    fecv_finalize_readiness_drops: List[float] = []
     verify_coverage_flags: List[float] = []
     primary_status_counter = Counter()
     verify_finalize_followthrough_numerator = 0
     verify_finalize_followthrough_denominator = 0
+    finalized_case_category_total = Counter()
+    finalized_case_category_hits = Counter()
+    finalized_case_existence_total = Counter()
+    finalized_case_existence_hits = Counter()
 
     for record in scored_records:
         video_id = record.get("video_id")
@@ -599,11 +593,6 @@ def summarize_saver_metrics(
                 precursor_ious.append(
                     interval_iou(claim.get("precursor_interval_sec"), target.get("precursor_interval_sec"))
                 )
-            gt_counterfactual_type = _normalize_counterfactual_type(target.get("counterfactual_type"))
-            if gt_counterfactual_type != "none":
-                counterfactual_hits.append(
-                    1.0 if _normalize_counterfactual_type(claim.get("counterfactual_type")) == gt_counterfactual_type else 0.0
-                )
             required_stages = infer_required_stages_from_target(
                 target,
                 tool_io=dict(reference_record.get("tool_io") or {}),
@@ -616,11 +605,6 @@ def summarize_saver_metrics(
                 event_chain_finalize_flags.append(
                     1.0 if has_complete_event_chain(required_stages, predicted_stage_annotation) else 0.0
                 )
-            gt_severity = target.get("severity")
-            pred_severity = claim.get("severity")
-            if gt_severity is not None and pred_severity is not None:
-                severity_errors.append(abs(_safe_float(pred_severity) - _safe_float(gt_severity)))
-
             gt_evidence_windows = _extract_reference_evidence_windows(reference_record)
             if gt_evidence_windows:
                 ranked_pred_evidence_windows = _rank_predicted_evidence_windows(record)
@@ -641,6 +625,13 @@ def summarize_saver_metrics(
 
         duration = _safe_float((reference_record.get("video_meta") or {}).get("duration_sec"), 0.0)
         state = record.get("state") or {}
+        category_key = str(target.get("category") or gt_existence or "unknown")
+        existence_key = str(gt_existence or "unknown")
+        finalized_case_category_total[category_key] += 1
+        finalized_case_existence_total[existence_key] += 1
+        if isinstance(state.get("finalized_case"), dict):
+            finalized_case_category_hits[category_key] += 1
+            finalized_case_existence_hits[existence_key] += 1
         visited_intervals = [
             (entry.get("start_sec"), entry.get("end_sec"))
             for entry in list(state.get("visited_windows") or [])
@@ -652,44 +643,6 @@ def summarize_saver_metrics(
         null_final_answer_flags.append(1.0 if not isinstance(record.get("final_answer"), dict) else 0.0)
         finalized_case_flags.append(1.0 if isinstance(state.get("finalized_case"), dict) else 0.0)
         max_turn_termination_flags.append(1.0 if str(record.get("terminated_reason") or "") == "max_turns" else 0.0)
-        counterfactual_profile = _extract_counterfactual_profile(record)
-        counterfactual_summary = _counterfactual_summary(counterfactual_profile)
-        fecv_decision_sufficiency_flags.append(
-            1.0 if bool(counterfactual_summary.get("decision_sufficiency")) else 0.0
-        )
-        fecv_minimal_subset_flags.append(
-            1.0 if bool(counterfactual_summary.get("minimal_subset_sufficiency")) else 0.0
-        )
-        fecv_negative_specificity_flags.append(
-            1.0 if bool(counterfactual_summary.get("negative_specificity_pass")) else 0.0
-        )
-        fecv_trigger_drop_effects.append(
-            max(
-                _counterfactual_branch_delta(counterfactual_profile, "drop_trigger", "existence"),
-                _counterfactual_branch_delta(counterfactual_profile, "drop_trigger", "category"),
-                _counterfactual_branch_delta(counterfactual_profile, "drop_trigger", "temporal"),
-            )
-        )
-        fecv_confirmation_drop_effects.append(
-            max(
-                _counterfactual_branch_delta(counterfactual_profile, "drop_confirmation", "confirmation"),
-                _counterfactual_branch_delta(counterfactual_profile, "drop_confirmation", "finalize_readiness"),
-            )
-        )
-        fecv_precursor_drop_effects.append(
-            max(
-                _counterfactual_branch_delta(counterfactual_profile, "drop_precursor", "precursor"),
-                _counterfactual_branch_delta(counterfactual_profile, "drop_precursor", "finalize_readiness"),
-            )
-        )
-        fecv_finalize_readiness_drops.append(
-            max(
-                _counterfactual_branch_delta(counterfactual_profile, "drop_precursor", "finalize_readiness"),
-                _counterfactual_branch_delta(counterfactual_profile, "drop_trigger", "finalize_readiness"),
-                _counterfactual_branch_delta(counterfactual_profile, "drop_confirmation", "finalize_readiness"),
-            )
-        )
-
         turns = list(record.get("turns") or [])
         invalid_attempts = list(record.get("invalid_attempts") or [])
         if turns:
@@ -697,7 +650,7 @@ def summarize_saver_metrics(
                 sum(
                     1.0
                     for turn in turns
-                    if bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"}))
+                    if bool(turn.get("valid_action", turn.get("action") in {"tool_call"}))
                 )
                 / len(turns)
             )
@@ -710,7 +663,7 @@ def summarize_saver_metrics(
                 sum(
                     1.0
                     for attempt in attempts
-                    if bool(attempt.get("valid_action", attempt.get("action") in {"tool_call", "answer"}))
+                    if bool(attempt.get("valid_action", attempt.get("action") in {"tool_call"}))
                 )
                 / len(attempts)
             )
@@ -723,7 +676,7 @@ def summarize_saver_metrics(
         finalize_recommend_steps = [
             _safe_int(turn.get("step_index"), 0)
             for turn in verify_turns
-            if str(turn.get("verifier_recommended_action") or "") == "finalize"
+            if str(turn.get("verifier_next_tool") or "") == "finalize_case"
         ]
         if finalize_recommend_steps:
             verify_finalize_followthrough_denominator += 1
@@ -760,17 +713,8 @@ def summarize_saver_metrics(
         "evidence_precision_at_3": _mean(evidence_precisions),
         "evidence_recall_at_3": _mean(evidence_recalls),
         "evidence_f1_at_3": _mean(evidence_f1s),
-        "fecv_decision_sufficiency_rate": _mean(fecv_decision_sufficiency_flags),
-        "fecv_minimal_subset_rate": _mean(fecv_minimal_subset_flags),
-        "fecv_negative_specificity_rate": _mean(fecv_negative_specificity_flags),
-        "fecv_trigger_drop_effect": _mean(fecv_trigger_drop_effects),
-        "fecv_confirmation_drop_effect": _mean(fecv_confirmation_drop_effects),
-        "fecv_precursor_drop_effect": _mean(fecv_precursor_drop_effects),
-        "fecv_finalize_readiness_drop": _mean(fecv_finalize_readiness_drops),
-        "counterfactual_type_accuracy": _mean(counterfactual_hits),
         "event_chain_f1": _mean(event_chain_f1_values),
         "event_chain_finalize_rate": _mean(event_chain_finalize_flags),
-        "severity_mae": _mean(severity_errors),
         "mean_inspected_clip_ratio": _mean(inspected_clip_ratios),
         "mean_num_turns": _mean(total_turns),
         "tool_call_validity_rate": _mean(tool_validity_values),
@@ -784,6 +728,28 @@ def summarize_saver_metrics(
             verify_finalize_followthrough_numerator,
             verify_finalize_followthrough_denominator,
         ),
+        "finalized_case_rate_by_category": {
+            str(key): {
+                "num_records": int(finalized_case_category_total.get(key, 0)),
+                "num_finalized": int(finalized_case_category_hits.get(key, 0)),
+                "rate": _safe_rate(
+                    int(finalized_case_category_hits.get(key, 0)),
+                    int(finalized_case_category_total.get(key, 0)),
+                ),
+            }
+            for key in sorted(finalized_case_category_total.keys())
+        },
+        "finalized_case_rate_by_existence": {
+            str(key): {
+                "num_records": int(finalized_case_existence_total.get(key, 0)),
+                "num_finalized": int(finalized_case_existence_hits.get(key, 0)),
+                "rate": _safe_rate(
+                    int(finalized_case_existence_hits.get(key, 0)),
+                    int(finalized_case_existence_total.get(key, 0)),
+                ),
+            }
+            for key in sorted(finalized_case_existence_total.keys())
+        },
         **verify_health,
     }
     if include_diagnostic_summary:

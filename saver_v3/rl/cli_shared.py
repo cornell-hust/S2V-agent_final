@@ -16,10 +16,12 @@ from saver_v3.common.runtime import (
 from saver_v3.core.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH
 from saver_v3.data.config import (
     DEFAULT_POLICY_MAX_NEW_TOKENS,
+    DEFAULT_ROLLOUT_MAX_TURNS,
     DEFAULT_RECOMMENDED_KEEP_RECENT_TEXT_MESSAGES,
     DEFAULT_RECOMMENDED_MAX_SEQ_LENGTH,
     DEFAULT_RECOMMENDED_MAX_TOTAL_IMAGES,
     PreviewConfig,
+    InitialObservationConfig,
     PromptConfig,
     RolloutTraceConfig,
     SaverAgentConfig,
@@ -81,6 +83,22 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--data", default="", help="Path to SAVER agent/oracle JSONL data.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data.")
+    parser.add_argument(
+        "--materialized-train-items-path",
+        default="",
+        help="Optional materialized_runtime_items_v5 cache used by active RL training.",
+    )
+    parser.add_argument(
+        "--materialized-eval-items-path",
+        default="",
+        help="Optional materialized_runtime_items_v5 cache used by RL inline/final rollout eval.",
+    )
+    parser.add_argument(
+        "--require-materialized-runtime-cache",
+        type=_parse_bool_flag,
+        default=False,
+        help="Require materialized_runtime_items_v5 caches for both RL train and eval paths.",
+    )
     parser.add_argument("--output-dir", required=True, help="Directory to store RL outputs.")
     parser.add_argument("--log-dir", default="", help="Optional directory for RL logs. Defaults to <output-dir>/logs.")
     parser.add_argument(
@@ -136,8 +154,8 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--rl-reward-version",
-        choices=["legacy", "timesearch_v1", "timesearch_v2", "timesearch_v3"],
-        default="timesearch_v3",
+        choices=["timesearch_v4"],
+        default="timesearch_v4",
         help="Reward version used by active RL.",
     )
     parser.add_argument("--rl-reward-config-json", default="", help="Optional JSON object overriding RL reward configuration fields.")
@@ -154,7 +172,12 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--rollout-count", type=int, default=16, help="Number of videos per iteration.")
     parser.add_argument("--num-generations", type=int, default=4, help="Number of sampled rollouts per video per iteration.")
     parser.add_argument("--rollout-start-index", type=int, default=0, help="Start index for the first iteration.")
-    parser.add_argument("--rollout-max-turns", type=int, default=14, help="Maximum rollout turns.")
+    parser.add_argument(
+        "--rollout-max-turns",
+        type=int,
+        default=DEFAULT_ROLLOUT_MAX_TURNS,
+        help="Maximum rollout turns.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Collect/score examples but skip gradient updates.")
     parser.add_argument("--min-weight", type=float, default=0.1, help="Minimum absolute rollout advantage kept for updates.")
     parser.add_argument("--advantage-clip", type=float, default=3.0, help="Absolute clip value for group-relative advantages.")
@@ -170,15 +193,12 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--policy-repetition-penalty", type=float, default=None, help="Sampling repetition penalty.")
     parser.add_argument("--policy-max-new-tokens", type=int, default=DEFAULT_POLICY_MAX_NEW_TOKENS, help="Policy generation length.")
     parser.add_argument("--rl-rollout-use-cache", type=_parse_bool_flag, default=True, help="Enable KV cache during RL rollout generation.")
-    parser.add_argument("--rl-fecv-use-cache", type=_parse_bool_flag, default=True, help="Enable KV cache during RL online FECV replay.")
     parser.add_argument("--max-tool-message-frames", type=int, default=0, help="Maximum image/video frames retained within a single tool message after budgeting.")
     parser.add_argument("--max-total-video-frames", type=int, default=0, help="Maximum total image/video frames retained across the final model input after budgeting.")
     parser.add_argument("--rl-compute-loss-microbatch-size", type=int, default=2, help="Deprecated compatibility knob. Active trajectory-level GRPO no longer slices prepared batches into loss microbatches.")
     parser.add_argument("--rl-steps-per-generation", type=int, default=1, help="Reuse one rollout generation batch across this many trainer steps.")
     parser.add_argument("--use-liger-loss", type=_parse_bool_flag, default=False, help="Enable Liger fused GRPO loss on the active trajectory-level path. Disabled by default in idea2_v3 because the current Qwen3-VL RL stack is incompatible/unstable with Liger.")
     parser.add_argument("--rollout-stage-batch-size", type=int, default=16, help="Chunk size for rollout stage processing.")
-    parser.add_argument("--fecv-stage-batch-size", type=int, default=16, help="Chunk size for FECV stage processing.")
-    parser.add_argument("--rl-fecv-failure-policy", choices=["degrade", "drop", "fail"], default="degrade", help="How active RL handles online FECV failures.")
     parser.add_argument("--rl-log-empty-batch-rank-summary", type=_parse_bool_flag, default=True, help="Log per-rank empty-batch summaries when active RL sees no trainable episode inputs.")
     parser.add_argument("--verifier-backend", choices=["qwen_self_verifier"], default="qwen_self_verifier", help="Diagnostic verifier backend only.")
     parser.add_argument("--verifier-model-path", default=DEFAULT_VERIFIER_MODEL_PATH, help="Diagnostic verifier model path.")
@@ -197,7 +217,12 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable model gradient checkpointing.")
     parser.add_argument("--deepspeed", default="", help="Optional DeepSpeed config json passed to Trainer/TRL training arguments.")
     parser.add_argument("--learning-rate", type=float, default=5e-6, help="Update learning rate.")
-    parser.add_argument("--num-train-epochs", type=float, default=1.0, help="Update epochs per iteration.")
+    parser.add_argument(
+        "--num-train-epochs",
+        type=float,
+        default=1.0,
+        help="Internal trainer epoch count. Active continuous RL derives total trainer epochs from --num-iterations and expects this to remain 1.0.",
+    )
     parser.add_argument("--per-device-train-batch-size", type=int, default=1, help="Per-device update batch size.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16, help="Gradient accumulation steps.")
     parser.add_argument("--dataloader-num-workers", type=int, default=0, help="DataLoader worker count for each RL update stage.")
@@ -222,13 +247,52 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--keep-recent-tool-image-messages", type=int, default=3, help="If >0, keep images only for the N most recent tool messages during RL.")
     parser.add_argument("--keep-recent-text-messages", type=int, default=DEFAULT_RECOMMENDED_KEEP_RECENT_TEXT_MESSAGES, help="If >0, keep full text only for the N most recent non-initial history messages during RL.")
     parser.add_argument("--max-total-images", type=int, default=DEFAULT_RECOMMENDED_MAX_TOTAL_IMAGES, help="Optional hard cap on total images kept in each RL example.")
-    parser.add_argument("--num-preview-frames", type=int, default=8, help="Preview frames for initial prompt.")
-    parser.add_argument("--preview-sampling-fps", type=float, default=None, help="Preview sampling fps.")
+    parser.add_argument(
+        "--initial-observation-mode",
+        choices=["preview", "explicit_first_scan"],
+        default="explicit_first_scan",
+        help="Canonical initial observation mode for SEEK mainline. Use preview only for preview-based compatibility paths.",
+    )
+    parser.add_argument(
+        "--initial-scan-num-frames",
+        type=int,
+        default=8,
+        help='Number of frames retained by the canonical first scan_timeline call when initial-observation-mode=explicit_first_scan.',
+    )
+    parser.add_argument(
+        "--protect-initial-scan-from-visual-budget",
+        type=_parse_bool_flag,
+        default=True,
+        help="Keep the canonical first global scan exempt from visual-budget pruning.",
+    )
+    parser.add_argument(
+        "--error-on-initial-scan-seq-prune",
+        type=_parse_bool_flag,
+        default=True,
+        help="Raise an explicit error if max_seq_length fitting would need to prune the canonical first global scan.",
+    )
+    parser.add_argument(
+        "--num-preview-frames",
+        type=int,
+        default=8,
+        help="Legacy preview frame count. Used only when --initial-observation-mode=preview.",
+    )
+    parser.add_argument(
+        "--preview-sampling-fps",
+        type=float,
+        default=None,
+        help="Legacy preview sampling fps. Used only when --initial-observation-mode=preview.",
+    )
     parser.add_argument("--eval-data", default="", help="Optional raw saver_agent/oracle JSONL used for rollout metrics after each update epoch.")
     parser.add_argument("--eval-data-root", default="", help="Root path used to resolve relative video paths for epoch-end rollout eval.")
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on eval records per epoch-end rollout eval.")
-    parser.add_argument("--eval-rollout-max-turns", type=int, default=14, help="Maximum rollout turns for epoch-end rollout eval.")
+    parser.add_argument(
+        "--eval-rollout-max-turns",
+        type=int,
+        default=DEFAULT_ROLLOUT_MAX_TURNS,
+        help="Maximum rollout turns for epoch-end rollout eval.",
+    )
     parser.add_argument("--eval-max-new-tokens-per-turn", type=int, default=DEFAULT_POLICY_MAX_NEW_TOKENS, help="Generation length budget for each epoch-end rollout eval turn.")
     parser.add_argument("--eval-total-visual-budget", type=int, default=0, help="Alias for a coarse epoch-end rollout visual budget.")
     parser.add_argument("--eval-max-total-images", type=int, default=0, action=_StoreEvalMaxTotalImages, help="Optional hard cap on total images preserved in each epoch-end rollout eval prompt.")
@@ -243,6 +307,13 @@ def build_active_rl_arg_parser(*, description: str) -> argparse.ArgumentParser:
     parser.add_argument("--eval-verifier-max-new-tokens", type=int, default=512, help="Generation length for epoch-end eval verifier.")
     parser.add_argument("--eval-attach-reference-diagnostics", action="store_true", help="Attach reference-conditioned offline verifier diagnostics during epoch-end rollout eval.")
     parser.add_argument("--eval-progress-every", type=int, default=1, help="Log epoch-end rollout eval progress every N local items.")
+    parser.add_argument("--eval-enable-semantic-metrics", type=_parse_bool_flag, default=None, help="Enable semantic metrics during epoch-end rollout eval.")
+    parser.add_argument("--eval-semantic-metrics", default="", help="Comma-separated semantic metrics for epoch-end rollout eval.")
+    parser.add_argument("--eval-semantic-judge-base-url", default="", help="Optional base URL for semantic LLM judging during epoch-end rollout eval.")
+    parser.add_argument("--eval-semantic-judge-model", default="", help="Optional model name for semantic LLM judging during epoch-end rollout eval.")
+    parser.add_argument("--eval-semantic-judge-cache-path", default="", help="Optional cache path for semantic LLM judging during epoch-end rollout eval.")
+    parser.add_argument("--eval-semantic-judge-timeout-sec", type=float, default=30.0, help="Timeout in seconds for semantic LLM judging during epoch-end rollout eval.")
+    parser.add_argument("--eval-bertscore-model-path", default="", help="Optional local Hugging Face model path or model id for BERTScore during epoch-end rollout eval.")
     return parser
 
 
@@ -438,6 +509,13 @@ def build_saver_config(args: argparse.Namespace) -> SaverAgentConfig:
             preview_sampling_fps=args.preview_sampling_fps,
             max_preview_frames=args.num_preview_frames,
         ),
+        initial_observation=InitialObservationConfig(
+            mode=str(getattr(args, "initial_observation_mode", "explicit_first_scan") or "explicit_first_scan"),
+            scan_num_frames=max(1, int(getattr(args, "initial_scan_num_frames", 8) or 8)),
+            scan_purpose="global_overview",
+            protect_from_visual_budget=bool(getattr(args, "protect_initial_scan_from_visual_budget", True)),
+            error_on_seq_prune=bool(getattr(args, "error_on_initial_scan_seq_prune", True)),
+        ),
         prompt=PromptConfig(),
         rollout_trace=RolloutTraceConfig(
             record_observation_content=False,
@@ -460,6 +538,8 @@ def build_rollout_eval_config(
     return RolloutEvaluationConfig(
         data_path=Path(args.eval_data),
         data_root=args.eval_data_root or args.data_root,
+        materialized_items_path=str(getattr(args, "materialized_eval_items_path", "") or "").strip(),
+        require_materialized_cache=bool(getattr(args, "require_materialized_runtime_cache", False)),
         include_splits=parse_include_splits(args.eval_include_splits),
         max_records=args.eval_max_records,
         inline_rollout_eval=bool(args.inline_rollout_eval),
@@ -484,6 +564,17 @@ def build_rollout_eval_config(
         verifier_max_new_tokens=args.eval_verifier_max_new_tokens,
         attach_reference_diagnostics=args.eval_attach_reference_diagnostics,
         progress_every=args.eval_progress_every,
+        enable_semantic_metrics=(
+            True
+            if getattr(args, "eval_enable_semantic_metrics", None) is None
+            else bool(getattr(args, "eval_enable_semantic_metrics"))
+        ),
+        semantic_metrics=str(getattr(args, "eval_semantic_metrics", "") or "").strip(),
+        semantic_judge_base_url=str(getattr(args, "eval_semantic_judge_base_url", "") or "").strip(),
+        semantic_judge_model=str(getattr(args, "eval_semantic_judge_model", "") or "").strip(),
+        semantic_judge_cache_path=str(getattr(args, "eval_semantic_judge_cache_path", "") or "").strip(),
+        semantic_judge_timeout_sec=float(getattr(args, "eval_semantic_judge_timeout_sec", 30.0) or 30.0),
+        semantic_bertscore_model_path=str(getattr(args, "eval_bertscore_model_path", "") or "").strip(),
         saver_config=config,
     )
 

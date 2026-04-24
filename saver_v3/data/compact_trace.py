@@ -7,6 +7,7 @@ import json
 from typing import Any, Optional
 
 from saver_v3.data.prepared_schema import validate_prepared_row
+from saver_v3.data.runtime_contract import RUNTIME_CONTRACT_VERSION
 
 
 def _json_dumps(payload: dict[str, Any]) -> str:
@@ -20,6 +21,8 @@ def compact_trace_row_to_runtime_record(row: dict[str, Any]) -> dict[str, Any]:
         "video_path": normalized.get("video_path"),
         "split": normalized.get("split"),
         "source": normalized.get("source"),
+        "runtime_contract_version": int(RUNTIME_CONTRACT_VERSION),
+        "protocol_signature": copy.deepcopy(normalized.get("protocol_signature") or {}),
         "video_meta": copy.deepcopy(normalized.get("video_meta") or {}),
         "scene": copy.deepcopy(normalized.get("scene") or {}),
         "agent_task": copy.deepcopy(normalized.get("agent_task") or {}),

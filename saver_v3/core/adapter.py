@@ -48,13 +48,13 @@ class TimeSearchRolloutAdapter:
             return adapted
         if adapted.get("name") == "verify_hypothesis":
             verification = self._extract_json_payload(content)
-            recommended_action = str((verification or {}).get("recommended_action") or "")
-            if recommended_action == "finalize":
+            next_tool = str((verification or {}).get("next_tool") or "")
+            if next_tool == "finalize_case":
                 content.append(
                     {
                         "type": "text",
                         "text": (
-                            "Finalize next. "
+                            "Call finalize_case next. "
                             + build_finalize_scaffold(
                                 verification_payload=verification,
                                 finalize_schema=(multimodal_cache.get("tool_io") or {}).get("finalize_case_schema") or {},
@@ -62,25 +62,11 @@ class TimeSearchRolloutAdapter:
                         ),
                     }
                 )
-            elif recommended_action == "continue_search":
+            elif next_tool == "seek_evidence":
                 content.append(
                     {
                         "type": "text",
-                        "text": "Continue search. Cover the next missing stage before finalizing.",
-                    }
-                )
-            elif recommended_action == "revise_claim":
-                content.append(
-                    {
-                        "type": "text",
-                        "text": "Revise the claim to match the selected evidence before continuing.",
-                    }
-                )
-            elif recommended_action == "refine_evidence":
-                content.append(
-                    {
-                        "type": "text",
-                        "text": "Refine the selected evidence subset before finalizing.",
+                        "text": "Call seek_evidence next. Cover the next missing stage before finalizing.",
                     }
                 )
             adapted["content"] = content

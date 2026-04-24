@@ -237,6 +237,7 @@ def _evaluate_bertscore(
     rollouts: Sequence[Dict[str, Any]],
     *,
     reference_data: ReferenceDataProvider,
+    bertscore_model_path: str | Path = "",
 ) -> Dict[str, Any]:
     predictions, references = _collect_summary_strings(rollouts, reference_data=reference_data)
     coverage = sum(1 for prediction in predictions if str(prediction).strip())
@@ -262,7 +263,14 @@ def _evaluate_bertscore(
             "coverage": 0,
             "coverage_rate": 0.0,
         }
-    precision, recall, f1 = bert_score(predictions, references, lang="en", verbose=False)
+    model_type = str(bertscore_model_path or "").strip()
+    bertscore_kwargs: Dict[str, Any] = {
+        "lang": "en",
+        "verbose": False,
+    }
+    if model_type:
+        bertscore_kwargs["model_type"] = model_type
+    precision, recall, f1 = bert_score(predictions, references, **bertscore_kwargs)
     return {
         "available": True,
         "precision": float(precision.mean().item()),
@@ -270,6 +278,7 @@ def _evaluate_bertscore(
         "f1": float(f1.mean().item()),
         "coverage": int(coverage),
         "coverage_rate": float(coverage) / float(total) if total > 0 else 0.0,
+        "model_type": model_type,
     }
 
 
@@ -609,6 +618,7 @@ def evaluate_semantic_rollouts(
     judge_model: str = "",
     judge_cache_path: str | Path = "",
     judge_timeout_sec: float = 30.0,
+    bertscore_model_path: str | Path = "",
 ) -> Dict[str, Any]:
     requested_metrics = [
         str(metric).strip().lower()
@@ -623,7 +633,11 @@ def evaluate_semantic_rollouts(
     if "rouge" in requested_metrics:
         result["rouge_summary"] = _evaluate_rouge(rollouts, reference_data=reference_data)
     if "bertscore" in requested_metrics:
-        result["bertscore_summary"] = _evaluate_bertscore(rollouts, reference_data=reference_data)
+        result["bertscore_summary"] = _evaluate_bertscore(
+            rollouts,
+            reference_data=reference_data,
+            bertscore_model_path=bertscore_model_path,
+        )
     if "qa_accuracy" in requested_metrics:
         result.update(_evaluate_qa_accuracy(rollouts, reference_data=reference_data))
     if "qa_relaxed" in requested_metrics:

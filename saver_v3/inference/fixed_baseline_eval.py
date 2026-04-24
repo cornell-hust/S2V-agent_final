@@ -19,6 +19,7 @@ from saver_v3.common.runtime import (
 from saver_v3.core.categories import canonicalize_category_payload
 from saver_v3.core.protocol_guidance import event_chain_stage_for_role, normalize_event_chain_stages
 from saver_v3.core.semantic_answer import normalize_semantic_answer_payload
+from saver_v3.data.config import InitialObservationConfig, PreviewConfig, SaverAgentConfig
 from saver_v3.data.dataset import SaverAgentDataset
 from saver_v3.inference.message_runtime import MessageSamplingConfig, TorchQwen3MessageRuntime
 from saver_v3.metrics.legacy_metrics import summarize_saver_metrics
@@ -74,10 +75,8 @@ def _response_scaffold() -> dict[str, Any]:
         "decision": {
             "existence": "anomaly",
             "category": "assault",
-            "severity": 0,
             "anomaly_interval_sec": [0.0, 1.0],
             "precursor_interval_sec": [0.0, 0.5],
-            "counterfactual_type": "remove_actor_interaction",
         },
         "semantic_answer": {
             "summary": "one concise case summary",
@@ -276,10 +275,8 @@ def normalize_fixed_baseline_prediction(payload: Any, *, duration_sec: float, ev
         {
             "existence": existence,
             "category": (raw_decision or {}).get("category"),
-            "severity": _safe_int((raw_decision or {}).get("severity"), 0) if (raw_decision or {}).get("severity") is not None else None,
             "anomaly_interval_sec": _normalize_interval_sec((raw_decision or {}).get("anomaly_interval_sec"), duration_sec=duration_sec),
             "precursor_interval_sec": _normalize_interval_sec((raw_decision or {}).get("precursor_interval_sec"), duration_sec=duration_sec),
-            "counterfactual_type": _clean_text((raw_decision or {}).get("counterfactual_type")) or "none",
         }
     )
     if existence == "normal":
@@ -436,6 +433,7 @@ class FixedBaselineEvalConfig:
     evidence_top_k: int = 3
     enable_semantic_metrics: bool = True
     semantic_metrics: Sequence[str] | str = "qa_accuracy"
+    semantic_bertscore_model_path: str = ""
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "flash_attention_3"
     use_generation_cache: bool = True
@@ -477,6 +475,9 @@ class FixedBaselineEvalConfig:
             evidence_top_k=int(baseline.get("evidence_top_k", 3) or 3),
             enable_semantic_metrics=_bool(evaluation.get("enable_semantic_metrics"), True),
             semantic_metrics=evaluation.get("semantic_metrics", "qa_accuracy"),
+            semantic_bertscore_model_path=(
+                str(evaluation.get("semantic_bertscore_model_path") or evaluation.get("bertscore_model_path") or "").strip()
+            ),
             torch_dtype=str(mapping.get("torch_dtype") or "bfloat16").strip() or "bfloat16",
             attn_implementation=str(mapping.get("attn_implementation") or "flash_attention_3").strip() or "flash_attention_3",
             use_generation_cache=_bool(client.get("use_generation_cache"), True),
@@ -497,10 +498,15 @@ class FixedBaselineEvalConfig:
 
 
 def run_fixed_baseline_eval_job(config: FixedBaselineEvalConfig) -> Dict[str, Any]:
-    if int(config.batch_size) != 1:
-        raise ValueError("Fixed baseline direct-HF path currently requires client.batch_size=1.")
-    if str(config.attn_implementation or "").strip() != "flash_attention_3":
-        raise ValueError("Fixed baseline direct-HF path requires attn_implementation=flash_attention_3.")
+    if int(config.batch_size) < 1:
+        raise ValueError("Fixed baseline direct-HF path requires client.batch_size>=1.")
+    attn_implementation = str(config.attn_implementation or "").strip().lower()
+    allowed_attention_backends = {"flash_attention_3", "flash_attention_2", "sdpa", "eager"}
+    if attn_implementation and attn_implementation not in allowed_attention_backends:
+        raise ValueError(
+            "Fixed baseline direct-HF path requires attn_implementation to be one of "
+            f"{sorted(allowed_attention_backends)}, got {config.attn_implementation!r}."
+        )
     runtime = distributed_runtime_from_env()
     init_torch_distributed(runtime)
 
@@ -517,7 +523,13 @@ def run_fixed_baseline_eval_job(config: FixedBaselineEvalConfig) -> Dict[str, An
         config.data_path,
         data_root=config.data_root,
         include_splits=config.include_splits,
-        num_preview_frames=config.num_preview_frames,
+        config=SaverAgentConfig(
+            preview=PreviewConfig(
+                num_preview_frames=int(config.num_preview_frames),
+                max_preview_frames=int(config.num_preview_frames),
+            ),
+            initial_observation=InitialObservationConfig(mode="preview"),
+        ),
         load_feature_cache=False,
         require_feature_cache=False,
     )
@@ -648,6 +660,7 @@ def run_fixed_baseline_eval_job(config: FixedBaselineEvalConfig) -> Dict[str, An
             merged_normalized_records,
             data_path=config.data_path,
             metrics=requested_metrics,
+            bertscore_model_path=config.semantic_bertscore_model_path,
         )
     if semantic_metrics:
         write_json(semantic_metrics, semantic_metrics_path)
@@ -676,7 +689,6 @@ def run_fixed_baseline_eval_job(config: FixedBaselineEvalConfig) -> Dict[str, An
             "qa_accuracy_overall": float(semantic_metrics.get("qa_accuracy_overall", 0.0) or 0.0),
             "event_chain_f1": float(summary.get("event_chain_f1", 0.0) or 0.0),
             "evidence_f1_at_3": float(summary.get("evidence_f1_at_3", 0.0) or 0.0),
-            "fecv_decision_sufficiency_rate": None,
         },
     }
     summary["paper_metrics"] = paper_metrics
@@ -684,7 +696,6 @@ def run_fixed_baseline_eval_job(config: FixedBaselineEvalConfig) -> Dict[str, An
     summary["split"] = split_label
     summary["num_scored_records"] = len(merged_normalized_records)
     summary["baseline_protocol"] = "fixed_observation_single_shot"
-    summary["fecv_reported_in_main_table"] = False
 
     write_json(summary, metrics_path)
     write_json(table_metrics, table_metrics_path)

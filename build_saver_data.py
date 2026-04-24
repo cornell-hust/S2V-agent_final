@@ -37,7 +37,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--sft-train-output",
         default="",
-        help="Optional output compact_trace_v2 prepared SFT JSONL for train split.",
+        help="Optional output compact_trace_v4 prepared SFT JSONL for train split.",
     )
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument(

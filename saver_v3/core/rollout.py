@@ -6,7 +6,8 @@ from dataclasses import asdict
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from saver_v3.core.adapter import TimeSearchRolloutAdapter
-from saver_v3.data.config import RolloutTraceConfig, SaverAgentConfig
+from saver_v3.core.initial_observation import is_initial_global_scan_message
+from saver_v3.data.config import DEFAULT_ROLLOUT_MAX_TURNS, RolloutTraceConfig, SaverAgentConfig
 from saver_v3.core.environment import SaverVideoInteraction, parse_actions_and_contents
 from saver_v3.core.semantic_answer import (
     extract_decision_from_semantic_answer,
@@ -15,6 +16,7 @@ from saver_v3.core.semantic_answer import (
 )
 from saver_v3.core.schema import SaverEnvironmentState
 from saver_v3.core.self_verification import parse_self_verification_payload
+from saver_v3.core.self_verification import coerce_self_verification_claim_payload
 
 
 PolicyFn = Callable[[List[Dict[str, Any]], Dict[str, Any], SaverEnvironmentState, int], str]
@@ -224,7 +226,7 @@ class SaverRolloutRunner:
         *,
         environment: Optional[SaverVideoInteraction] = None,
         adapter: Optional[TimeSearchRolloutAdapter] = None,
-        max_turns: int = 14,
+        max_turns: int = DEFAULT_ROLLOUT_MAX_TURNS,
         config: Optional[SaverAgentConfig] = None,
     ):
         self.config = copy.deepcopy(config) if config is not None else SaverAgentConfig()
@@ -245,7 +247,7 @@ class SaverRolloutRunner:
         saw_finalize_recommendation = False
         for turn in turns:
             tool_name = str(turn.get("tool_name") or "")
-            if tool_name == "verify_hypothesis" and str(turn.get("verifier_recommended_action") or "") == "finalize":
+            if tool_name == "verify_hypothesis" and str(turn.get("verifier_next_tool") or "") == "finalize_case":
                 saw_finalize_recommendation = True
             elif tool_name == "finalize_case":
                 saw_finalize_recommendation = False
@@ -254,9 +256,17 @@ class SaverRolloutRunner:
     @staticmethod
     def _guardrail_tool_message(reason: str, *, tool_name: str) -> Dict[str, Any]:
         if reason == "repeated_search_signature":
+            recovery_scaffold = {
+                "blocked_reason": "repeated_search_signature",
+                "blocked_tool": str(tool_name or ""),
+                "required_transition": "change_search_or_transition",
+                "allowed_next_tools": ["seek_evidence", "verify_hypothesis", "finalize_case"],
+                "search_rule": "If you search again, change query or window.",
+            }
             prompt_text = (
                 f"Repeated search detected for {tool_name}. Do not repeat the exact same search signature. "
-                "Either change the query or window, or move on to verify_hypothesis/finalize_case."
+                "Either change the query or window, or move on to verify_hypothesis/finalize_case. "
+                f"Recovery scaffold: {json.dumps(recovery_scaffold, ensure_ascii=False, separators=(',', ':'))}"
             )
         elif reason == "search_after_finalize_recommendation":
             prompt_text = (
@@ -427,7 +437,8 @@ class SaverRolloutRunner:
             "invalid_attempts": context["invalid_attempts"],
             "state": asdict(context["state"]),
             "config_snapshot": self.config.to_dict(),
-            "preview_trace": self._build_preview_trace(context["multimodal_cache"]),
+            "initial_scan_trace": self._build_initial_scan_trace(turns),
+            "preview_trace": self._build_preview_trace(turns),
             "termination_trace": {
                 "reason": context["terminated_reason"],
                 "terminated_at_step": context["terminated_at_step"] if turns else 0,
@@ -537,7 +548,7 @@ class SaverRolloutRunner:
 
             for context, response_text in zip(ready_contexts, response_texts):
                 context["_response_text"] = response_text
-                actions, contents = parse_actions_and_contents([response_text])
+                actions, contents = parse_actions_and_contents([response_text], allow_answer=False)
                 action = actions[0]
                 parsed_content = contents[0]
                 context["_action"] = action
@@ -571,6 +582,7 @@ class SaverRolloutRunner:
                     env_multimodal_cache_batch,
                     env_states_batch,
                     [True] * len(env_ready_contexts),
+                    allow_answer=False,
                 )
                 for context, next_obs_entry, done_flag, valid_action_flag, is_search_flag, next_state in zip(
                     env_ready_contexts,
@@ -624,7 +636,7 @@ class SaverRolloutRunner:
                     "verifier_mode": None,
                     "verifier_backend": None,
                     "verifier_primary_status": None,
-                    "verifier_recommended_action": None,
+                    "verifier_next_tool": None,
                     "verifier_derived_scores": None,
                     "verifier_verified_window_ids": None,
                     "verifier_best_effort_window_ids": None,
@@ -632,6 +644,8 @@ class SaverRolloutRunner:
                     "verification_parse_mode": None,
                     "invalid_selected_window_ids": [],
                     "selection_resolution_source": None,
+                    "auto_heal_applied": False,
+                    "auto_heal_window_ids": [],
                     "self_verification_decision": None,
                     "self_verification_scores": None,
                     "self_verification_selected_window_ids": None,
@@ -664,11 +678,25 @@ class SaverRolloutRunner:
                 )
 
                 if action == "tool_call":
-                    turn_info["tool_name"] = parsed_content["function"]["name"]
-                    turn_info["parsed_tool_call"] = parsed_content["function"]
+                    parsed_tool_call = copy.deepcopy(parsed_content["function"])
+                    tool_name = str(parsed_tool_call.get("name") or "")
+                    arguments = dict(parsed_tool_call.get("arguments") or {})
+                    if tool_name == "verify_hypothesis" and "claim" in arguments:
+                        normalized_claim = coerce_self_verification_claim_payload(
+                            arguments.get("claim"),
+                            fallback_claim=context["state"].last_claim,
+                            require_category_for_anomaly=True,
+                        )
+                        if normalized_claim:
+                            arguments["claim"] = normalized_claim
+                        else:
+                            arguments.pop("claim", None)
+                        parsed_tool_call["arguments"] = arguments
+                    turn_info["tool_name"] = tool_name
+                    turn_info["parsed_tool_call"] = parsed_tool_call
                     turn_info["tool_signature"] = _canonical_search_signature(
-                        parsed_content["function"]["name"],
-                        parsed_content["function"].get("arguments") or {},
+                        tool_name,
+                        arguments,
                     )
                 elif action == "answer":
                     raw_answer_text = self.adapter.parse_answer_text(response_text)
@@ -701,14 +729,15 @@ class SaverRolloutRunner:
                         context["semantic_answer_text"] = None
                         context["semantic_answer_source"] = None
                         context["final_answer_source"] = None
-                        context["terminated_reason"] = "max_turns"
-                        context["terminated_at_step"] = self.max_turns
+                        context["terminated_reason"] = "invalid_answer"
+                        context["terminated_at_step"] = step_index
                     else:
                         if needs_state_delta and state_before is not None and state_after is not None:
                             state_delta = self._compute_state_delta(state_before, state_after)
                             turn_info["state_before"] = state_before
                             turn_info["state_after"] = state_after
                             turn_info["state_delta"] = state_delta
+                            turn_info["new_visited_windows"] = state_delta["new_visited_windows"]
                             turn_info["new_evidence_ids"] = [
                                 entry["evidence_id"] for entry in state_delta["new_evidence_windows"]
                             ]
@@ -759,6 +788,7 @@ class SaverRolloutRunner:
                     turn_info["state_before"] = state_before
                     turn_info["state_after"] = state_after
                     turn_info["state_delta"] = state_delta
+                    turn_info["new_visited_windows"] = state_delta["new_visited_windows"]
                     turn_info["new_evidence_ids"] = [
                         entry["evidence_id"] for entry in state_delta["new_evidence_windows"]
                     ]
@@ -872,11 +902,12 @@ class SaverRolloutRunner:
                 "tool_observation_summary": None,
                 "tool_timestamps": [],
                 "tool_image_count": 0,
+                "initial_global_scan": False,
                 "tool_observation_content": None,
                 "verifier_mode": None,
                 "verifier_backend": None,
                 "verifier_primary_status": None,
-                "verifier_recommended_action": None,
+                "verifier_next_tool": None,
                 "verifier_derived_scores": None,
                 "verifier_verified_window_ids": None,
                 "verifier_best_effort_window_ids": None,
@@ -884,6 +915,8 @@ class SaverRolloutRunner:
                 "verification_parse_mode": None,
                 "invalid_selected_window_ids": [],
                 "selection_resolution_source": None,
+                "auto_heal_applied": False,
+                "auto_heal_window_ids": [],
                 "self_verification_decision": None,
                 "self_verification_scores": None,
                 "self_verification_selected_window_ids": None,
@@ -912,14 +945,20 @@ class SaverRolloutRunner:
             "tool_observation_summary": tool_observation_summary,
             "tool_timestamps": tool_timestamps,
             "tool_image_count": tool_image_count,
+            "initial_global_scan": is_initial_global_scan_message(tool_message),
             "verifier_mode": None,
             "verifier_backend": None,
             "verifier_primary_status": None,
-            "verifier_recommended_action": None,
+            "verifier_next_tool": None,
             "verifier_derived_scores": None,
             "verifier_verified_window_ids": None,
             "verifier_best_effort_window_ids": None,
             "verifier_failure_reasons": None,
+            "verification_parse_mode": None,
+            "invalid_selected_window_ids": [],
+            "selection_resolution_source": None,
+            "auto_heal_applied": False,
+            "auto_heal_window_ids": [],
             "self_verification_decision": None,
             "self_verification_scores": None,
             "self_verification_selected_window_ids": None,
@@ -937,7 +976,7 @@ class SaverRolloutRunner:
                     "verifier_mode": normalized_payload.get("verification_mode"),
                     "verifier_backend": normalized_payload.get("verifier_backend"),
                     "verifier_primary_status": normalized_payload.get("primary_status"),
-                    "verifier_recommended_action": normalized_payload.get("recommended_action"),
+                    "verifier_next_tool": normalized_payload.get("next_tool"),
                     "verifier_derived_scores": normalized_payload.get("derived_scores"),
                     "verifier_verified_window_ids": normalized_payload.get("verified_window_ids"),
                     "verifier_best_effort_window_ids": normalized_payload.get("best_effort_window_ids"),
@@ -945,6 +984,8 @@ class SaverRolloutRunner:
                     "verification_parse_mode": normalized_payload.get("verification_parse_mode"),
                     "invalid_selected_window_ids": list(normalized_payload.get("invalid_selected_window_ids") or []),
                     "selection_resolution_source": normalized_payload.get("selection_resolution_source"),
+                    "auto_heal_applied": bool(normalized_payload.get("auto_heal_applied")),
+                    "auto_heal_window_ids": list(normalized_payload.get("auto_heal_window_ids") or []),
                     "self_verification_decision": normalized_payload.get("verification_decision"),
                     "self_verification_scores": normalized_payload.get("self_verification_scores")
                     or normalized_payload.get("derived_scores"),
@@ -960,12 +1001,43 @@ class SaverRolloutRunner:
         return summary
 
     @staticmethod
-    def _build_preview_trace(multimodal_cache: Dict[str, Any]) -> Dict[str, Any]:
-        preview_frames = multimodal_cache.get("preview_frames")
-        preview_timestamps = multimodal_cache.get("preview_timestamps") or []
-        preview_frame_count = 0 if preview_frames is None else int(len(preview_frames))
+    def _build_initial_scan_trace(turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for turn in turns:
+            if not bool(turn.get("initial_global_scan")):
+                continue
+            parsed_tool_call = dict(turn.get("parsed_tool_call") or {})
+            arguments = dict(parsed_tool_call.get("arguments") or {})
+            new_visited_windows = list(turn.get("new_visited_windows") or [])
+            latest_window = dict(new_visited_windows[-1] or {}) if new_visited_windows else {}
+            return {
+                "tool_name": str(turn.get("tool_name") or ""),
+                "step_index": int(turn.get("step_index") or 0),
+                "window_id": str(latest_window.get("window_id") or ""),
+                "start_sec": latest_window.get("start_sec", arguments.get("start_sec")),
+                "end_sec": latest_window.get("end_sec", arguments.get("end_sec")),
+                "purpose": str(arguments.get("purpose") or latest_window.get("query") or ""),
+                "selected_timestamps": list(latest_window.get("selected_timestamps") or []),
+                "frame_count": int(latest_window.get("selected_frame_count") or turn.get("tool_image_count") or 0),
+                "tool_timestamps": list(turn.get("tool_timestamps") or []),
+            }
         return {
-            "preview_frame_count": preview_frame_count,
+            "tool_name": "",
+            "step_index": 0,
+            "window_id": "",
+            "start_sec": None,
+            "end_sec": None,
+            "purpose": "",
+            "selected_timestamps": [],
+            "frame_count": 0,
+            "tool_timestamps": [],
+        }
+
+    @staticmethod
+    def _build_preview_trace(turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        initial_scan_trace = SaverRolloutRunner._build_initial_scan_trace(turns)
+        preview_timestamps = list(initial_scan_trace.get("selected_timestamps") or initial_scan_trace.get("tool_timestamps") or [])
+        return {
+            "preview_frame_count": int(initial_scan_trace.get("frame_count") or 0),
             "preview_timestamps": preview_timestamps,
         }
 

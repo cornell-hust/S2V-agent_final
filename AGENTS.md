@@ -68,14 +68,14 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
 
 ### RL Runtime Note
 
-- As of 2026-04-17, the default RL DeepSpeed config should be `configs/deepspeed/zero2_rl.json`.
+- As of 2026-04-24, the default RL DeepSpeed config should be `configs/deepspeed/zero3_full_model.json`.
 - As of the current RL config, `gradient_accumulation_steps` for the active 3-GPU setup is `22`.
-- Optional RL memory-pressure fallback: `configs/deepspeed/zero2_cpuoffload_rl.json`.
-  Use it only when `zero2_rl.json` still exceeds memory; expect it to be slower than plain Zero2 because optimizer state is offloaded to CPU.
-- As of 2026-04-17, the default RL `keep_recent_tool_image_messages` should be `3`, with a special rule:
-  preserve the latest `scan_timeline` image tool message inside this budget, and use the remaining slots for the most recent other image-bearing tool messages.
-- As of 2026-04-17, active RL should not use `severity` or `counterfactual_type` as part of its output contract, reward computation, or FECV semantics.
-  Preserve broad compatibility when reading old artifacts that still contain these fields, but treat them as ignored by active RL training.
+- Optional RL memory-pressure fallback: `configs/deepspeed/zero3_offload_rl.json`.
+  Use it only when `zero3_full_model.json` still exceeds memory; expect it to be slower than plain ZeRO-3 because parameters and optimizer state are offloaded to CPU.
+- As of 2026-04-17, the default RL `keep_recent_tool_image_messages` should be `3`.
+  The protected canonical initial scan is retained separately; this budget then prioritizes the latest `scan_timeline` image tool message and uses the remaining slots for the most recent other image-bearing tool messages.
+- As of the active v5 contract, training and inference do not use `severity`, `counterfactual_type`, or any FECV / counterfactual-faithfulness semantics.
+  Old artifacts should be treated as legacy and rejected by active entrypoints rather than silently reused.
 
 ### Data Prep File Map
 
@@ -89,12 +89,15 @@ Current official preprocessing outputs under `data_utils/`:
 
 - `msad_saver_runtime_train.jsonl` — runtime train input for RL and compact-trace preparation.
 - `msad_saver_runtime_test.jsonl` — runtime test input for rollout eval / RL eval.
-- `sft_train.compact_trace_v2.jsonl` — base prepared SFT file.
-- `sft_train.teacher_rollout_primary.compact_trace_v2.jsonl` — teacher-judge prepared SFT file.
-- `sft_train.compact_trace_v2.materialized_messages_v1.jsonl` — offline SFT messages cache.
-- `msad_saver_runtime_train.materialized_items_v1.jsonl` — offline runtime-items cache for RL train.
-- `msad_saver_runtime_test.materialized_items_v1.jsonl` — offline runtime-items cache for rollout eval / RL eval.
+- `sft_train.compact_trace_v5.jsonl` — base prepared SFT file.
+- `sft_train.teacher_rollout_primary.compact_trace_v5.jsonl` — teacher-judge prepared SFT file.
+- `sft_train.compact_trace_v5.materialized_messages_v5.jsonl` — offline base `materialized_sft_messages_v5` cache.
+- `sft_train.compact_trace_v5.teacher_materialized_messages_v5.jsonl` — offline teacher `materialized_sft_messages_v5` cache used by the default SFT path.
+- `msad_saver_runtime_train.materialized_items_v5.jsonl` — offline `materialized_runtime_items_v5` cache for RL train.
+- `msad_saver_runtime_test.materialized_items_v5.jsonl` — offline `materialized_runtime_items_v5` cache for rollout eval / RL eval.
 - `*.meta.json` and `*.summary.json` sidecars next to the prepared/materialized files — provenance, validation, and summary metadata.
+- Active verify payloads must use `next_tool`; legacy `recommended_action` / `verifier_recommended_action` are rejected.
+- Active data / cache / eval / RL artifacts must share the same v5 `protocol_signature`: `explicit_first_scan`, main-rollout `finalize_case_only`, verifier `next_tool_only`, `max_turns=10`, and `policy_max_new_tokens=1024`.
 
 ### Data Prep Command Ownership
 
@@ -124,6 +127,7 @@ Current official preprocessing outputs under `data_utils/`:
 - `refine-logs/EXPERIMENT_PLAN.md` — experiment planning scratch artifact.
 - For code analysis or experiment-result analysis, fetch the latest experiment logs from the server-side artifacts tree at `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/artifacts`.
 - The local Mac workspace does not contain authoritative experiment logs for this project; do not treat local files as the log source of truth.
+- Artifact protection rule: without explicit user approval, do not delete, overwrite, move, or use bulk sync with deletion semantics against any path under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/artifacts`.
 
 ### Documentation Sync Rule
 
@@ -198,6 +202,7 @@ export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 - Default edit path: modify the local mirror first, then immediately upload the modified file to the matching server-side project path under `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3`.
 - Stable-connection exception: if the SSH/session is stable and direct server-side editing is more practical, it is valid to edit the server copy first, but immediately after that change you must download the modified file back into the matching local mirror path.
 - When uploading to or downloading from the server project, obey that project's `.gitignore` rules. Do not sync files that are intentionally ignored on the server side.
+- Never use `rsync --delete` or any equivalent bulk-delete sync against the server project root or its `artifacts/` subtree unless the user explicitly approves that deletion scope.
 - Keep the local mirror and the server copy aligned at all times. Do not leave local-only edits or server-only edits pending across turns.
 - If a server-side file changes first for any reason, sync that change back into the local mirror before making further edits so the two trees remain identical.
 - When reporting work, assume `/Users/cornell/Desktop/ssh_worker/AgenticVAU/code` is the primary inspection and planning surface, while `/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3` is the execution-side copy that must stay synchronized with local.
@@ -234,7 +239,7 @@ Data Prep ──→ SFT (3 epochs, per-epoch eval) ──→ RL (GRPO+FECV) ─�
 
 #### Stage 0: Data Preparation
 
-**Purpose:** Convert raw annotations → SFT training format (compact_trace_v2).
+**Purpose:** Convert raw annotations → SFT training format (`compact_trace_v5`).
 
 ```bash
 # Convert raw MSAD/ECVA → canonical runtime format
@@ -244,11 +249,11 @@ python convert_to_saver_agent.py \
   --mode oracle_sft \
   --output data_utils/msad_saver_sft_train.jsonl
 
-# Prepare SFT manifest (compact_trace_v2)
+# Prepare SFT manifest (compact_trace_v5)
 bash scripts/prepare_sft_manifest.sh --run
 ```
 
-**Verify:** `data_utils/sft_train.compact_trace_v2.jsonl` and `data_utils/runtime_test.jsonl` exist and are non-empty.
+**Verify:** `data_utils/sft_train.compact_trace_v5.jsonl` and `data_utils/msad_saver_runtime_test.jsonl` exist and are non-empty.
 
 #### Stage 1: SFT Training
 
@@ -257,7 +262,7 @@ bash scripts/prepare_sft_manifest.sh --run
 ```bash
 # Config: configs/sft/qwen3_vl_8b_full_train.yaml
 # Key fields to check/modify:
-#   data.prepared_data_path → sft_train.compact_trace_v2.jsonl
+#   data.prepared_data_path → sft_train.compact_trace_v5.jsonl
 #   optimization.epochs → 3
 #   output_dir → artifacts/<EXP_NAME>/sft
 
@@ -277,7 +282,7 @@ bash scripts/train_sft_qwen3_vl_8b_ds8.sh --run
 # Config: configs/rollout_eval/vllm_qwen3_vl_8b.yaml
 # Key fields:
 #   base_model → path to SFT checkpoint
-#   io.data_path → data_utils/runtime_test.jsonl
+#   io.data_path → data_utils/msad_saver_runtime_test.jsonl
 #   io.output_dir → artifacts/<EXP_NAME>/eval/sft_epoch_N
 
 bash scripts/run_sft_rollout_eval_vllm.sh --run
@@ -285,16 +290,16 @@ bash scripts/run_sft_rollout_eval_vllm.sh --run
 
 **Output:** `metrics.json` + `semantic_metrics.json` in output directory.
 
-#### Stage 3: RL Training (GRPO + FECV)
+#### Stage 3: RL Training (GRPO, stage-verified reward)
 
-**Purpose:** Reinforce evidence-faithful behavior via FECV-grounded rewards.
+**Purpose:** Reinforce stage-complete, protocol-consistent behavior via the active `timesearch_v4` reward.
 
 ```bash
 # Config: configs/rl/qwen3_vl_8b_grpo_train.yaml
 # Key fields:
 #   policy_init_from → best SFT checkpoint (from Stage 2)
-#   data.train_manifest → data_utils/runtime_train.jsonl (or runtime_test.jsonl for RL data)
-#   rewards.reward_version → timesearch_v3
+#   data.train_manifest → data_utils/msad_saver_runtime_train.jsonl
+#   rewards.reward_version → timesearch_v4
 
 bash scripts/train_rl_qwen3_vl_8b_ds8.sh --run
 ```

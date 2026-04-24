@@ -11,14 +11,14 @@ from saver_v3.core.tool_registry import execute_tool_call
 INVALID_TOOL_CALL_PROMPT = (
     "The previous response is invalid. Retry immediately with exactly one of these formats: "
     '<tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0}}</tool_call> '
-    'or <tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"final_check","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"verification_decision":"insufficient","recommended_action":"continue_search","sufficiency_score":0.3,"necessity_score":0.3,"finalize_readiness_score":0.2,"counterfactual_faithfulness":0.3}}</tool_call> '
-    "Do not output the terminal answer unless the latest observation explicitly requested it. "
+    'or <tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"final_check","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"verification_decision":"insufficient","next_tool":"seek_evidence","sufficiency_score":0.3,"necessity_score":0.3,"finalize_readiness_score":0.2}}</tool_call> '
+    "Do not output <answer>. The main rollout ends only through finalize_case. "
     "Do not describe the intended tool call in plain English. Do not output bare tool names."
 )
 INVALID_ANSWER_PROMPT = (
-    "The previous <answer> payload is invalid. Retry immediately with exactly one structured JSON object "
-    'inside <answer></answer>, for example <answer>{"decision":{"existence":"normal","category":"normal"},"summary":"No anomaly found.","event_chain_summary":{"precursor":"","trigger":"","confirmation":""},"qa_focus_answers":{"existence":"No. No anomaly is visible in this video.","category":"The video is normal.","temporal":"There is no anomaly interval in this video."}}</answer>. '
-    "Do not output plain text inside <answer>. Do not describe the answer in prose."
+    "The main rollout does not accept answer blocks. Retry immediately with exactly one <tool_call>{...}</tool_call>. "
+    "If the gathered evidence is already sufficient, call finalize_case. Otherwise call seek_evidence or verify_hypothesis. "
+    "Do not output an answer block. Do not describe the intended tool call in plain English."
 )
 OPTIONAL_FINALIZE_SEMANTIC_FIELDS = (
     "summary",
@@ -62,16 +62,23 @@ def _verify_retry_prompt(state: SaverEnvironmentState | None = None) -> str:
         "verification_mode": "final_check",
         "selected_window_ids": selected_window_ids,
         "verification_decision": "insufficient",
-        "recommended_action": "continue_search",
+        "next_tool": "seek_evidence",
         "sufficiency_score": 0.3,
         "necessity_score": 0.3,
         "finalize_readiness_score": 0.2,
-        "counterfactual_faithfulness": 0.3,
     }
+    if evidence_window_ids:
+        example_arguments["candidate_window_ids"] = evidence_window_ids[:4]
+    known_windows_text = (
+        f" Known evidence windows right now: {', '.join(evidence_window_ids[:8])}."
+        if evidence_window_ids
+        else ""
+    )
     return (
         "The previous verify_hypothesis call was invalid. Retry immediately with exactly one "
         f'<tool_call>{{"name":"verify_hypothesis","arguments":{json.dumps(example_arguments, ensure_ascii=False, separators=(",", ":"))}}}</tool_call>. '
         "selected_window_ids must reference currently available evidence windows. "
+        f"{known_windows_text}"
         "Do not output <answer> yet. Do not describe the intended tool call in plain English."
     )
 
@@ -95,7 +102,12 @@ def invalid_tool_call_message(
     }
 
 
-def invalid_answer_message() -> Dict[str, Any]:
+def invalid_answer_message(
+    *,
+    multimodal_cache: Dict[str, Any] | None = None,
+    state: SaverEnvironmentState | None = None,
+) -> Dict[str, Any]:
+    del multimodal_cache, state
     return {
         "role": "tool",
         "name": "parse_error",
@@ -138,8 +150,6 @@ def _normalize_tool_arguments(name: str, arguments: Dict[str, Any]) -> Dict[str,
         normalized["start_sec"] = _parse_sec_value(normalized["start_sec"])
     if "end_sec" in normalized:
         normalized["end_sec"] = _parse_sec_value(normalized["end_sec"])
-    if "earliest_actionable_sec" in normalized:
-        normalized["earliest_actionable_sec"] = _parse_sec_value(normalized["earliest_actionable_sec"])
     if "earliest_alert_sec" in normalized:
         normalized["earliest_alert_sec"] = _parse_sec_value(normalized["earliest_alert_sec"])
     return normalized
@@ -281,7 +291,11 @@ def _extract_open_structured_fragment(prediction: str) -> Tuple[str | None, str]
     return latest_tag, prediction[content_start:].strip()
 
 
-def parse_actions_and_contents(predictions: List[Any]) -> Tuple[List[str | None], List[Any]]:
+def parse_actions_and_contents(
+    predictions: List[Any],
+    *,
+    allow_answer: bool = True,
+) -> Tuple[List[str | None], List[Any]]:
     actions: List[str | None] = []
     contents: List[Any] = []
     for prediction in predictions:
@@ -295,6 +309,10 @@ def parse_actions_and_contents(predictions: List[Any]) -> Tuple[List[str | None]
             if fallback_action is None:
                 actions.append(None)
                 contents.append("")
+                continue
+            if fallback_action == "answer" and not allow_answer:
+                actions.append("invalid_answer")
+                contents.append(fallback_content.strip())
                 continue
             match = (fallback_action, fallback_content)
         action = match[0]
@@ -318,6 +336,10 @@ def parse_actions_and_contents(predictions: List[Any]) -> Tuple[List[str | None]
                 actions.append("tool_call")
                 contents.append({"type": "function", "function": func})
         else:
+            if not allow_answer:
+                actions.append("invalid_answer")
+                contents.append(content)
+                continue
             payload = _parse_answer_payload(content)
             if payload is None:
                 actions.append("invalid_answer")
@@ -337,9 +359,11 @@ class SaverVideoInteraction:
         multimodal_cache_batch: List[Dict[str, Any]],
         states: List[SaverEnvironmentState],
         active_mask: List[bool],
+        *,
+        allow_answer: bool = True,
     ) -> Tuple[List[Any], List[int], List[int], List[int], List[SaverEnvironmentState]]:
         cleaned = [cleanup_llm_response(prediction) for prediction in predictions]
-        actions, contents = parse_actions_and_contents(cleaned)
+        actions, contents = parse_actions_and_contents(cleaned, allow_answer=allow_answer)
 
         next_obs: List[Any] = []
         dones: List[int] = []
@@ -367,7 +391,7 @@ class SaverVideoInteraction:
                 continue
 
             if action == "invalid_answer":
-                next_obs.append(invalid_answer_message())
+                next_obs.append(invalid_answer_message(multimodal_cache=multimodal_cache, state=state))
                 dones.append(0)
                 valid_actions.append(0)
                 is_search.append(0)

@@ -11,7 +11,7 @@ server:
   gpu_memory_utilization: 0.15
 
 client:
-  max_tokens: 512
+  max_tokens: 1024
   max_total_images: 28
   max_seq_length: 8192
   keep_recent_text_messages: 20
@@ -22,6 +22,13 @@ client:
   top_p: 1.0
   top_k: -1
   guided_decoding_regex: ""
+
+initial_observation:
+  mode: explicit_first_scan
+  scan_num_frames: 8
+  scan_purpose: global_overview
+  protect_from_visual_budget: true
+  error_on_seq_prune: true
 
 io:
   data_path: /abs/path/to/raw_saver_agent_eval.jsonl
@@ -36,7 +43,7 @@ evaluation:
   rollout_batch_size: 4
   progress_every: 10
   enable_semantic_replay: true
-  semantic_replay_max_new_tokens: 512
+  semantic_replay_max_new_tokens: 1024
 
 proposal:
   model_path: /abs/path/to/proposal_model
@@ -57,6 +64,7 @@ semantic_metrics:
   metrics:
     - qa_accuracy
     - bertscore
+  bertscore_model_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/roberta-large
   judge_base_url: ""
   judge_model: ""
   judge_cache_path: ""

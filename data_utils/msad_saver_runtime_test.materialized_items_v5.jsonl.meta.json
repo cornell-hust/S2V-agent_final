@@ -1,0 +1,58 @@
+{
+  "config": {
+    "initial_observation": {
+      "error_on_seq_prune": true,
+      "mode": "explicit_first_scan",
+      "protect_from_visual_budget": true,
+      "scan_num_frames": 8,
+      "scan_purpose": "global_overview"
+    },
+    "prompt": {
+      "explicit_first_scan_instruction": "Before any targeted search or verification, call scan_timeline once over the initial scan window with purpose=\"global_overview\" to build the canonical first observation. Use that overview to decide the next search or verification step.",
+      "initial_user_template": "Case ID: {public_case_id}\nScene: {scene}\nDuration (sec): {duration}\nTask: {task_prompt}\nSuccess Criteria:\n{criteria_text}",
+      "tool_response_template": "Selected frames: {timestamps}.\nChoose exactly one next step.\nUsually call seek_evidence for another stage or verify_hypothesis to judge sufficiency.\nCall finalize_case only when the gathered evidence is already sufficient.\nWhen finalizing, prioritize a compact finalize_case that closes cleanly.\nIf optional summary, rationale, event_chain_summary, or qa_focus_answers would make the tool call too long, omit them.\nDo not answer before finalize_case returns."
+    },
+    "rollout_trace": {
+      "record_counterfactual_trace": true,
+      "record_message_history": true,
+      "record_observation_content": false,
+      "record_state_deltas": true
+    }
+  },
+  "data_root": "/mnt/shared-storage-user/mineru2-shared/zengweijun",
+  "include_splits": [
+    "test"
+  ],
+  "input_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_test.jsonl",
+  "materialized_format": "materialized_runtime_items_v5",
+  "mode": "runtime",
+  "num_records": 240,
+  "proposal_device": "",
+  "proposal_model_path": "",
+  "proposal_torch_dtype": "auto",
+  "protocol_signature": {
+    "generator_fingerprint": "68369fa86849effdf8e64bc89a4497ecc9476738ef90acfec2a0b161cfd7bfd3",
+    "generator_revision": "2026-04-23-active-contract-v5",
+    "initial_observation_mode": "explicit_first_scan",
+    "main_rollout_terminal_mode": "finalize_case_only",
+    "max_turns": 10,
+    "policy_max_new_tokens": 1024,
+    "protocol_version": "seek_v5",
+    "signature_schema_version": 1,
+    "teacher_role": "none",
+    "verifier_contract": "next_tool_only"
+  },
+  "schema_version": 6,
+  "source_jsonl": {
+    "file_size": 3740071,
+    "include_splits": [
+      "test"
+    ],
+    "mtime_ns": 1776939916402922520,
+    "num_records": 240,
+    "path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_test.jsonl",
+    "resolved_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_test.jsonl",
+    "sha256": "a787f1819c0fdd06b08f14998b8c21aaae9b81dfa7d36b3390dccbe32c602ab6",
+    "validation_mode": "canonical_jsonl"
+  }
+}

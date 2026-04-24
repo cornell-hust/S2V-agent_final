@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
-from saver_v3.core.categories import CANONICAL_POLICY_CATEGORIES, validate_canonical_category_payload
+from saver_v3.core.categories import (
+    CANONICAL_POLICY_CATEGORIES,
+    canonicalize_saver_category,
+    normalize_existence,
+)
 from saver_v3.core.protocol_guidance import (
     EVENT_CHAIN_STAGES,
     build_stage_selected_moment_ids_schema,
@@ -10,15 +15,21 @@ from saver_v3.core.protocol_guidance import (
     normalize_stage_selected_moment_ids,
 )
 
+_REMOVED_CLAIM_FIELDS = (
+    "severity",
+    "counterfactual_type",
+    "counterfactual_faithfulness",
+    "precursor_interval_sec",
+    "earliest_actionable_sec",
+)
+
 SELF_VERIFICATION_DECISIONS = {"insufficient", "sufficient", "misaligned", "redundant"}
-SELF_VERIFICATION_ACTIONS = {"continue_search", "revise_claim", "refine_evidence", "finalize"}
+SELF_VERIFICATION_NEXT_TOOLS = {"seek_evidence", "finalize_case"}
 SELF_VERIFICATION_MODES = {
     "final_check",
-    "full_keep_drop",
-    "reward_only",
-    "search_step_check",
+    "stage_check",
 }
-PUBLIC_SELF_VERIFICATION_MODES = SELF_VERIFICATION_MODES - {"search_step_check"}
+PUBLIC_SELF_VERIFICATION_MODES = SELF_VERIFICATION_MODES
 LEGACY_VERIFICATION_MODE_ALIASES = {
     "normal_check": "final_check",
     "declare_normal": "final_check",
@@ -35,16 +46,15 @@ DECISION_TO_PRIMARY_STATUS = {
     "misaligned": "misaligned",
     "redundant": "redundant",
 }
-POLICY_SELF_VERIFICATION_CLAIM_KEYS = ("existence", "category", "earliest_actionable_sec")
+POLICY_SELF_VERIFICATION_CLAIM_KEYS = ("existence", "category")
 POLICY_SELF_VERIFICATION_REQUIRED_FIELDS = (
     "verification_mode",
     "selected_window_ids",
     "verification_decision",
-    "recommended_action",
+    "next_tool",
     "sufficiency_score",
     "necessity_score",
     "finalize_readiness_score",
-    "counterfactual_faithfulness",
 )
 
 
@@ -60,6 +70,58 @@ def _compact_payload_object(payload: Dict[str, Any], *, keys: tuple[str, ...]) -
             continue
         compact[key] = value
     return compact
+
+
+def _drop_removed_claim_fields(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    for field_name in _REMOVED_CLAIM_FIELDS:
+        normalized.pop(field_name, None)
+    return normalized
+
+
+def _normalize_self_verification_claim_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _drop_removed_claim_fields(dict(payload or {}))
+    existence = normalize_existence(normalized.get("existence"))
+    if existence:
+        normalized["existence"] = existence
+    else:
+        normalized.pop("existence", None)
+    if "category" in normalized:
+        category = str(
+            canonicalize_saver_category(
+                normalized.get("category"),
+                existence=normalized.get("existence"),
+            )
+            or ""
+        ).strip()
+        if category:
+            normalized["category"] = category
+        else:
+            normalized.pop("category", None)
+    return normalized
+
+
+def coerce_self_verification_claim_payload(
+    payload: Any,
+    *,
+    fallback_claim: Optional[Dict[str, Any]] = None,
+    require_category_for_anomaly: bool = False,
+) -> Dict[str, Any]:
+    del require_category_for_anomaly
+    candidate = payload
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            candidate = parsed if isinstance(parsed, dict) else None
+        else:
+            candidate = None
+    if not isinstance(candidate, dict):
+        candidate = fallback_claim if isinstance(fallback_claim, dict) else {}
+    return _normalize_self_verification_claim_fields(dict(candidate or {}))
 
 
 def _coerce_string_list(value: Any) -> List[str]:
@@ -91,37 +153,44 @@ def _normalize_decision(payload: Dict[str, Any]) -> str:
     return PRIMARY_STATUS_TO_DECISION.get(primary_status, "insufficient")
 
 
-def _normalize_action(payload: Dict[str, Any], decision: str) -> str:
-    action = str(payload.get("recommended_action") or "").strip().lower()
-    if action in SELF_VERIFICATION_ACTIONS:
-        return action
+def _normalize_next_tool(payload: Dict[str, Any], decision: str) -> str:
+    if "recommended_action" in payload and "next_tool" not in payload:
+        raise ValueError(
+            "verify_hypothesis self-verification payload uses legacy field `recommended_action`. "
+            "Regenerate the payload with `next_tool`."
+        )
+    next_tool = str(payload.get("next_tool") or "").strip().lower()
+    if next_tool:
+        if next_tool not in SELF_VERIFICATION_NEXT_TOOLS:
+            raise ValueError(
+                "verify_hypothesis self-verification payload has invalid `next_tool`: "
+                f"{next_tool}. Expected one of {sorted(SELF_VERIFICATION_NEXT_TOOLS)}."
+            )
+        return next_tool
     if decision == "sufficient":
-        return "finalize"
-    if decision == "misaligned":
-        return "revise_claim"
-    if decision == "redundant":
-        return "refine_evidence"
-    return "continue_search"
+        return "finalize_case"
+    return "seek_evidence"
 
 
 def normalize_self_verification_mode(
     value: Any,
     *,
-    default: str = "reward_only",
+    default: str = "stage_check",
     public_only: bool = False,
 ) -> str:
     text = str(value or "").strip().lower()
     if text in LEGACY_VERIFICATION_MODE_ALIASES:
         return LEGACY_VERIFICATION_MODE_ALIASES[text]
-    if public_only and text == "search_step_check":
-        text = "full_keep_drop"
+    if text in {"full_keep_drop", "reward_only", "search_step_check"}:
+        raise ValueError(
+            f"Legacy verification_mode `{text}` is no longer supported in the active v5 contract. "
+            "Use `stage_check` or `final_check`."
+        )
     if text in SELF_VERIFICATION_MODES:
         return text
-    fallback = str(default or "reward_only").strip().lower() or "reward_only"
+    fallback = str(default or "stage_check").strip().lower() or "stage_check"
     if fallback in LEGACY_VERIFICATION_MODE_ALIASES:
         fallback = LEGACY_VERIFICATION_MODE_ALIASES[fallback]
-    if public_only and fallback == "search_step_check":
-        fallback = "full_keep_drop"
     return fallback
 
 
@@ -140,12 +209,12 @@ def parse_self_verification_payload(
     payload: Dict[str, Any],
     *,
     fallback_claim: Optional[Dict[str, Any]] = None,
-    verification_mode: str = "reward_only",
+    verification_mode: str = "stage_check",
 ) -> Dict[str, Any]:
     payload = dict(payload or {})
-    claim = validate_canonical_category_payload(
-        dict(payload.get("claim") or fallback_claim or {}),
-        payload_name="claim",
+    claim = coerce_self_verification_claim_payload(
+        payload.get("claim"),
+        fallback_claim=fallback_claim,
         require_category_for_anomaly=True,
     )
     verification_mode_normalized = normalize_self_verification_mode(
@@ -156,19 +225,13 @@ def parse_self_verification_payload(
 
     decision = _normalize_decision(payload)
     primary_status = DECISION_TO_PRIMARY_STATUS.get(decision, "incomplete")
-    recommended_action = _normalize_action(payload, decision)
+    next_tool = _normalize_next_tool(payload, decision)
 
     derived_scores_in = dict(payload.get("derived_scores") or {})
     sufficiency = _coerce_score(payload.get("sufficiency_score", derived_scores_in.get("sufficiency", 0.0)))
     necessity = _coerce_score(payload.get("necessity_score", derived_scores_in.get("necessity", 0.0)))
     finalize_readiness = _coerce_score(
         payload.get("finalize_readiness_score", derived_scores_in.get("finalize_readiness", 0.0))
-    )
-    counterfactual_faithfulness = _coerce_score(
-        payload.get(
-            "counterfactual_faithfulness",
-            derived_scores_in.get("counterfactual_faithfulness", 0.0),
-        )
     )
     consistency = _coerce_score(
         derived_scores_in.get("consistency", 1.0 - abs(sufficiency - necessity) if (sufficiency or necessity) else 0.0)
@@ -178,7 +241,6 @@ def parse_self_verification_payload(
         "necessity": round(necessity, 6),
         "consistency": round(consistency, 6),
         "finalize_readiness": round(finalize_readiness, 6),
-        "counterfactual_faithfulness": round(counterfactual_faithfulness, 6),
     }
 
     selected_window_ids = _coerce_string_list(
@@ -218,7 +280,7 @@ def parse_self_verification_payload(
         "selected_evidence_ids": selected_evidence_ids,
         "selected_evidence_moment_ids": selected_evidence_moment_ids,
         "verification_decision": decision,
-        "recommended_action": recommended_action,
+        "next_tool": next_tool,
         "rationale": str(payload.get("rationale") or payload.get("explanation") or ""),
         "primary_status": primary_status,
         "derived_scores": derived_scores,
@@ -236,8 +298,23 @@ def parse_self_verification_payload(
     return parsed
 
 
-def validate_policy_self_verification_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def validate_policy_self_verification_payload(
+    payload: Dict[str, Any],
+    *,
+    fallback_claim: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     normalized = dict(payload or {})
+    if "claim" in normalized:
+        normalized["claim"] = coerce_self_verification_claim_payload(
+            normalized.get("claim"),
+            fallback_claim=fallback_claim,
+            require_category_for_anomaly=True,
+        )
+    if "recommended_action" in normalized and "next_tool" not in normalized:
+        raise ValueError(
+            "verify_hypothesis self-verification payload uses legacy field `recommended_action`. "
+            "Regenerate the payload with `next_tool`."
+        )
     missing = [
         field_name
         for field_name in POLICY_SELF_VERIFICATION_REQUIRED_FIELDS
@@ -264,32 +341,29 @@ def build_policy_self_verification_payload(
 ) -> Dict[str, Any]:
     source = dict(payload or {})
     decision = _normalize_decision(source)
-    recommended_action = _normalize_action(source, decision)
+    next_tool = _normalize_next_tool(source, decision)
     compact: Dict[str, Any] = {
         "verification_mode": normalize_self_verification_mode(
             source.get("verification_mode"),
-            default="reward_only",
+            default="stage_check",
             public_only=True,
         ),
         "verification_decision": decision,
-        "recommended_action": recommended_action,
+        "next_tool": next_tool,
         "sufficiency_score": round(_coerce_score(source.get("sufficiency_score")), 6),
         "necessity_score": round(_coerce_score(source.get("necessity_score")), 6),
         "finalize_readiness_score": round(
             _coerce_score(source.get("finalize_readiness_score"))
         ),
-        "counterfactual_faithfulness": round(_coerce_score(source.get("counterfactual_faithfulness")), 6),
     }
 
-    claim = source.get("claim")
-    if isinstance(claim, dict) and claim:
-        normalized_claim = validate_canonical_category_payload(
-            dict(claim),
-            payload_name="claim",
-            require_category_for_anomaly=True,
-        )
+    claim = coerce_self_verification_claim_payload(
+        source.get("claim"),
+        require_category_for_anomaly=True,
+    )
+    if claim:
         compact_claim = _compact_payload_object(
-            normalized_claim,
+            claim,
             keys=POLICY_SELF_VERIFICATION_CLAIM_KEYS,
         )
         if compact_claim:
@@ -340,7 +414,6 @@ def build_self_verification_tool_schema() -> Dict[str, Any]:
         "properties": {
             "existence": {"type": "string", "enum": ["normal", "anomaly"]},
             "category": {"type": "string", "enum": list(CANONICAL_POLICY_CATEGORIES)},
-            "earliest_actionable_sec": {"oneOf": [{"type": "null"}, {"type": "number"}]},
         },
     }
     return {
@@ -362,11 +435,10 @@ def build_self_verification_tool_schema() -> Dict[str, Any]:
             "claim": claim_schema,
             "query": {"type": "string"},
             "verification_decision": {"type": "string", "enum": sorted(SELF_VERIFICATION_DECISIONS)},
-            "recommended_action": {"type": "string", "enum": sorted(SELF_VERIFICATION_ACTIONS)},
+            "next_tool": {"type": "string", "enum": sorted(SELF_VERIFICATION_NEXT_TOOLS)},
             "sufficiency_score": {"type": "number"},
             "necessity_score": {"type": "number"},
             "finalize_readiness_score": {"type": "number"},
-            "counterfactual_faithfulness": {"type": "number"},
             "rationale": {"type": "string"},
         },
         "required": list(POLICY_SELF_VERIFICATION_REQUIRED_FIELDS),

@@ -6,7 +6,7 @@ attention_config: configs/model/attention_fa3_only.yaml
 deepspeed_config: configs/deepspeed/zero3_full_model.json
 
 data:
-  prepared_data_path: /abs/path/to/sft_train.compact_trace_v2.jsonl
+  prepared_data_path: /abs/path/to/sft_train.compact_trace_v5.jsonl
   include_splits: train
   num_workers: 8
   dataloader_prefetch_factor: 2
@@ -17,10 +17,12 @@ proposal:
   torch_dtype: auto
   device: ""
 
-preview:
-  num_preview_frames: 8
-  preview_sampling_fps: null
-  max_preview_frames: 8
+initial_observation:
+  mode: explicit_first_scan
+  scan_num_frames: 8
+  scan_purpose: global_overview
+  protect_from_visual_budget: true
+  error_on_seq_prune: true
 
 prompt:
   initial_user_template: |
@@ -30,8 +32,8 @@ prompt:
     Task: {task_prompt}
     Success Criteria:
     {criteria_text}
-  preview_instruction: |
-    You are given temporally ordered preview frames from the video. Use these preview frames to decide the next best action. If they are insufficient, call a tool to inspect more evidence.
+  explicit_first_scan_instruction: |
+    Before any targeted search or verification, call scan_timeline once over the initial scan window with purpose="global_overview" to build the canonical first observation. Use that overview to decide the next step.
   tool_response_template: |
     Selected frames: {timestamps}.
     Choose exactly one next step.

@@ -6,15 +6,12 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from saver_v3.core.counterfactual_verification import (
-    run_counterfactual_verification,
-)
 from saver_v3.data.dataset import SaverAgentDataset
+from saver_v3.data.runtime_contract import validate_runtime_record_contract
 from saver_v3.common.runtime import DistributedRuntime, create_progress_bar, runtime_log, should_log_progress
 from saver_v3.core.reward import score_rollout_trace
 from saver_v3.core.schema import SaverEnvironmentState
 from saver_v3.teacher.teacher_judge import compute_teacher_judge_signal
-from saver_v3.core.verifier import run_counterfactual_verifier
 
 
 def load_rollout_records(input_path: str | Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -89,7 +86,7 @@ class ReferenceDataProvider:
         self._dataset: Optional[SaverAgentDataset] = None
         if self.data_path is not None:
             with self.data_path.open("r", encoding="utf-8") as f:
-                self.records = [json.loads(line) for line in f if line.strip()]
+                self.records = [validate_runtime_record_contract(json.loads(line)) for line in f if line.strip()]
             self.by_video_id = {record.get("video_id"): record for record in self.records if record.get("video_id")}
             self.index_by_video_id = {
                 record.get("video_id"): idx for idx, record in enumerate(self.records) if record.get("video_id")
@@ -150,14 +147,11 @@ def _build_scoring_target_from_reference_record(reference_record: Dict[str, Any]
         return copy.deepcopy(structured_target)
     label = dict(reference_record.get("label") or {})
     temporal = dict(reference_record.get("temporal") or {})
-    counterfactual = dict(reference_record.get("counterfactual") or {})
     return {
         "existence": "anomaly" if bool(label.get("is_anomaly")) else "normal",
         "category": label.get("category"),
-        "severity": label.get("severity"),
         "anomaly_interval_sec": temporal.get("anomaly_interval_sec"),
         "precursor_interval_sec": temporal.get("precursor_interval_sec"),
-        "counterfactual_type": counterfactual.get("type", "none"),
     }
 
 
@@ -184,36 +178,10 @@ def attach_offline_verifier(
     force_reverify: bool = False,
     verifier_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    verifier_kwargs = verifier_kwargs or {}
+    del reference_data, verifier_backend, force_reverify, verifier_kwargs
     augmented = copy.deepcopy(rollout)
-    if not force_reverify and isinstance(augmented.get("offline_verifier"), dict):
-        return augmented
-
-    video_id = augmented.get("video_id")
-    if not video_id:
-        raise ValueError("Rollout record is missing video_id and cannot be reverified offline.")
-
-    multimodal_cache = reference_data.get_multimodal_cache(
-        video_id,
-        verifier_backend=verifier_backend,
-        verifier_kwargs=verifier_kwargs,
-    )
-    state = rollout_state_from_dict(augmented.get("state") or {})
-    claim = infer_claim_from_rollout(augmented)
-    candidate_window_ids = infer_candidate_window_ids(augmented)
-
-    verdict = run_counterfactual_verifier(
-        state=state,
-        multimodal_cache=multimodal_cache,
-        verification_mode="final_check",
-        claim=claim,
-        candidate_window_ids=candidate_window_ids,
-        backend=verifier_backend,
-        use_reference_supervision=True,
-    )
-    verdict["reference_conditioned"] = True
-    verdict["intended_use"] = "training_or_diagnostic_only"
-    augmented["offline_verifier"] = verdict
+    if not isinstance(augmented.get("offline_verifier"), dict):
+        augmented["offline_verifier"] = {}
     return augmented
 
 
@@ -314,27 +282,8 @@ def _counterfactual_profile_covers(existing_profile: str, requested_profile: str
 
 
 def _build_counterfactual_defaults(branch_profile: str) -> Dict[str, Any]:
-    normalized_profile = _normalize_counterfactual_branch_profile(branch_profile) or "full"
-    return {
-        "counterfactual_branches": {},
-        "counterfactual_profile": {
-            "summary": {
-                "decision_sufficiency": False,
-                "minimal_subset_sufficiency": False,
-                "stage_necessity": {},
-                "negative_specificity_pass": False,
-                "counterfactual_type_supported": False,
-            },
-            "branch_field_matrix": {},
-            "branch_delta_matrix": {},
-            "stage_packages": {},
-            "selection_metadata": {
-                "normalized_branch_profile": normalized_profile,
-            },
-        },
-        "counterfactual_profile_source": normalized_profile,
-        "counterfactual_branch_profile": normalized_profile,
-    }
+    del branch_profile
+    return {}
 
 
 def attach_counterfactual_verification_to_records(
@@ -345,55 +294,8 @@ def attach_counterfactual_verification_to_records(
     counterfactual_branch_profile: str = "full",
     counterfactual_max_images: int = 12,
 ) -> List[Dict[str, Any]]:
-    requested_counterfactual_profile = (
-        _normalize_counterfactual_branch_profile(counterfactual_branch_profile) or "full"
-    )
-    attached_records: List[Dict[str, Any]] = []
-    for record in records:
-        augmented = copy.deepcopy(record)
-        counterfactual_defaults = _build_counterfactual_defaults(requested_counterfactual_profile)
-        existing_counterfactual_profile = _infer_existing_counterfactual_branch_profile(augmented)
-        has_existing_counterfactual = bool(existing_counterfactual_profile)
-        if _counterfactual_profile_covers(existing_counterfactual_profile, requested_counterfactual_profile):
-            augmented["counterfactual_profile_source"] = existing_counterfactual_profile
-            augmented["counterfactual_branch_profile"] = existing_counterfactual_profile
-            attached_records.append(augmented)
-            continue
-
-        if reference_data is None or policy is None or not hasattr(policy, "generate_from_messages"):
-            if has_existing_counterfactual:
-                augmented["counterfactual_profile_source"] = existing_counterfactual_profile
-                augmented["counterfactual_branch_profile"] = existing_counterfactual_profile
-            else:
-                augmented.update(counterfactual_defaults)
-            attached_records.append(augmented)
-            continue
-
-        video_id = str(augmented.get("video_id") or "").strip()
-        if not video_id:
-            augmented.update(counterfactual_defaults)
-            attached_records.append(augmented)
-            continue
-        try:
-            item = reference_data.get_dataset_item(video_id)
-            reference_record = reference_data.by_video_id.get(video_id)
-            if isinstance(reference_record, dict):
-                augmented.update(
-                    run_counterfactual_verification(
-                        policy,
-                        item=item,
-                        rollout=augmented,
-                        reference_record=reference_record,
-                        max_images=int(counterfactual_max_images),
-                        branch_profile=requested_counterfactual_profile,
-                    )
-                )
-            else:
-                augmented.update(counterfactual_defaults)
-        except Exception:
-            augmented.update(counterfactual_defaults)
-        attached_records.append(augmented)
-    return attached_records
+    del reference_data, policy, counterfactual_branch_profile, counterfactual_max_images
+    return [copy.deepcopy(record) for record in records]
 
 
 def score_rollout_records(
@@ -465,7 +367,7 @@ def score_rollout_records(
                     counterfactual_branch_profile=requested_counterfactual_profile,
                     counterfactual_max_images=int(counterfactual_max_images),
                 )[0]
-            augmented["reward_summary"] = score_rollout_trace(augmented, reward_version="timesearch_v3")
+            augmented["reward_summary"] = score_rollout_trace(augmented, reward_version="timesearch_v4")
             augmented["scoring_metadata"] = {
                 "verifier_backend": verifier_backend,
                 "force_reverify": bool(force_reverify),

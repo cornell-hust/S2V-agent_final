@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
 
+from saver_v3.core.initial_observation import is_canonical_initial_scan_entry
 from saver_v3.core.categories import canonicalize_category_payload, validate_canonical_category_payload
 from saver_v3.core.protocol_guidance import event_chain_stage_for_role, summarize_evidence_ledger
 from saver_v3.core.proposal import (
@@ -17,6 +18,7 @@ from saver_v3.core.proposal import (
 from saver_v3.core.schema import SaverEnvironmentState, validate_required_fields
 from saver_v3.core.semantic_answer import augment_finalize_case_schema, split_finalize_case_payload
 from saver_v3.core.self_verification import (
+    coerce_self_verification_claim_payload,
     normalize_self_verification_mode,
     parse_self_verification_payload,
     validate_policy_self_verification_payload,
@@ -24,19 +26,32 @@ from saver_v3.core.self_verification import (
 
 
 MAX_NUM_KEY_FRAMES = 8
+_REMOVED_DECISION_FIELDS = (
+    "severity",
+    "counterfactual_type",
+    "counterfactual_faithfulness",
+    "precursor_interval_sec",
+    "earliest_actionable_sec",
+)
 SELF_VERIFICATION_VERDICT_KEYS = (
     "verification_decision",
     "primary_status",
-    "recommended_action",
+    "next_tool",
     "sufficiency_score",
     "necessity_score",
     "finalize_readiness_score",
-    "counterfactual_faithfulness",
     "derived_scores",
     "failure_reasons",
     "rationale",
     "explanation",
 )
+
+
+def _drop_removed_decision_fields(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    for field_name in _REMOVED_DECISION_FIELDS:
+        normalized.pop(field_name, None)
+    return normalized
 
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -472,19 +487,27 @@ def _has_self_verification_payload(arguments: Dict[str, Any]) -> bool:
     return any(key in arguments for key in SELF_VERIFICATION_VERDICT_KEYS)
 
 
-def _normalize_verification_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_verification_arguments(
+    arguments: Dict[str, Any],
+    *,
+    fallback_claim: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     normalized = dict(arguments or {})
     normalized["verification_mode"] = normalize_self_verification_mode(
         normalized.get("verification_mode"),
-        default="reward_only",
+        default="stage_check",
         public_only=True,
     )
-    if isinstance(normalized.get("claim"), dict):
-        normalized["claim"] = validate_canonical_category_payload(
-            normalized["claim"],
-            payload_name="claim",
+    if "claim" in normalized:
+        claim = coerce_self_verification_claim_payload(
+            normalized.get("claim"),
+            fallback_claim=fallback_claim,
             require_category_for_anomaly=True,
         )
+        if claim:
+            normalized["claim"] = claim
+        else:
+            normalized.pop("claim", None)
     return normalized
 
 
@@ -511,6 +534,7 @@ def _resolve_selected_window_ids(
         for entry in state.evidence_ledger
         if str(entry.get("window_id") or "").strip()
     }
+    sorted_valid_window_ids = sorted(valid_window_ids)
     by_evidence_id = {
         str(entry.get("evidence_id")): entry for entry in state.evidence_ledger if entry.get("evidence_id")
     }
@@ -561,6 +585,9 @@ def _resolve_selected_window_ids(
     valid_candidate_window_ids: List[str] = []
     candidate_added = False
     candidate_fallback_allowed = not resolved
+    no_explicit_selection = not (
+        requested_selected_window_ids or selected_evidence_ids or selected_evidence_moment_ids
+    )
     for window_id in candidate_window_ids:
         if window_id not in valid_window_ids:
             continue
@@ -578,14 +605,31 @@ def _resolve_selected_window_ids(
     selection_requested = bool(
         requested_selected_window_ids or selected_evidence_ids or selected_evidence_moment_ids or candidate_window_ids
     )
-    # Fallback: when nothing resolves but evidence exists in ledger, auto-select all evidence windows
-    if not resolved and valid_window_ids:
-        for fallback_window_id in sorted(valid_window_ids):
-            if fallback_window_id not in seen:
+    auto_heal_applied = False
+    auto_heal_window_ids: List[str] = []
+    if candidate_added and no_explicit_selection and len(valid_candidate_window_ids) == 1:
+        auto_heal_applied = True
+        auto_heal_window_ids = list(valid_candidate_window_ids)
+        resolution_sources = [
+            "auto_heal_single_candidate_window" if source == "candidate_window_ids" else source
+            for source in resolution_sources
+        ]
+    if not resolved and no_explicit_selection:
+        single_candidate_window_ids = (
+            list(valid_candidate_window_ids)
+            if len(valid_candidate_window_ids) == 1
+            else list(sorted_valid_window_ids)
+            if len(sorted_valid_window_ids) == 1
+            else []
+        )
+        if len(single_candidate_window_ids) == 1:
+            fallback_window_id = str(single_candidate_window_ids[0]).strip()
+            if fallback_window_id and fallback_window_id not in seen:
                 seen.add(fallback_window_id)
                 resolved.append(fallback_window_id)
-        if resolved:
-            resolution_sources.append("auto_fallback_from_ledger")
+                auto_heal_applied = True
+                auto_heal_window_ids = [fallback_window_id]
+                resolution_sources.append("auto_heal_single_candidate_window")
 
     if resolution_sources:
         selection_resolution_source = "+".join(resolution_sources)
@@ -604,6 +648,8 @@ def _resolve_selected_window_ids(
         "selected_evidence_ids": selected_evidence_ids,
         "selected_evidence_moment_ids": selected_evidence_moment_ids,
         "valid_candidate_window_ids": valid_candidate_window_ids,
+        "auto_heal_applied": bool(auto_heal_applied),
+        "auto_heal_window_ids": auto_heal_window_ids,
         "window_selector_ids": raw_window_selector_ids,
     }
 
@@ -636,10 +682,13 @@ def _finalize_verification_payload(
     finalized["requested_selected_window_ids"] = list(selection_info.get("requested_selected_window_ids") or [])
     finalized["invalid_selected_window_ids"] = list(selection_info.get("invalid_selected_window_ids") or [])
     finalized["selection_resolution_source"] = str(selection_info.get("selection_resolution_source") or "none")
+    finalized["auto_heal_applied"] = bool(selection_info.get("auto_heal_applied"))
+    finalized["auto_heal_window_ids"] = list(selection_info.get("auto_heal_window_ids") or [])
     return finalized
 
 
 def scan_timeline(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
+    prior_scan_count = sum(1 for entry in state.visited_windows if str(entry.get("kind") or "").strip() == "scan")
     start_sec, end_sec, selected_indices, fps = _resolve_window(arguments, multimodal_cache)
     entry = _append_window(
         state,
@@ -666,6 +715,14 @@ def scan_timeline(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
             "proposal_fallback_reason": "scan_timeline_uniform",
         },
     )
+    if is_canonical_initial_scan_entry(
+        entry,
+        arguments=arguments,
+        multimodal_cache=multimodal_cache,
+        config=multimodal_cache.get("config_snapshot") or {},
+        prior_scan_count=prior_scan_count,
+    ):
+        entry["initial_global_scan"] = True
     footer = (
         f"Scanned timeline window [{start_sec:.3f}, {end_sec:.3f}] and selected "
         f"{len(selected_indices)} frames."
@@ -758,7 +815,7 @@ def seek_evidence(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
 
 
 def verify_hypothesis(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
-    arguments = _normalize_verification_arguments(arguments)
+    arguments = _normalize_verification_arguments(arguments, fallback_claim=state.last_claim)
     selected_window_ids = [str(value) for value in (arguments.get("selected_window_ids") or []) if str(value).strip()]
     selected_evidence_ids = [str(value) for value in (arguments.get("selected_evidence_ids") or []) if str(value).strip()]
     selected_evidence_moment_ids = [
@@ -802,11 +859,11 @@ def verify_hypothesis(arguments: Dict[str, Any], multimodal_cache: Dict, state: 
         payload["selected_evidence_ids"] = list(selection_info["selected_evidence_ids"])
         payload["selected_evidence_moment_ids"] = list(selection_info["selected_evidence_moment_ids"])
         payload["candidate_window_ids"] = list(selection_info["valid_candidate_window_ids"])
-        payload = validate_policy_self_verification_payload(payload)
+        payload = validate_policy_self_verification_payload(payload, fallback_claim=state.last_claim)
         verification = parse_self_verification_payload(
             payload,
             fallback_claim=arguments.get("claim") or state.last_claim or {},
-            verification_mode=str(arguments.get("verification_mode") or "reward_only"),
+            verification_mode=str(arguments.get("verification_mode") or "stage_check"),
         )
         verification = _finalize_verification_payload(
             verification,
@@ -829,6 +886,7 @@ def verify_hypothesis(arguments: Dict[str, Any], multimodal_cache: Dict, state: 
 
 def finalize_case(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
     decision_arguments, semantic_answer = split_finalize_case_payload(arguments)
+    decision_arguments = _drop_removed_decision_fields(decision_arguments)
     decision_arguments = validate_canonical_category_payload(
         decision_arguments,
         payload_name="finalize_case",

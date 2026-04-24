@@ -1,46 +1,19 @@
-import json
+#!/usr/bin/env python3
+from __future__ import annotations
 
-INPUT_PATH = "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v2.jsonl"
-OUTPUT_PATH = "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v2.weighted.jsonl"
+MESSAGE = (
+    "This sample-weighting helper is retired and no longer runnable. "
+    "Use the active SEEK v5 path instead: scripts/prepare_sft_manifest.sh --run, "
+    "prepare_materialized_cache.py, scripts/run_full_pipeline.sh, saver_v3.cli.train_sft_ds, "
+    "and saver_v3.cli.train_rl_ds. "
+    "The only supported data families are compact_trace_v5, materialized_sft_messages_v5, "
+    "and materialized_runtime_items_v5."
+)
 
-WEIGHT_MAP = {
-    "normal": 1.0,
-    "anomaly": 0.6,
-}
 
-total = 0
-normal_count = 0
-anomaly_count = 0
-unknown_count = 0
+def main() -> None:
+    raise SystemExit(MESSAGE)
 
-with open(INPUT_PATH, "r") as fin, open(OUTPUT_PATH, "w") as fout:
-    for line in fin:
-        line = line.strip()
-        if not line:
-            continue
-        record = json.loads(line)
-        existence = record.get("structured_target", {}).get("existence", "")
-        if existence == "normal":
-            weight = 1.0
-            normal_count += 1
-        elif existence == "anomaly":
-            weight = 0.6
-            anomaly_count += 1
-        else:
-            weight = 1.0
-            unknown_count += 1
-            print(f"WARNING: unknown existence value '{existence}' for record, defaulting weight to 1.0")
-        record["sample_weight"] = weight
-        fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-        total += 1
 
-mean_weight = (normal_count * 1.0 + anomaly_count * 0.6) / total if total > 0 else 0.0
-
-print(f"Summary:")
-print(f"  Total records : {total}")
-print(f"  Normal        : {normal_count}  (weight=1.0)")
-print(f"  Anomaly       : {anomaly_count}  (weight=0.6)")
-if unknown_count:
-    print(f"  Unknown       : {unknown_count}  (weight=1.0 default)")
-print(f"  Mean weight   : {mean_weight:.4f}")
-print(f"Output written to: {OUTPUT_PATH}")
+if __name__ == "__main__":
+    main()

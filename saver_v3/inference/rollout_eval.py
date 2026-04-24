@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
@@ -10,6 +10,12 @@ from saver_v3.metrics.legacy_metrics import PAPER_MAIN_METRIC_KEYS
 from saver_v3.model.vllm_generation import build_vllm_policy_from_model_path
 from saver_v3.cli.common import load_yaml_mapping, write_json
 from saver_v3.common import distributed_runtime_from_env, runtime_log
+from saver_v3.data.config import (
+    DEFAULT_POLICY_MAX_NEW_TOKENS,
+    DEFAULT_ROLLOUT_MAX_TURNS,
+    SaverAgentConfig,
+    saver_config_from_mapping,
+)
 
 
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -40,13 +46,13 @@ class StepRolloutEvalConfig:
     include_splits: str = ""
     max_records: int = 0
     epoch_index: int = 0
-    max_turns: int = 14
+    max_turns: int = DEFAULT_ROLLOUT_MAX_TURNS
     rollout_batch_size: int = 4
     progress_every: int = 10
-    policy_max_new_tokens: int = 512
+    policy_max_new_tokens: int = DEFAULT_POLICY_MAX_NEW_TOKENS
     use_generation_cache: bool = True
     enable_semantic_replay: bool = True
-    semantic_replay_max_new_tokens: int = 512
+    semantic_replay_max_new_tokens: int = DEFAULT_POLICY_MAX_NEW_TOKENS
     max_total_images: int = 28
     max_seq_length: int = 8192
     keep_recent_text_messages: int = 20
@@ -69,6 +75,7 @@ class StepRolloutEvalConfig:
     semantic_judge_model: str = ""
     semantic_judge_cache_path: str = ""
     semantic_judge_timeout_sec: float = 30.0
+    semantic_bertscore_model_path: str = ""
     torch_dtype: str = "auto"
     device_map: str = "auto"
     attn_implementation: str = ""
@@ -85,6 +92,7 @@ class StepRolloutEvalConfig:
     top_p: float | None = None
     top_k: int | None = None
     repetition_penalty: float | None = None
+    saver_config: Dict[str, Any] = field(default_factory=lambda: SaverAgentConfig().to_dict())
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StepRolloutEvalConfig":
@@ -95,6 +103,7 @@ class StepRolloutEvalConfig:
         proposal = dict(_mapping(mapping.get("proposal")))
         verifier = dict(_mapping(mapping.get("verifier")))
         semantic = dict(_mapping(mapping.get("semantic_metrics")))
+        saver_config = saver_config_from_mapping(mapping)
         data_path = str(io_cfg.get("data_path") or "").strip()
         if not data_path:
             raise ValueError(
@@ -112,13 +121,18 @@ class StepRolloutEvalConfig:
             include_splits=str(io_cfg.get("include_splits") or "").strip(),
             max_records=int(io_cfg.get("max_records", 0) or 0),
             epoch_index=int(evaluation.get("epoch_index", 0) or 0),
-            max_turns=int(evaluation.get("max_turns", 14) or 14),
+            max_turns=int(evaluation.get("max_turns", DEFAULT_ROLLOUT_MAX_TURNS) or DEFAULT_ROLLOUT_MAX_TURNS),
             rollout_batch_size=int(evaluation.get("rollout_batch_size", client.get("rollout_batch_size", 4)) or 4),
             progress_every=int(evaluation.get("progress_every", 10) or 10),
-            policy_max_new_tokens=int(client.get("max_tokens", 512) or 512),
+            policy_max_new_tokens=int(
+                client.get("max_tokens", DEFAULT_POLICY_MAX_NEW_TOKENS) or DEFAULT_POLICY_MAX_NEW_TOKENS
+            ),
             use_generation_cache=_bool(client.get("use_generation_cache"), True),
             enable_semantic_replay=_bool(evaluation.get("enable_semantic_replay"), True),
-            semantic_replay_max_new_tokens=int(evaluation.get("semantic_replay_max_new_tokens", 512) or 512),
+            semantic_replay_max_new_tokens=int(
+                evaluation.get("semantic_replay_max_new_tokens", DEFAULT_POLICY_MAX_NEW_TOKENS)
+                or DEFAULT_POLICY_MAX_NEW_TOKENS
+            ),
             max_total_images=int(client.get("max_total_images", 28) or 28),
             max_seq_length=int(client.get("max_seq_length", 8192) or 8192),
             keep_recent_text_messages=int(client.get("keep_recent_text_messages", 20) or 20),
@@ -141,6 +155,7 @@ class StepRolloutEvalConfig:
             semantic_judge_model=str(semantic.get("judge_model") or "").strip(),
             semantic_judge_cache_path=str(semantic.get("judge_cache_path") or "").strip(),
             semantic_judge_timeout_sec=float(semantic.get("judge_timeout_sec", 30.0) or 30.0),
+            semantic_bertscore_model_path=str(semantic.get("bertscore_model_path") or "").strip(),
             torch_dtype=str(mapping.get("torch_dtype") or server.get("dtype") or "auto"),
             device_map=str(mapping.get("device_map") or "auto"),
             attn_implementation=str(mapping.get("attn_implementation") or "").strip(),
@@ -159,6 +174,7 @@ class StepRolloutEvalConfig:
             repetition_penalty=(
                 None if client.get("repetition_penalty") is None else float(client.get("repetition_penalty") or 1.0)
             ),
+            saver_config=saver_config.to_dict(),
         )
 
     @classmethod
@@ -184,6 +200,14 @@ def _build_vllm_args(config: StepRolloutEvalConfig) -> argparse.Namespace:
         torch_dtype=config.torch_dtype,
         device_map=config.device_map,
         attn_implementation=config.attn_implementation,
+        max_seq_length=int(config.max_seq_length),
+        policy_max_new_tokens=int(config.policy_max_new_tokens),
+        max_new_tokens=int(config.policy_max_new_tokens),
+        max_total_images=int(config.max_total_images),
+        keep_recent_text_messages=int(config.keep_recent_text_messages),
+        keep_recent_tool_image_messages=int(config.keep_recent_tool_image_messages),
+        max_image_side=int(config.max_image_side),
+        max_image_pixels=int(config.max_image_pixels),
     )
 
 
@@ -214,6 +238,7 @@ def run_step_rollout_eval_job(config: StepRolloutEvalConfig) -> Dict[str, Any]:
         runtime=runtime,
         main_process_only=True,
     )
+    saver_config = saver_config_from_mapping(config.saver_config)
     eval_config = RolloutEvaluationConfig(
         data_path=config.data_path,
         data_root=config.data_root,
@@ -250,6 +275,8 @@ def run_step_rollout_eval_job(config: StepRolloutEvalConfig) -> Dict[str, Any]:
         semantic_judge_model=config.semantic_judge_model,
         semantic_judge_cache_path=config.semantic_judge_cache_path,
         semantic_judge_timeout_sec=config.semantic_judge_timeout_sec,
+        semantic_bertscore_model_path=config.semantic_bertscore_model_path,
+        saver_config=saver_config,
     )
     policy = build_vllm_policy_from_model_path(
         args=_build_vllm_args(config),

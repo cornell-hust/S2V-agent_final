@@ -5,9 +5,12 @@ from __future__ import annotations
 import copy
 from typing import Any, Iterable, List
 
+from saver_v3.data.config import SaverAgentConfig
+from saver_v3.core.initial_observation import is_preview_initial_observation
 from saver_v3.data.prepared_schema import validate_compact_trace_row
 from saver_v3.core.prompts import build_system_prompt, build_user_prompt
 from saver_v3.core.tool_registry import DEFAULT_TOOL_NAMES, get_tool_schemas
+from saver_v3.data.runtime_contract import ensure_removed_fields_absent
 
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -29,6 +32,7 @@ def _clean_allowed_tools(tool_io: dict[str, Any]) -> list[str]:
 
 def _build_tool_io(row: dict[str, Any]) -> dict[str, Any]:
     tool_io = copy.deepcopy(row.get("tool_io") or {})
+    ensure_removed_fields_absent(tool_io.get("finalize_case_schema", {}).get("properties"), context="runtime_item.finalize_case_schema.properties")
     allowed_tools = _clean_allowed_tools(tool_io)
     tool_schemas = [
         schema
@@ -77,6 +81,7 @@ def _resolve_fps(row: dict[str, Any]) -> float:
 
 
 def _build_multimodal_cache(row: dict[str, Any], *, tool_io: dict[str, Any]) -> dict[str, Any]:
+    config = SaverAgentConfig()
     video_meta = copy.deepcopy(row.get("video_meta") or {})
     duration = _resolve_duration(row)
     fps = _resolve_fps(row)
@@ -87,7 +92,7 @@ def _build_multimodal_cache(row: dict[str, Any], *, tool_io: dict[str, Any]) -> 
         "fps": float(fps),
         "duration": float(duration),
         "question": _default_task_prompt(row),
-        "structured_target": copy.deepcopy(row.get("structured_target") or {}),
+        "structured_target": ensure_removed_fields_absent(copy.deepcopy(row.get("structured_target") or {}), context="runtime_item.structured_target"),
         "tool_io": copy.deepcopy(tool_io),
         "video_path": str(row.get("video_path") or ""),
         "video_meta": video_meta,
@@ -95,23 +100,30 @@ def _build_multimodal_cache(row: dict[str, Any], *, tool_io: dict[str, Any]) -> 
         "preview_frames": None,
         "preview_timestamps": [],
         "preview_frame_indices": [],
+        "config_snapshot": config.to_dict(),
         "proposal_runtime": None,
         "strict_feature_guided_proposal": False,
     }
 
 
 def _build_user_content(row: dict[str, Any], user_prompt: str) -> list[dict[str, Any]]:
+    config = SaverAgentConfig()
     content: list[dict[str, Any]] = []
     video_path = str(row.get("video_path") or "").strip()
-    if video_path:
+    if video_path and is_preview_initial_observation(config.initial_observation):
         content.append({"type": "video", "video": video_path})
     content.append({"type": "text", "text": user_prompt})
     return content
 
 
 def _build_messages(row: dict[str, Any], *, tool_io: dict[str, Any]) -> list[dict[str, Any]]:
+    config = SaverAgentConfig()
     system_prompt = build_system_prompt(tool_io.get("function_schemas") or tool_io.get("tool_schemas") or [])
-    user_prompt = build_user_prompt(row, preview_available=False)
+    user_prompt = build_user_prompt(
+        row,
+        preview_available=False,
+        initial_observation=config.initial_observation,
+    )
     return [
         {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": _build_user_content(row, user_prompt)},

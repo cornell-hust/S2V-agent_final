@@ -7,11 +7,24 @@ from typing import Any, Dict, Sequence
 
 from split_utils import parse_include_splits
 
-from saver_v3.data.config import PreviewConfig, PromptConfig, RolloutTraceConfig, SaverAgentConfig
+from saver_v3.data.config import (
+    InitialObservationConfig,
+    PreviewConfig,
+    PromptConfig,
+    RolloutTraceConfig,
+    SaverAgentConfig,
+    saver_config_cache_semantic_snapshot,
+)
+from saver_v3.data.protocol_signature import (
+    DEFAULT_TEACHER_ROLE,
+    build_protocol_signature,
+    ensure_protocol_signature_matches,
+    extract_protocol_signature,
+)
 
 
-PREPARED_SFT_METADATA_SCHEMA_VERSION = 3
-PREPARED_SFT_FORMAT = "compact_trace_v2"
+PREPARED_SFT_METADATA_SCHEMA_VERSION = 8
+PREPARED_SFT_FORMAT = "compact_trace_v5"
 PREPARED_SFT_PROVENANCE_MODE = "hybrid"
 
 
@@ -67,23 +80,27 @@ def build_jsonl_provenance(jsonl_path: str | Path, *, include_splits: str | Sequ
 
 
 def build_prepared_sft_metadata(*, config: SaverAgentConfig) -> Dict[str, Any]:
-    snapshot = config.to_dict()
+    snapshot = saver_config_cache_semantic_snapshot(config)
     return {
         "schema_version": int(PREPARED_SFT_METADATA_SCHEMA_VERSION),
         "prepared_format": str(PREPARED_SFT_FORMAT),
-        "preview": snapshot.get("preview", {}),
+        "protocol_signature": build_protocol_signature(config=config, teacher_role=DEFAULT_TEACHER_ROLE),
+        "initial_observation": snapshot.get("initial_observation", {}),
         "prompt": snapshot.get("prompt", {}),
         "rollout_trace": snapshot.get("rollout_trace", {}),
+        **({"preview": snapshot.get("preview", {})} if "preview" in snapshot else {}),
     }
 
 
 def config_from_prepared_sft_metadata(metadata: Dict[str, Any]) -> SaverAgentConfig:
     payload = dict(metadata or {})
     preview_payload = payload.get("preview") or {}
+    initial_observation_payload = payload.get("initial_observation") or {}
     prompt_payload = payload.get("prompt") or {}
     rollout_trace_payload = payload.get("rollout_trace") or {}
     return SaverAgentConfig(
         preview=PreviewConfig(**dict(preview_payload)),
+        initial_observation=InitialObservationConfig(**dict(initial_observation_payload)),
         prompt=PromptConfig(**dict(prompt_payload)),
         rollout_trace=RolloutTraceConfig(**dict(rollout_trace_payload)),
     )
@@ -173,6 +190,7 @@ def ensure_prepared_sft_metadata(
     *,
     config: SaverAgentConfig | None = None,
     require_config_match: bool = False,
+    expected_protocol_signature: Dict[str, Any] | None = None,
     expected_source_runtime_path: str | Path | None = None,
     expected_source_runtime_include_splits: str | Sequence[str] | None = None,
     require_source_runtime: bool = False,
@@ -207,15 +225,18 @@ def ensure_prepared_sft_metadata(
 
     if require_config_match and config is not None:
         expected = build_prepared_sft_metadata(config=config)
-        if (
-            metadata.get("preview") != expected.get("preview")
-            or metadata.get("prompt") != expected.get("prompt")
-            or metadata.get("rollout_trace") != expected.get("rollout_trace")
-        ):
+        actual = build_prepared_sft_metadata(config=config_from_prepared_sft_metadata(metadata))
+        if actual != expected:
             raise ValueError(
-                f"Prepared SFT metadata does not match the current preview/prompt/rollout_trace config for {prepared_data_path}. "
-                "Regenerate the prepared JSONL with the same preview/prompt/rollout_trace settings used for training and evaluation."
+                f"Prepared SFT metadata does not match the current initial-observation/prompt/rollout_trace config for {prepared_data_path}. "
+                "Regenerate the prepared JSONL with the same initial-observation/prompt/rollout_trace settings used for training and evaluation."
             )
+    if expected_protocol_signature is not None:
+        ensure_protocol_signature_matches(
+            actual_signature=extract_protocol_signature(metadata),
+            expected_signature=expected_protocol_signature,
+            context=f"Prepared SFT metadata for {prepared_data_path}",
+        )
 
     if require_source_runtime or expected_source_runtime_path is not None:
         _validate_provenance_block(

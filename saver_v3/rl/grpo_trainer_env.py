@@ -4,20 +4,22 @@ import copy
 import gc
 import json
 import math
+import os
 import random
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from saver_v3.core.counterfactual_verification import run_counterfactual_verification
 from saver_v3.data.dataset import SaverAgentDataset
+from saver_v3.data.config import DEFAULT_ROLLOUT_MAX_TURNS
 from saver_v3.data.materialized_cache import (
     MATERIALIZED_RUNTIME_ITEMS_FORMAT,
     MaterializedRuntimeItemDataset,
     ensure_materialized_cache_metadata,
 )
+from saver_v3.data.protocol_signature import DEFAULT_TEACHER_ROLE, build_protocol_signature
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp, write_json
 from saver_v3.model.qwen_policy import QwenGenerationPolicy
 from saver_v3.core.reward import (
@@ -39,7 +41,9 @@ from saver_v3.sft.training import (
     _save_epoch_resume_rng_state,
     _zero_loss_from_model,
     _unwrap_model,
+    build_completion_only_model_inputs,
     compute_completion_only_log_probs_from_ids,
+    compute_completion_only_token_log_probs_from_prepared_inputs,
     compute_completion_only_token_log_probs_from_ids,
     compute_completion_only_response_log_probs,
     compute_completion_only_response_token_log_probs,
@@ -84,6 +88,7 @@ class RepeatSampler(torch.utils.data.Sampler[int]):
         repeat_count: int = 1,
         shuffle: bool = True,
         seed: Optional[int] = None,
+        sort_key_fn: Optional[Callable[[Any], Tuple[Any, ...]]] = None,
     ) -> None:
         self.data_source = data_source
         self.mini_repeat_count = max(1, int(mini_repeat_count))
@@ -92,6 +97,7 @@ class RepeatSampler(torch.utils.data.Sampler[int]):
         self.num_samples = max(0, int(len(data_source)))
         self.shuffle = bool(shuffle)
         self.seed = seed
+        self.sort_key_fn = sort_key_fn
         self.generator = None
         if self.shuffle:
             self.generator = torch.Generator()
@@ -103,6 +109,8 @@ class RepeatSampler(torch.utils.data.Sampler[int]):
             indices = torch.randperm(self.num_samples, generator=self.generator).tolist()
         else:
             indices = list(range(self.num_samples))
+        if callable(self.sort_key_fn):
+            indices = sorted(indices, key=lambda index: self.sort_key_fn(self.data_source[index]))
         chunks = [indices[offset : offset + self.batch_size] for offset in range(0, len(indices), self.batch_size)]
         chunks = [chunk for chunk in chunks if len(chunk) == self.batch_size]
         for chunk in chunks:
@@ -121,6 +129,27 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _raw_item_workload_sort_key(item: Any) -> Tuple[Any, ...]:
+    if not isinstance(item, dict):
+        return (0, 0, 0, 0, "")
+    video_meta = dict(item.get("video_meta") or {})
+    duration_sec = _safe_float(video_meta.get("duration_sec"), 0.0)
+    total_frames = int(video_meta.get("total_frames", 0) or 0)
+    allowed_tools = list(((item.get("tool_io") or {}).get("allowed_tools") or []))
+    has_seek_evidence = int(any(str(tool_name or "").strip() == "seek_evidence" for tool_name in allowed_tools))
+    qa_pair_count = len(item.get("qa_pairs") or []) if isinstance(item.get("qa_pairs"), list) else 0
+    label = dict(item.get("label") or {})
+    is_anomaly = int(bool(label.get("is_anomaly")))
+    return (
+        has_seek_evidence,
+        int(duration_sec // 10.0),
+        int(total_frames // 64),
+        min(int(qa_pair_count), 8),
+        is_anomaly,
+        str(item.get("video_id") or ""),
+    )
 
 
 def _iter_dataloader_chain(dataloader: Any):
@@ -204,6 +233,15 @@ def _distributed_sum_int(local_value: int, *, device: torch.device) -> int:
     total_tensor = torch.tensor([local_total], dtype=torch.int64, device=device)
     torch.distributed.all_reduce(total_tensor, op=torch.distributed.ReduceOp.SUM)
     return int(total_tensor.item())
+
+
+def _distributed_sum_float(local_value: float, *, device: torch.device) -> float:
+    local_total = float(local_value)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_total
+    total_tensor = torch.tensor([local_total], dtype=torch.float32, device=device)
+    torch.distributed.all_reduce(total_tensor, op=torch.distributed.ReduceOp.SUM)
+    return float(total_tensor.item())
 
 
 def _distributed_first_available_object(local_object: Any, *, device: Optional[torch.device] = None) -> Any:
@@ -298,7 +336,7 @@ def _resolve_sample_partition(rollout: Dict[str, Any]) -> str:
     if target_existence == "normal":
         reward_summary = dict(rollout.get("reward_summary") or {})
         normal_case_type = str(
-            reward_summary.get("fecv_normal_case_type") or reward_summary.get("normal_case_type") or ""
+            reward_summary.get("normal_case_type") or ""
         ).strip().lower()
         if normal_case_type == "easy_normal":
             return "easy_normal"
@@ -318,7 +356,7 @@ def _resolve_sample_partition_multiplier(
         multipliers = {**multipliers, **sample_partition_multipliers}
     multiplier = float(multipliers.get(normalized_partition, 1.0) or 1.0)
     if normalized_partition == "easy_normal":
-        multiplier *= float(reward_summary.get("fecv_easy_normal_sample_loss_multiplier") or 1.0)
+        multiplier *= float(reward_summary.get("easy_normal_sample_loss_multiplier") or 1.0)
     return max(0.0, float(multiplier))
 
 
@@ -327,33 +365,8 @@ def _degrade_reward_summary_for_fecv_failure(
     *,
     error_message: str = "",
 ) -> Dict[str, Any]:
-    degraded = copy.deepcopy(dict(reward_summary or {}))
-    components = dict(degraded.get("components") or {})
-    weights = dict(degraded.get("weights") or {})
-    components["fecv_evidence_faithfulness_reward"] = 0.0
-    components["fecv_decision_sufficiency_reward"] = 0.0
-    components["fecv_specificity_reward"] = 0.0
-    total_reward = degraded.get("total_reward", 0.0)
-    if weights:
-        total_reward = sum(float(weights.get(key, 0.0)) * float(value) for key, value in components.items())
-    degraded["total_reward"] = round(float(total_reward or 0.0), 6)
-    degraded["components"] = {
-        key: round(float(value), 6)
-        for key, value in components.items()
-    }
-    degraded["fecv_failed"] = True
-    degraded["fecv_degraded"] = True
-    degraded["fecv_failure_message"] = _truncate_error_message(error_message)
-    degraded["fecv_decision_sufficiency"] = 0.0
-    degraded["fecv_minimal_subset_sufficiency"] = 0.0
-    degraded["fecv_negative_specificity_pass"] = 0.0
-    degraded["fecv_grounded_decision"] = 0.0
-    degraded["counterfactual_decision_sufficiency"] = 0.0
-    degraded["counterfactual_minimal_subset_sufficiency"] = 0.0
-    degraded["negative_specificity_pass"] = 0.0
-    degraded["counterfactual_type_supported"] = 0.0
-    degraded["fecv_counterfactual_type_supported"] = 0.0
-    return degraded
+    del error_message
+    return copy.deepcopy(dict(reward_summary or {}))
 
 
 def _replay_priority_from_experience(experience: Dict[str, Any]) -> float:
@@ -444,10 +457,266 @@ def get_replay_buffer(buffer_type: str, capacity: int, alpha: float = 1.0):
     raise ValueError(f"Invalid replay buffer type: {buffer_type!r}")
 
 
+def _named_tensor_non_finite_summary(name: str, tensor: torch.Tensor) -> Dict[str, Any]:
+    value = tensor.detach()
+    if bool(getattr(value, "is_sparse", False)):
+        value = value.coalesce().values()
+    summary: Dict[str, Any] = {
+        "name": str(name or ""),
+        "shape": tuple(int(dim) for dim in value.shape),
+        "dtype": str(value.dtype).replace("torch.", ""),
+        "device": str(value.device),
+        "numel": int(value.numel()),
+        "layout": str(value.layout),
+    }
+    if value.numel() <= 0:
+        summary.update(
+            {
+                "all_finite": True,
+                "nan_count": 0,
+                "posinf_count": 0,
+                "neginf_count": 0,
+            }
+        )
+        return summary
+    flat_value = value.reshape(-1)
+    chunk_elements = max(1, min(int(flat_value.numel()), 4_194_304))
+    nan_count = 0
+    posinf_count = 0
+    neginf_count = 0
+    for offset in range(0, int(flat_value.numel()), int(chunk_elements)):
+        chunk = flat_value.narrow(0, int(offset), min(int(chunk_elements), int(flat_value.numel()) - int(offset)))
+        nan_count += int(torch.isnan(chunk).sum().item())
+        posinf_count += int(torch.isposinf(chunk).sum().item())
+        neginf_count += int(torch.isneginf(chunk).sum().item())
+    summary.update(
+        {
+            "all_finite": bool((nan_count + posinf_count + neginf_count) == 0),
+            "nan_count": int(nan_count),
+            "posinf_count": int(posinf_count),
+            "neginf_count": int(neginf_count),
+        }
+    )
+    return summary
+
+
+def _scan_named_tensors_for_non_finite(named_tensors: Sequence[Tuple[str, torch.Tensor]], *, max_entries: int = 8) -> Dict[str, Any]:
+    checked_count = 0
+    non_finite_count = 0
+    entries: List[Dict[str, Any]] = []
+    for name, tensor in list(named_tensors or []):
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        checked_count += 1
+        value = tensor.detach()
+        if bool(getattr(value, "is_sparse", False)):
+            value = value.coalesce().values()
+        flat_value = value.reshape(-1)
+        chunk_elements = max(1, min(int(flat_value.numel()), 4_194_304))
+        has_non_finite = False
+        for offset in range(0, int(flat_value.numel()), int(chunk_elements)):
+            chunk = flat_value.narrow(0, int(offset), min(int(chunk_elements), int(flat_value.numel()) - int(offset)))
+            if not bool(torch.all(torch.isfinite(chunk)).item()):
+                has_non_finite = True
+                break
+        if not has_non_finite:
+            continue
+        non_finite_count += 1
+        if len(entries) < max(1, int(max_entries)):
+            entries.append(_named_tensor_non_finite_summary(name=name, tensor=tensor))
+    return {
+        "checked_count": int(checked_count),
+        "non_finite_count": int(non_finite_count),
+        "entries": entries,
+    }
+
+
+def _iter_nested_named_tensors(prefix: str, value: Any):
+    if isinstance(value, torch.Tensor):
+        yield str(prefix or ""), value
+        return
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            yield from _iter_nested_named_tensors(child_prefix, nested_value)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, nested_value in enumerate(list(value)):
+            child_prefix = f"{prefix}[{index}]"
+            yield from _iter_nested_named_tensors(child_prefix, nested_value)
+
+
+def _optimizer_param_group_summaries(optimizer: Any) -> List[Dict[str, Any]]:
+    summaries: List[Dict[str, Any]] = []
+    param_groups = getattr(optimizer, "param_groups", None)
+    if not isinstance(param_groups, (list, tuple)):
+        return summaries
+    for group_index, group in enumerate(list(param_groups)):
+        if not isinstance(group, dict):
+            continue
+        params = list(group.get("params") or [])
+        summaries.append(
+            {
+                "group_index": int(group_index),
+                "param_count": int(len(params)),
+                "trainable_param_count": int(
+                    sum(1 for param in params if bool(getattr(param, "requires_grad", False)))
+                ),
+                "lr": float(group.get("lr", 0.0) or 0.0),
+                "weight_decay": float(group.get("weight_decay", 0.0) or 0.0),
+            }
+        )
+    return summaries
+
+
+def _flat_master_scan_payload_for_optimizer(optimizer: Any) -> Dict[str, Any]:
+    fp32_partitions = []
+    for index, tensor in enumerate(list(getattr(optimizer, "single_partition_of_fp32_groups", []) or [])):
+        if isinstance(tensor, torch.Tensor):
+            fp32_partitions.append((f"single_partition_of_fp32_groups[{index}]", tensor))
+
+    fp32_partition_grads = []
+    for index, tensor in enumerate(list(getattr(optimizer, "single_partition_of_fp32_groups", []) or [])):
+        grad = getattr(tensor, "grad", None)
+        if isinstance(grad, torch.Tensor):
+            fp32_partition_grads.append((f"single_partition_of_fp32_groups[{index}].grad", grad))
+
+    bit16_flat_groups = []
+    for index, tensor in enumerate(list(getattr(optimizer, "bit16_groups_flat", []) or [])):
+        if isinstance(tensor, torch.Tensor):
+            bit16_flat_groups.append((f"bit16_groups_flat[{index}]", tensor))
+
+    averaged_gradients = []
+    raw_averaged_gradients = getattr(optimizer, "averaged_gradients", None)
+    if isinstance(raw_averaged_gradients, dict):
+        for key, value in sorted(raw_averaged_gradients.items(), key=lambda item: repr(item[0])):
+            averaged_gradients.extend(
+                list(_iter_nested_named_tensors(f"averaged_gradients[{key}]", value))
+            )
+    elif isinstance(raw_averaged_gradients, (list, tuple)):
+        for index, value in enumerate(list(raw_averaged_gradients)):
+            averaged_gradients.extend(
+                list(_iter_nested_named_tensors(f"averaged_gradients[{index}]", value))
+            )
+
+    optimizer_state_tensors = []
+    optimizer_state = getattr(optimizer, "state", None)
+    if isinstance(optimizer_state, dict):
+        fp32_group_lookup = {
+            id(tensor): index
+            for index, tensor in enumerate(list(getattr(optimizer, "single_partition_of_fp32_groups", []) or []))
+            if isinstance(tensor, torch.Tensor)
+        }
+        for raw_key, raw_state in optimizer_state.items():
+            if not isinstance(raw_state, dict):
+                continue
+            if isinstance(raw_key, torch.Tensor) and id(raw_key) in fp32_group_lookup:
+                prefix = f"single_partition_of_fp32_groups[{fp32_group_lookup[id(raw_key)]}].state"
+            else:
+                prefix = f"optimizer_state[{repr(raw_key)}]"
+            optimizer_state_tensors.extend(list(_iter_nested_named_tensors(prefix, raw_state)))
+
+    sections = {
+        "fp32_partitions": _scan_named_tensors_for_non_finite(fp32_partitions),
+        "fp32_partition_grads": _scan_named_tensors_for_non_finite(fp32_partition_grads),
+        "bit16_flat_groups": {
+            "checked_count": int(len(bit16_flat_groups)),
+            "non_finite_count": 0,
+            "metadata_only": True,
+            "entries": [
+                {
+                    "name": str(name or ""),
+                    "shape": tuple(int(dim) for dim in tensor.shape),
+                    "dtype": str(tensor.dtype).replace("torch.", ""),
+                    "device": str(tensor.device),
+                    "numel": int(tensor.numel()),
+                }
+                for name, tensor in bit16_flat_groups[:4]
+                if isinstance(tensor, torch.Tensor)
+            ],
+        },
+        "averaged_gradients": _scan_named_tensors_for_non_finite(averaged_gradients),
+        "optimizer_state": _scan_named_tensors_for_non_finite(optimizer_state_tensors),
+    }
+    sections["any_non_finite"] = bool(
+        any(int(section.get("non_finite_count", 0)) > 0 for section in sections.values() if isinstance(section, dict))
+    )
+    return sections
+
+
+def _write_flat_master_forensics_dump(
+    *,
+    trainer: Any,
+    optimizer: Any,
+    stage: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    flat_master_scan = _flat_master_scan_payload_for_optimizer(optimizer)
+    if not bool(flat_master_scan.get("any_non_finite")):
+        return None
+    runtime = distributed_runtime_from_env()
+    global_rank = getattr(runtime, "global_rank", None)
+    if global_rank is None:
+        global_rank = getattr(runtime, "rank", 0)
+    dump_path = trainer._non_finite_dump_dir() / (
+        f"{utc_timestamp()}_{str(stage or 'optimizer_flat_master_state')}_"
+        f"rank{int(getattr(runtime, 'local_rank', 0) or 0)}_"
+        f"call{int(getattr(trainer, '_debug_last_compute_loss_call_index', 0))}.json"
+    )
+    payload = {
+        "timestamp": utc_timestamp(),
+        "stage": str(stage or ""),
+        "compute_loss_call": int(getattr(trainer, "_debug_last_compute_loss_call_index", 0)),
+        "local_prepared_batch_count": int(getattr(trainer, "_debug_last_compute_loss_rank_local_batch_count", 0)),
+        "runtime": {
+            "local_rank": int(getattr(runtime, "local_rank", 0) or 0),
+            "global_rank": int(global_rank or 0),
+            "world_size": int(getattr(runtime, "world_size", 1) or 1),
+        },
+        "trainer_state": {
+            "global_step": int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0),
+            "epoch": float(getattr(getattr(trainer, "state", None), "epoch", 0.0) or 0.0),
+        },
+        "optimizer_class": type(optimizer).__name__,
+        "optimizer_param_groups": _optimizer_param_group_summaries(optimizer),
+        "flat_master_scan": flat_master_scan,
+        "extra": dict(extra or {}),
+    }
+    write_json(dump_path, payload)
+    runtime_log(
+        (
+            "trainer-native RL detected non-finite DeepSpeed flat master/state tensors: "
+            f"stage={str(stage or '')} dump={dump_path}"
+        ),
+        runtime=runtime,
+        main_process_only=False,
+    )
+    return dump_path
+
+
 class _NativeRLOptimizerStepProxy:
     def __init__(self, optimizer: Any, *, trainer: Any):
         self._optimizer = optimizer
         self._trainer = trainer
+
+    def _optimizer_param_group_summaries(self) -> List[Dict[str, Any]]:
+        return _optimizer_param_group_summaries(self._optimizer)
+
+    def _flat_master_scan_payload(self) -> Dict[str, Any]:
+        return _flat_master_scan_payload_for_optimizer(self._optimizer)
+
+    def _write_flat_master_forensics_dump(
+        self,
+        *,
+        stage: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        return _write_flat_master_forensics_dump(
+            trainer=self._trainer,
+            optimizer=self._optimizer,
+            stage=stage,
+            extra=extra,
+        )
 
     def step(self, *args, **kwargs):
         if bool(getattr(self._trainer, "_native_rl_skip_next_optimizer_step", False)):
@@ -465,11 +734,32 @@ class _NativeRLOptimizerStepProxy:
             self._trainer._native_rl_skip_next_optimizer_step = False
             self._trainer._optimizer_step_skips += 1
             return None
+        self._write_flat_master_forensics_dump(
+            stage="pre_optimizer_step_flat_master_state",
+            extra={"phase": "pre_step"},
+        )
         try:
             setattr(self._trainer.accelerator, "optimizer_step_was_skipped", False)
         except Exception:
             pass
-        result = self._optimizer.step(*args, **kwargs)
+        try:
+            result = self._optimizer.step(*args, **kwargs)
+        except Exception as exc:
+            self._write_flat_master_forensics_dump(
+                stage="optimizer_step_exception_flat_master_state",
+                extra={
+                    "phase": "step_exception",
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                },
+            )
+            raise
+        self._write_flat_master_forensics_dump(
+            stage="post_optimizer_step_flat_master_state",
+            extra={"phase": "post_step"},
+        )
         self._trainer._effective_update_steps += 1
         return result
 
@@ -536,7 +826,6 @@ class _NativeGRPOProgressReporter:
         num_generations: int,
         compute_loss_microbatch_size: int = 1,
         rollout_use_generation_cache: bool = False,
-        fecv_use_generation_cache: bool = False,
     ):
         self.runtime = runtime
         self.iteration_index = max(0, int(iteration_index))
@@ -545,7 +834,6 @@ class _NativeGRPOProgressReporter:
         self.num_generations = max(1, int(num_generations))
         self.compute_loss_microbatch_size = max(1, int(compute_loss_microbatch_size))
         self.rollout_use_generation_cache = bool(rollout_use_generation_cache)
-        self.fecv_use_generation_cache = bool(fecv_use_generation_cache)
         self._active_iteration_index = int(self.iteration_index)
         self.trainer_step = 0
         self.processed_groups = 0
@@ -923,10 +1211,25 @@ def _build_grad_norm_probe_callback(*, trainer: Any):
         class TrainerCallback:  # type: ignore[no-redef]
             pass
 
+    def _probe_rank() -> int:
+        runtime = distributed_runtime_from_env()
+        rank = getattr(runtime, "rank", None)
+        if rank is None:
+            rank = getattr(trainer, "global_rank", None)
+        if rank is None:
+            trainer_args = getattr(trainer, "args", None)
+            rank = getattr(trainer_args, "process_index", None)
+        if rank is None:
+            trainer_args = getattr(trainer, "args", None)
+            rank = getattr(trainer_args, "local_rank", None)
+        if rank is None:
+            rank = getattr(trainer, "local_rank", 0)
+        return int(rank or 0)
+
     class GradNormProbeCallback(TrainerCallback):
         def on_train_begin(self, args, state, control, **kwargs):
             try:
-                rank = int(getattr(trainer, "local_rank", 0) or 0)
+                rank = _probe_rank()
                 if rank != 0:
                     return control
                 opt = getattr(trainer, "optimizer", None)
@@ -953,7 +1256,7 @@ def _build_grad_norm_probe_callback(*, trainer: Any):
         def on_step_end(self, args, state, control, **kwargs):
             del args, kwargs
             try:
-                rank = int(getattr(trainer, "local_rank", 0) or 0)
+                rank = _probe_rank()
                 if rank != 0:
                     return control
                 global_step = int(getattr(state, "global_step", 0) or 0)
@@ -990,6 +1293,63 @@ def _build_grad_norm_probe_callback(*, trainer: Any):
             return control
 
     return GradNormProbeCallback()
+
+
+def _build_parameter_finite_probe_callback(*, trainer: Any):
+    try:
+        from transformers import TrainerCallback
+    except Exception:
+        class TrainerCallback:  # type: ignore[no-redef]
+            pass
+
+    class ParameterFiniteProbeCallback(TrainerCallback):
+        def on_train_begin(self, args, state, control, model=None, **kwargs):
+            del args, state, kwargs
+            model_ref = model if model is not None else getattr(trainer, "model", None)
+            if model_ref is not None:
+                trainer._assert_finite_trainable_parameters(
+                    stage="train_begin_params",
+                    model=model_ref,
+                )
+            return control
+
+        def on_step_begin(self, args, state, control, model=None, **kwargs):
+            del args, kwargs
+            model_ref = model if model is not None else getattr(trainer, "model", None)
+            if model_ref is not None:
+                trainer._assert_finite_trainable_parameters(
+                    stage="step_begin_params",
+                    model=model_ref,
+                    extra={
+                        "global_step": int(getattr(state, "global_step", 0) or 0),
+                        "epoch": float(getattr(state, "epoch", 0.0) or 0.0),
+                    },
+                )
+            return control
+
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            del args, kwargs
+            model_ref = model if model is not None else getattr(trainer, "model", None)
+            trainer._write_deepspeed_flat_master_forensics_dump(
+                stage="post_optimizer_step_flat_master_state",
+                extra={
+                    "global_step": int(getattr(state, "global_step", 0) or 0),
+                    "epoch": float(getattr(state, "epoch", 0.0) or 0.0),
+                    "phase": "callback_post_step",
+                },
+            )
+            if model_ref is not None:
+                trainer._assert_finite_trainable_parameters(
+                    stage="post_optimizer_step_params",
+                    model=model_ref,
+                    extra={
+                        "global_step": int(getattr(state, "global_step", 0) or 0),
+                        "epoch": float(getattr(state, "epoch", 0.0) or 0.0),
+                    },
+                )
+            return control
+
+    return ParameterFiniteProbeCallback()
 
 
 def _is_episode_feature_from_feature(feature: Dict[str, Any]) -> bool:
@@ -1061,7 +1421,6 @@ def _log_rollout_reward_diagnostics(
     zero_variance_skipped_count = zero_variance_rollout_count if zero_variance_group_count > 0 else 0
     filtered_count = sum(1 for value in advantage_values if abs(float(value)) < float(min_weight))
     zero_advantage_count = sum(1 for value in advantage_values if abs(float(value)) <= 1e-8)
-    fecv_failed_count = sum(1 for rollout in rollouts if bool(rollout.get("fecv_failed")))
     generation_ids = [int(rollout.get("generation_id", -1) or -1) for rollout in rollouts]
     runtime_log(
         "rl reward/advantage debug: "
@@ -1074,7 +1433,6 @@ def _log_rollout_reward_diagnostics(
         f"zero_variance_group_count={int(zero_variance_group_count)} "
         f"zero_variance_rollout_count={int(zero_variance_rollout_count)} "
         f"zero_variance_skipped_count={int(zero_variance_skipped_count)} "
-        f"fecv_failed_count={int(fecv_failed_count)} "
         f"reward_mean={float(reward_mean):.6f} "
         f"reward_std={float(reward_std):.6f} "
         f"reward_values={[f'{value:.6f}' for value in reward_values]} "
@@ -1098,108 +1456,38 @@ def _log_rollout_reward_diagnostics(
                 "below_min_weight": bool(abs(float(advantage)) < float(min_weight)),
                 "accuracy_reward": round(float(components.get("accuracy_reward") or 0.0), 6),
                 "weighted_accuracy_reward": round(float(weighted_components.get("accuracy_reward") or 0.0), 6),
-                "fecv_evidence_faithfulness_reward": round(
-                    float(components.get("fecv_evidence_faithfulness_reward") or 0.0),
-                    6,
-                ),
-                "weighted_fecv_evidence_faithfulness_reward": round(
-                    float(weighted_components.get("fecv_evidence_faithfulness_reward") or 0.0),
-                    6,
-                ),
                 "protocol_finalize_reward": round(float(components.get("protocol_finalize_reward") or 0.0), 6),
                 "weighted_protocol_finalize_reward": round(
                     float(weighted_components.get("protocol_finalize_reward") or 0.0),
                     6,
                 ),
-                "fecv_decision_sufficiency_reward": round(
-                    float(components.get("fecv_decision_sufficiency_reward") or 0.0),
-                    6,
-                ),
-                "fecv_specificity_reward": round(float(components.get("fecv_specificity_reward") or 0.0), 6),
-                "fecv_branch_profile": str(reward_summary.get("fecv_branch_profile") or ""),
-                "fecv_profile_source": str(reward_summary.get("fecv_profile_source") or ""),
+                "stage_necessity_reward": round(float(components.get("stage_necessity_reward") or 0.0), 6),
+                "query_alignment_reward": round(float(components.get("query_alignment_reward") or 0.0), 6),
+                "efficiency_reward": round(float(components.get("efficiency_reward") or 0.0), 6),
+                "anomaly_false_normal_penalty": round(float(components.get("anomaly_false_normal_penalty") or 0.0), 6),
                 "advantage_source": str(rollout.get("advantage_source") or ""),
                 "sample_partition": str(rollout.get("sample_partition") or ""),
                 "sample_partition_multiplier": round(
                     float(rollout.get("sample_partition_multiplier") or 1.0),
                     6,
                 ),
-                "fecv_full_selected_available": bool(reward_summary.get("fecv_full_selected_available")),
-                "fecv_normal_case_type": str(reward_summary.get("fecv_normal_case_type") or ""),
-                "fecv_easy_normal_sample_loss_multiplier": round(
-                    float(reward_summary.get("fecv_easy_normal_sample_loss_multiplier") or 1.0),
-                    6,
-                ),
-                "fecv_selected_support_score": round(
-                    float(reward_summary.get("fecv_selected_support_score") or 0.0),
+                "normal_case_type": str(reward_summary.get("normal_case_type") or ""),
+                "easy_normal_sample_loss_multiplier": round(
+                    float(reward_summary.get("easy_normal_sample_loss_multiplier") or 1.0),
                     6,
                 ),
                 "sample_partition_type": str(rollout.get("sample_partition_type") or ""),
                 "advantage_source": str(rollout.get("advantage_source") or "group_relative"),
-                "fecv_trigger_necessity_delta": round(
-                    float(reward_summary.get("fecv_trigger_necessity_delta") or 0.0),
+                "normal_continuous_verifier_score": round(
+                    float(reward_summary.get("normal_continuous_verifier_score") or 0.0),
                     6,
                 ),
-                "fecv_negative_resistance_delta": round(
-                    float(reward_summary.get("fecv_negative_resistance_delta") or 0.0),
-                    6,
+                "normal_verifier_primary_status": str(
+                    reward_summary.get("normal_verifier_primary_status") or "unknown"
                 ),
-                "fecv_normal_continuous_verifier_score": round(
-                    float(reward_summary.get("fecv_normal_continuous_verifier_score") or 0.0),
-                    6,
+                "normal_verifier_next_tool": str(
+                    reward_summary.get("normal_verifier_next_tool") or "unknown"
                 ),
-                "fecv_normal_verifier_primary_status": str(
-                    reward_summary.get("fecv_normal_verifier_primary_status") or "unknown"
-                ),
-                "fecv_normal_verifier_recommended_action": str(
-                    reward_summary.get("fecv_normal_verifier_recommended_action") or "unknown"
-                ),
-                "fecv_normal_verifier_base_status_score": round(
-                    float(reward_summary.get("fecv_normal_verifier_base_status_score") or 0.0),
-                    6,
-                ),
-                "fecv_normal_verifier_action_offset": round(
-                    float(reward_summary.get("fecv_normal_verifier_action_offset") or 0.0),
-                    6,
-                ),
-                "fecv_normal_continuous_verifier_score_before_action": round(
-                    float(reward_summary.get("fecv_normal_continuous_verifier_score_before_action") or 0.0),
-                    6,
-                ),
-                "fecv_normal_continuous_verifier_score_after_action": round(
-                    float(reward_summary.get("fecv_normal_continuous_verifier_score_after_action") or 0.0),
-                    6,
-                ),
-                "fecv_normal_verifier_trace_score": round(
-                    float(reward_summary.get("fecv_normal_verifier_trace_score") or 0.0),
-                    6,
-                ),
-                "fecv_normal_selected_duration_ratio": round(
-                    float(reward_summary.get("fecv_normal_selected_duration_ratio") or 0.0),
-                    6,
-                ),
-                "fecv_normal_grounded_local_score": round(
-                    float(reward_summary.get("fecv_normal_grounded_local_score") or 0.0),
-                    6,
-                ),
-                "fecv_verifier_trace_score": round(
-                    float(reward_summary.get("fecv_verifier_trace_score") or 0.0),
-                    6,
-                ),
-                "fecv_stage_coverage_score": round(
-                    float(reward_summary.get("fecv_stage_coverage_score") or 0.0),
-                    6,
-                ),
-                "fecv_normal_provenance_score": round(
-                    float(reward_summary.get("fecv_normal_provenance_score") or 0.0),
-                    6,
-                ),
-                "fecv_normal_provenance_source_bucket": str(
-                    reward_summary.get("fecv_normal_provenance_source_bucket") or ""
-                ),
-                "fecv_decision_field_scores": dict(reward_summary.get("fecv_decision_field_scores") or {}),
-                "fecv_required_stage_scores": dict(reward_summary.get("fecv_required_stage_scores") or {}),
-                "fecv_failed": bool(rollout.get("fecv_failed")),
             }
         )
     runtime_log(
@@ -1258,25 +1546,24 @@ class _NativeGRPOTrainerMixin:
         self.keep_recent_tool_image_messages = int(config["keep_recent_tool_image_messages"])
         self.keep_recent_text_messages = int(config["keep_recent_text_messages"])
         self.max_seq_length = int(config["max_seq_length"])
-        self.counterfactual_max_images = int(config["counterfactual_max_images"])
         self.policy_do_sample = bool(config["policy_do_sample"])
         self.policy_temperature = config["policy_temperature"]
         self.policy_top_p = config["policy_top_p"]
         self.policy_top_k = config["policy_top_k"]
         self.policy_repetition_penalty = config["policy_repetition_penalty"]
         self.rollout_use_generation_cache = bool(config["rollout_use_generation_cache"])
-        self.fecv_use_generation_cache = bool(config["fecv_use_generation_cache"])
         self.compute_loss_microbatch_size = max(1, int(config["compute_loss_microbatch_size"]))
         self.steps_per_generation = max(1, int(config["steps_per_generation"]))
         self._generation_step_batch_size = max(1, int(config["per_device_train_batch_size"]))
         self._generation_batch_size = max(1, self._generation_step_batch_size * self.steps_per_generation)
+        self.proposal_runtime = config.get("proposal_runtime")
+        self.strict_feature_guided_proposal = bool(config.get("strict_feature_guided_proposal", False))
         self._buffered_generation_step_payloads: List[Dict[str, Any]] = []
         self._buffered_generation_batch_key: Optional[Tuple[Any, ...]] = None
         self.replay_buffer_enable = bool(config["replay_buffer_enable"])
         self.replay_buffer_type = str(config["replay_buffer_type"] or "none").strip().lower()
         self.replay_buffer_capacity = max(0, int(config["replay_buffer_capacity"]))
         self.replay_buffer_alpha = float(config["replay_buffer_alpha"])
-        self.fecv_failure_policy = str(config["fecv_failure_policy"] or "degrade").strip().lower()
         self.all_empty_policy = str(config["all_empty_policy"] or "true_skip").strip().lower()
         self.log_empty_batch_rank_summary = bool(config["log_empty_batch_rank_summary"])
         self.reward_version = str(config["reward_version"] or DEFAULT_RL_REWARD_VERSION).strip().lower()
@@ -1303,16 +1590,20 @@ class _NativeGRPOTrainerMixin:
         self._replay_fill_batches = 0
         self._replay_fill_episode_specs = 0
         self._groups_all_zero_advantage = 0
+        self._skipped_non_finite_old_policy_samples = 0
+        self._skipped_non_finite_compute_samples = 0
         self._zero_variance_group_count = 0
         self._zero_variance_rollout_count = 0
         self._zero_variance_skipped_count = 0
         self._groups_filtered_by_min_weight = 0
-        self._fecv_failure_count = 0
-        self._fecv_degraded_rollout_count = 0
         self._advantage_source_counts: Dict[str, int] = {}
         self._sample_partition_counts: Dict[str, int] = {}
         self._native_rl_skip_next_optimizer_step = False
         self._native_rl_last_skip_reason = ""
+        self._debug_compute_loss_call_index = 0
+        self._debug_last_compute_loss_call_index = 0
+        self._debug_last_compute_loss_prepared_batch_count = 0
+        self._debug_last_compute_loss_rank_local_batch_count = 0
         self.replay_buffer = get_replay_buffer(
             self.replay_buffer_type if self.replay_buffer_enable else "none",
             capacity=self.replay_buffer_capacity,
@@ -1330,13 +1621,573 @@ class _NativeGRPOTrainerMixin:
             num_generations=self.num_generations,
             compute_loss_microbatch_size=self.compute_loss_microbatch_size,
             rollout_use_generation_cache=self.rollout_use_generation_cache,
-            fecv_use_generation_cache=self.fecv_use_generation_cache,
         )
         super().__init__(*trainer_args, **trainer_kwargs)
         if self.reference_model is not None:
             self.reference_model.eval()
             for parameter in self.reference_model.parameters():
                 parameter.requires_grad_(False)
+
+    def _debug_prepared_batch_summary(self, prepared_batch: Dict[str, Any]) -> Dict[str, Any]:
+        completion_ids = prepared_batch.get("completion_ids")
+        completion_shape = None
+        if isinstance(completion_ids, torch.Tensor):
+            completion_shape = tuple(int(dim) for dim in completion_ids.shape)
+        return {
+            "merge_signature": repr(self._prepared_batch_merge_signature(prepared_batch)),
+            "completion_ids_shape": completion_shape,
+        }
+
+    def _prepare_rollout_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = copy.deepcopy(dict(item or {}))
+        if not bool(self.strict_feature_guided_proposal):
+            return prepared
+        multimodal_cache = prepared.get("multimodal_cache")
+        if not isinstance(multimodal_cache, dict):
+            raise ValueError("Strict RL seek_evidence requires multimodal_cache on every rollout item.")
+        if multimodal_cache.get("embedding") is None:
+            raise ValueError("Strict RL seek_evidence requires feature_cache on every rollout item.")
+        if self.proposal_runtime is None:
+            raise ValueError("Strict RL seek_evidence requires proposal_runtime before rollout generation.")
+        multimodal_cache["proposal_runtime"] = self.proposal_runtime
+        multimodal_cache["strict_feature_guided_proposal"] = True
+        prepared["multimodal_cache"] = multimodal_cache
+        return prepared
+
+    @staticmethod
+    def _tensor_debug_summary(value: Any) -> Dict[str, Any]:
+        if not isinstance(value, torch.Tensor):
+            return {"type": type(value).__name__}
+        tensor = value.detach()
+        summary: Dict[str, Any] = {
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "dtype": str(tensor.dtype).replace("torch.", ""),
+            "device": str(tensor.device),
+            "requires_grad": bool(getattr(value, "requires_grad", False)),
+            "numel": int(tensor.numel()),
+        }
+        if tensor.numel() <= 0:
+            summary.update(
+                {
+                    "all_finite": True,
+                    "nan_count": 0,
+                    "posinf_count": 0,
+                    "neginf_count": 0,
+                }
+            )
+            return summary
+        tensor_f = tensor.to(dtype=torch.float32)
+        finite_mask = torch.isfinite(tensor_f)
+        summary.update(
+            {
+                "all_finite": bool(torch.all(finite_mask).item()),
+                "nan_count": int(torch.isnan(tensor_f).sum().item()),
+                "posinf_count": int(torch.isposinf(tensor_f).sum().item()),
+                "neginf_count": int(torch.isneginf(tensor_f).sum().item()),
+            }
+        )
+        if bool(torch.any(finite_mask)):
+            finite_values = tensor_f.masked_select(finite_mask)
+            summary.update(
+                {
+                    "min": float(finite_values.min().item()),
+                    "max": float(finite_values.max().item()),
+                    "mean": float(finite_values.mean().item()),
+                }
+            )
+        return summary
+
+    def _non_finite_dump_dir(self) -> Path:
+        output_dir = str(getattr(getattr(self, "args", None), "output_dir", "") or "").strip()
+        base_dir = Path(output_dir) if output_dir else Path.cwd()
+        dump_dir = base_dir / "non_finite_dumps"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        return dump_dir
+
+    def _raise_non_finite_training_error(
+        self,
+        *,
+        stage: str,
+        tensor_name: str,
+        tensor_value: Any,
+        batch: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        runtime = distributed_runtime_from_env()
+        batch_summary = None
+        if isinstance(batch, dict):
+            batch_summary = {
+                "merge_signature": repr(self._prepared_batch_merge_signature(batch)),
+                "prompt_ids": self._tensor_debug_summary(batch.get("prompt_ids")),
+                "completion_ids": self._tensor_debug_summary(batch.get("completion_ids")),
+                "completion_mask": self._tensor_debug_summary(batch.get("completion_mask")),
+                "token_loss_weight": self._tensor_debug_summary(batch.get("token_loss_weight")),
+                "advantage": self._tensor_debug_summary(batch.get("advantage")),
+                "sample_loss_multiplier": self._tensor_debug_summary(batch.get("sample_loss_multiplier")),
+                "old_policy_token_log_probs": self._tensor_debug_summary(batch.get("old_policy_token_log_probs")),
+                "multimodal_input_keys": sorted(self._episode_spec_multimodal_inputs(batch).keys()),
+            }
+        payload = {
+            "timestamp": utc_timestamp(),
+            "stage": str(stage or ""),
+            "tensor_name": str(tensor_name or ""),
+            "tensor_summary": self._tensor_debug_summary(tensor_value),
+            "compute_loss_call": int(getattr(self, "_debug_last_compute_loss_call_index", 0)),
+            "local_prepared_batch_count": int(getattr(self, "_debug_last_compute_loss_rank_local_batch_count", 0)),
+            "runtime": {
+                "local_rank": int(getattr(runtime, "local_rank", 0) or 0),
+                "global_rank": int(getattr(runtime, "global_rank", 0) or 0),
+                "world_size": int(getattr(runtime, "world_size", 1) or 1),
+            },
+            "batch_summary": batch_summary,
+            "extra": dict(extra or {}),
+        }
+        dump_path = self._non_finite_dump_dir() / (
+            f"{utc_timestamp()}_{str(stage or 'unknown')}_"
+            f"rank{int(getattr(runtime, 'local_rank', 0) or 0)}_"
+            f"call{int(getattr(self, '_debug_last_compute_loss_call_index', 0))}.json"
+        )
+        write_json(dump_path, payload)
+        runtime_log(
+            (
+                "trainer-native RL detected non-finite tensor and aborted: "
+                f"stage={str(stage or '')} tensor={str(tensor_name or '')} dump={dump_path}"
+            ),
+            runtime=runtime,
+            main_process_only=False,
+        )
+        raise RuntimeError(
+            "Active RL encountered a non-finite tensor and aborted to prevent poisoned training: "
+            f"stage={str(stage or '')} tensor={str(tensor_name or '')} dump={dump_path}"
+        )
+
+    def _assert_finite_tensor(
+        self,
+        *,
+        stage: str,
+        tensor_name: str,
+        tensor_value: Any,
+        batch: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not isinstance(tensor_value, torch.Tensor):
+            return
+        if bool(torch.all(torch.isfinite(tensor_value.detach())).item()):
+            return
+        self._raise_non_finite_training_error(
+            stage=stage,
+            tensor_name=tensor_name,
+            tensor_value=tensor_value,
+            batch=batch,
+            extra=extra,
+        )
+
+    def _iter_named_trainable_tensors(
+        self,
+        model: Any,
+        *,
+        tensor_kind: str,
+    ):
+        unwrapped_model = _unwrap_model(model)
+        named_parameters = getattr(unwrapped_model, "named_parameters", None)
+        if not callable(named_parameters):
+            return
+        for name, parameter in named_parameters():
+            if not isinstance(parameter, torch.Tensor) or not bool(getattr(parameter, "requires_grad", False)):
+                continue
+            tensor_value = None
+            if str(tensor_kind or "").strip() == "params":
+                tensor_value = parameter.detach()
+            elif str(tensor_kind or "").strip() == "grads":
+                grad_value = getattr(parameter, "grad", None)
+                if isinstance(grad_value, torch.Tensor):
+                    tensor_value = grad_value.detach()
+            if not isinstance(tensor_value, torch.Tensor):
+                continue
+            yield str(name or ""), tensor_value
+
+    @staticmethod
+    def _named_tensor_non_finite_summary(name: str, tensor: torch.Tensor) -> Dict[str, Any]:
+        value = tensor.detach()
+        if bool(getattr(value, "is_sparse", False)):
+            value = value.coalesce().values()
+        summary: Dict[str, Any] = {
+            "name": str(name or ""),
+            "shape": tuple(int(dim) for dim in value.shape),
+            "dtype": str(value.dtype).replace("torch.", ""),
+            "device": str(value.device),
+            "numel": int(value.numel()),
+            "layout": str(value.layout),
+        }
+        if value.numel() <= 0:
+            summary.update(
+                {
+                    "all_finite": True,
+                    "nan_count": 0,
+                    "posinf_count": 0,
+                    "neginf_count": 0,
+                }
+            )
+            return summary
+        finite_mask = torch.isfinite(value)
+        summary.update(
+            {
+                "all_finite": bool(torch.all(finite_mask).item()),
+                "nan_count": int(torch.isnan(value).sum().item()),
+                "posinf_count": int(torch.isposinf(value).sum().item()),
+                "neginf_count": int(torch.isneginf(value).sum().item()),
+            }
+        )
+        return summary
+
+    def _scan_non_finite_trainable_tensors(
+        self,
+        model: Any,
+        *,
+        tensor_kind: str,
+        max_entries: int = 8,
+    ) -> Dict[str, Any]:
+        checked_count = 0
+        non_finite_count = 0
+        entries: List[Dict[str, Any]] = []
+        for name, tensor in self._iter_named_trainable_tensors(model, tensor_kind=tensor_kind) or []:
+            checked_count += 1
+            if bool(torch.all(torch.isfinite(tensor)).item()):
+                continue
+            non_finite_count += 1
+            if len(entries) < max(1, int(max_entries)):
+                entries.append(self._named_tensor_non_finite_summary(name=name, tensor=tensor))
+        return {
+            "tensor_kind": str(tensor_kind or ""),
+            "checked_count": int(checked_count),
+            "non_finite_count": int(non_finite_count),
+            "entries": entries,
+        }
+
+    def _raise_non_finite_trainable_tensors_error(
+        self,
+        *,
+        stage: str,
+        model: Any,
+        tensor_kind: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        scan = self._scan_non_finite_trainable_tensors(model, tensor_kind=tensor_kind)
+        if int(scan.get("non_finite_count", 0)) <= 0:
+            return
+        runtime = distributed_runtime_from_env()
+        payload = {
+            "timestamp": utc_timestamp(),
+            "stage": str(stage or ""),
+            "tensor_kind": str(tensor_kind or ""),
+            "compute_loss_call": int(getattr(self, "_debug_last_compute_loss_call_index", 0)),
+            "local_prepared_batch_count": int(getattr(self, "_debug_last_compute_loss_rank_local_batch_count", 0)),
+            "runtime": {
+                "local_rank": int(getattr(runtime, "local_rank", 0) or 0),
+                "global_rank": int(getattr(runtime, "global_rank", 0) or 0),
+                "world_size": int(getattr(runtime, "world_size", 1) or 1),
+            },
+            "trainer_state": {
+                "global_step": int(getattr(getattr(self, "state", None), "global_step", 0) or 0),
+                "epoch": float(getattr(getattr(self, "state", None), "epoch", 0.0) or 0.0),
+            },
+            "scan": scan,
+            "extra": dict(extra or {}),
+        }
+        dump_path = self._non_finite_dump_dir() / (
+            f"{utc_timestamp()}_{str(stage or 'non_finite_model_state')}_"
+            f"rank{int(getattr(runtime, 'local_rank', 0) or 0)}_"
+            f"call{int(getattr(self, '_debug_last_compute_loss_call_index', 0))}.json"
+        )
+        write_json(dump_path, payload)
+        runtime_log(
+            (
+                "trainer-native RL detected non-finite trainable tensors and aborted: "
+                f"stage={str(stage or '')} tensor_kind={str(tensor_kind or '')} dump={dump_path}"
+            ),
+            runtime=runtime,
+            main_process_only=False,
+        )
+        raise RuntimeError(
+            "Active RL detected non-finite trainable tensors and aborted to preserve forensics: "
+            f"stage={str(stage or '')} tensor_kind={str(tensor_kind or '')} dump={dump_path}"
+        )
+
+    def _write_deepspeed_flat_master_forensics_dump(
+        self,
+        *,
+        stage: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        candidates = []
+        deepspeed_engine = getattr(self, "deepspeed", None)
+        if deepspeed_engine is not None:
+            candidates.append(deepspeed_engine)
+        model_wrapped = getattr(self, "model_wrapped", None)
+        if model_wrapped is not None and model_wrapped is not deepspeed_engine:
+            candidates.append(model_wrapped)
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            candidates.append(optimizer)
+
+        for candidate in candidates:
+            candidate_optimizer = getattr(candidate, "optimizer", None)
+            if isinstance(candidate_optimizer, _NativeRLOptimizerStepProxy):
+                candidate_optimizer = getattr(candidate_optimizer, "_optimizer", None)
+            if candidate_optimizer is None:
+                continue
+            dump_path = _write_flat_master_forensics_dump(
+                trainer=self,
+                optimizer=candidate_optimizer,
+                stage=stage,
+                extra=extra,
+            )
+            if dump_path is not None:
+                return dump_path
+        return None
+
+    def _assert_finite_trainable_parameters(
+        self,
+        *,
+        stage: str,
+        model: Any,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._raise_non_finite_trainable_tensors_error(
+            stage=stage,
+            model=model,
+            tensor_kind="params",
+            extra=extra,
+        )
+
+    def _assert_finite_trainable_gradients(
+        self,
+        *,
+        stage: str,
+        model: Any,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._raise_non_finite_trainable_tensors_error(
+            stage=stage,
+            model=model,
+            tensor_kind="grads",
+            extra=extra,
+        )
+
+    def _old_policy_prefill_entry_debug_rows(
+        self,
+        episode_entries: Optional[Sequence[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for row_index, entry in enumerate(list(episode_entries or [])):
+            if not isinstance(entry, dict):
+                continue
+            debug_plan = dict(entry.get("episode_debug_metadata") or {})
+            episode_spec = dict(entry.get("episode_spec") or {})
+            completion_ids = episode_spec.get("completion_ids")
+            prompt_ids = episode_spec.get("prompt_ids")
+            rows.append(
+                {
+                    "row_index": int(row_index),
+                    "video_id": str(entry.get("video_id") or ""),
+                    "group_id": str(entry.get("group_id") or ""),
+                    "generation_id": int(entry.get("generation_id", -1) or -1),
+                    "sample_partition": str(entry.get("sample_partition") or ""),
+                    "sample_partition_type": str(entry.get("sample_partition_type") or ""),
+                    "advantage_source": str(entry.get("advantage_source") or ""),
+                    "message_plan": copy.deepcopy(list(debug_plan.get("message_plan") or [])),
+                    "assistant_supervision": copy.deepcopy(list(debug_plan.get("assistant_supervision") or [])),
+                    "retained_image_provenance": copy.deepcopy(list(debug_plan.get("retained_image_provenance") or [])),
+                    "retained_message_count": int(debug_plan.get("retained_message_count") or 0),
+                    "prompt_ids_shape": (
+                        tuple(int(dim) for dim in prompt_ids.shape) if isinstance(prompt_ids, torch.Tensor) else None
+                    ),
+                    "completion_ids_shape": (
+                        tuple(int(dim) for dim in completion_ids.shape)
+                        if isinstance(completion_ids, torch.Tensor)
+                        else None
+                    ),
+                }
+            )
+        return rows
+
+    def _summarize_old_policy_prefill_model_inputs(
+        self,
+        model_inputs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        summaries: Dict[str, Any] = {}
+        for key in ("input_ids", "attention_mask"):
+            if key in model_inputs:
+                summaries[key] = self._tensor_debug_summary(model_inputs.get(key))
+        for key, value in sorted(dict(model_inputs or {}).items()):
+            key_name = str(key)
+            if key_name in summaries:
+                continue
+            if self._is_visual_multimodal_tensor_key(key_name):
+                summaries[key_name] = self._tensor_debug_summary(value)
+        return summaries
+
+    def _write_old_policy_prefill_debug_dump(
+        self,
+        *,
+        stage: str,
+        prepared_batch: Dict[str, Any],
+        model_inputs: Dict[str, Any],
+        episode_entries: Optional[Sequence[Dict[str, Any]]],
+        error: Optional[BaseException] = None,
+        tensor_name: str = "",
+        tensor_value: Any = None,
+    ) -> Path:
+        runtime = distributed_runtime_from_env()
+        payload: Dict[str, Any] = {
+            "timestamp": utc_timestamp(),
+            "stage": str(stage or ""),
+            "tensor_name": str(tensor_name or ""),
+            "compute_loss_call": int(getattr(self, "_debug_last_compute_loss_call_index", 0)),
+            "local_prepared_batch_count": int(getattr(self, "_debug_last_compute_loss_rank_local_batch_count", 0)),
+            "runtime": {
+                "local_rank": int(getattr(runtime, "local_rank", 0) or 0),
+                "global_rank": int(getattr(runtime, "global_rank", 0) or 0),
+                "world_size": int(getattr(runtime, "world_size", 1) or 1),
+            },
+            "prepared_batch_summary": {
+                "merge_signature": repr(self._prepared_batch_merge_signature(prepared_batch)),
+                "prompt_ids": self._tensor_debug_summary(prepared_batch.get("prompt_ids")),
+                "completion_ids": self._tensor_debug_summary(prepared_batch.get("completion_ids")),
+                "completion_mask": self._tensor_debug_summary(prepared_batch.get("completion_mask")),
+            },
+            "model_input_summaries": self._summarize_old_policy_prefill_model_inputs(model_inputs),
+            "episode_entries": self._old_policy_prefill_entry_debug_rows(episode_entries),
+        }
+        if isinstance(tensor_value, torch.Tensor):
+            payload["tensor_summary"] = self._tensor_debug_summary(tensor_value)
+        if error is not None:
+            payload["error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+        dump_path = self._non_finite_dump_dir() / (
+            f"{utc_timestamp()}_{str(stage or 'old_policy_prefill')}_"
+            f"rank{int(getattr(runtime, 'local_rank', 0) or 0)}_"
+            f"call{int(getattr(self, '_debug_last_compute_loss_call_index', 0))}.json"
+        )
+        write_json(dump_path, payload)
+        return dump_path
+
+    def _assert_finite_old_policy_prefill_inputs(
+        self,
+        *,
+        prepared_batch: Dict[str, Any],
+        model_inputs: Dict[str, Any],
+        episode_entries: Optional[Sequence[Dict[str, Any]]],
+    ) -> None:
+        for key in ("input_ids", "attention_mask"):
+            value = model_inputs.get(key)
+            if not isinstance(value, torch.Tensor):
+                continue
+            if bool(torch.all(torch.isfinite(value.detach())).item()):
+                continue
+            dump_path = self._write_old_policy_prefill_debug_dump(
+                stage="old_policy_prefill_inputs_non_finite",
+                prepared_batch=prepared_batch,
+                model_inputs=model_inputs,
+                episode_entries=episode_entries,
+                tensor_name=key,
+                tensor_value=value,
+            )
+            raise RuntimeError(
+                "Active RL old-policy prefill received a non-finite tensor input and aborted: "
+                f"tensor={key} dump={dump_path}"
+            )
+        for key, value in sorted(dict(model_inputs or {}).items()):
+            key_name = str(key)
+            if key_name in {"input_ids", "attention_mask"}:
+                continue
+            if not self._is_visual_multimodal_tensor_key(key_name) or not isinstance(value, torch.Tensor):
+                continue
+            if bool(torch.all(torch.isfinite(value.detach())).item()):
+                continue
+            dump_path = self._write_old_policy_prefill_debug_dump(
+                stage="old_policy_prefill_inputs_non_finite",
+                prepared_batch=prepared_batch,
+                model_inputs=model_inputs,
+                episode_entries=episode_entries,
+                tensor_name=key_name,
+                tensor_value=value,
+            )
+            raise RuntimeError(
+                "Active RL old-policy prefill received a non-finite multimodal tensor and aborted: "
+                f"tensor={key_name} dump={dump_path}"
+            )
+
+    def _non_finite_skip_summary_path(self) -> Path:
+        return self._non_finite_dump_dir() / "skipped_non_finite_samples.jsonl"
+
+    @staticmethod
+    def _is_skippable_sample_exception(exc: BaseException) -> bool:
+        del exc
+        return False
+
+    @staticmethod
+    def _skippable_sample_exception_reason(exc: BaseException) -> str:
+        if isinstance(exc, torch.OutOfMemoryError):
+            return "oom"
+        message = str(exc or "").lower()
+        if "non-finite" in message or "non finite" in message or "nan" in message or "inf" in message:
+            return "non_finite"
+        return type(exc).__name__
+
+    def _write_skipped_sample_dump(
+        self,
+        *,
+        stage: str,
+        episode_entry: Dict[str, Any],
+        error: BaseException,
+        prepared_batch: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        runtime = distributed_runtime_from_env()
+        payload: Dict[str, Any] = {
+            "timestamp": utc_timestamp(),
+            "stage": str(stage or ""),
+            "reason": self._skippable_sample_exception_reason(error),
+            "compute_loss_call": int(getattr(self, "_debug_last_compute_loss_call_index", 0)),
+            "local_prepared_batch_count": int(getattr(self, "_debug_last_compute_loss_rank_local_batch_count", 0)),
+            "runtime": {
+                "local_rank": int(getattr(runtime, "local_rank", 0) or 0),
+                "global_rank": int(getattr(runtime, "global_rank", 0) or 0),
+                "world_size": int(getattr(runtime, "world_size", 1) or 1),
+            },
+            "episode_entry": (
+                self._old_policy_prefill_entry_debug_rows([episode_entry])[0]
+                if isinstance(episode_entry, dict)
+                else {}
+            ),
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+            "extra": dict(extra or {}),
+        }
+        if isinstance(prepared_batch, dict):
+            payload["prepared_batch_summary"] = {
+                "merge_signature": repr(self._prepared_batch_merge_signature(prepared_batch)),
+                "prompt_ids": self._tensor_debug_summary(prepared_batch.get("prompt_ids")),
+                "completion_ids": self._tensor_debug_summary(prepared_batch.get("completion_ids")),
+                "completion_mask": self._tensor_debug_summary(prepared_batch.get("completion_mask")),
+                "token_loss_weight": self._tensor_debug_summary(prepared_batch.get("token_loss_weight")),
+                "old_policy_token_log_probs": self._tensor_debug_summary(prepared_batch.get("old_policy_token_log_probs")),
+                "multimodal_input_keys": sorted(self._episode_spec_multimodal_inputs(prepared_batch).keys()),
+            }
+        dump_path = self._non_finite_dump_dir() / (
+            f"{utc_timestamp()}_{str(stage or 'skipped_sample')}_"
+            f"rank{int(getattr(runtime, 'local_rank', 0) or 0)}_"
+            f"call{int(getattr(self, '_debug_last_compute_loss_call_index', 0))}_"
+            f"gen{int(episode_entry.get('generation_id', -1) or -1)}.json"
+        )
+        write_json(dump_path, payload)
+        append_jsonl(self._non_finite_skip_summary_path(), payload)
+        return dump_path
 
     def _classify_rollout_partition(self, rollout: Dict[str, Any]) -> str:
         return _resolve_sample_partition(rollout)
@@ -1440,8 +2291,9 @@ class _NativeGRPOTrainerMixin:
             mini_repeat_count=1,
             batch_size=max(1, int(self._generation_batch_size)),
             repeat_count=max(1, int(self.steps_per_generation)),
-            shuffle=False,
+            shuffle=True,
             seed=getattr(self.args, "seed", None),
+            sort_key_fn=_raw_item_workload_sort_key,
         )
 
     def _mark_skip_next_optimizer_step(self, *, reason: str, all_empty: bool = False) -> None:
@@ -1466,7 +2318,6 @@ class _NativeGRPOTrainerMixin:
                 f"episode_specs={int(runtime_stats.get('raw_local_episode_spec_count', 0))} "
                 f"prepared_batches={int(runtime_stats.get('raw_local_prepared_batch_count', 0))} "
                 f"trainable_samples={int(trainable_samples)} "
-                f"fecv_failures={int(runtime_stats.get('local_fecv_failure_count', 0))} "
                 f"min_weight_drops={int(runtime_stats.get('groups_filtered_by_min_weight', 0))} "
                 f"replay_fills={int(runtime_stats.get('replay_fill_batches', 0))}"
             ),
@@ -1506,10 +2357,10 @@ class _NativeGRPOTrainerMixin:
         return {
             "reward_total": [],
             "reward_accuracy": [],
-            "reward_fecv_evidence": [],
             "reward_protocol_finalize": [],
-            "reward_fecv_decision": [],
-            "reward_fecv_specificity": [],
+            "reward_stage_necessity": [],
+            "reward_query_alignment": [],
+            "reward_efficiency": [],
         }
 
     def _new_runtime_stats(self) -> Dict[str, int]:
@@ -1517,7 +2368,6 @@ class _NativeGRPOTrainerMixin:
             "raw_local_episode_spec_count": 0,
             "raw_local_prepared_batch_count": 0,
             "raw_local_sample_count": 0,
-            "local_fecv_failure_count": 0,
             "groups_filtered_by_min_weight": 0,
             "groups_all_zero_advantage": 0,
             "zero_variance_group_count": 0,
@@ -1554,8 +2404,14 @@ class _NativeGRPOTrainerMixin:
         }
 
     def _can_reuse_current_policy_as_old_logprobs(self) -> bool:
+        steps_per_generation = int(getattr(self, "steps_per_generation", 1) or 1)
+        explicit_setting = getattr(self, "allow_reuse_current_policy_as_old_logprobs", None)
+        if explicit_setting is None:
+            return steps_per_generation <= 1
+        if not bool(explicit_setting):
+            return False
         gradient_accumulation_steps = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
-        return int(self.steps_per_generation) <= max(1, gradient_accumulation_steps)
+        return steps_per_generation <= max(1, gradient_accumulation_steps)
 
     def _build_generation_item_payload(
         self,
@@ -1580,8 +2436,6 @@ class _NativeGRPOTrainerMixin:
         item_materialization_total = 0
         item_materialized_completed = 0
         for rollout in scored_rollouts:
-            if bool(rollout.get("fecv_failed")):
-                runtime_stats["local_fecv_failure_count"] += 1
             sample_partition = str(
                 rollout.get("sample_partition")
                 or rollout.get("sample_partition_type")
@@ -1598,18 +2452,12 @@ class _NativeGRPOTrainerMixin:
             components = dict(reward_summary.get("components") or {})
             rollout_metrics["reward_total"].append(_safe_float(reward_summary.get("total_reward")))
             rollout_metrics["reward_accuracy"].append(_safe_float(components.get("accuracy_reward")))
-            rollout_metrics["reward_fecv_evidence"].append(
-                _safe_float(components.get("fecv_evidence_faithfulness_reward"))
-            )
             rollout_metrics["reward_protocol_finalize"].append(
                 _safe_float(components.get("protocol_finalize_reward"))
             )
-            rollout_metrics["reward_fecv_decision"].append(
-                _safe_float(components.get("fecv_decision_sufficiency_reward"))
-            )
-            rollout_metrics["reward_fecv_specificity"].append(
-                _safe_float(components.get("fecv_specificity_reward"))
-            )
+            rollout_metrics["reward_stage_necessity"].append(_safe_float(components.get("stage_necessity_reward")))
+            rollout_metrics["reward_query_alignment"].append(_safe_float(components.get("query_alignment_reward")))
+            rollout_metrics["reward_efficiency"].append(_safe_float(components.get("efficiency_reward")))
             rollout_advantage = abs(float(rollout.get("group_advantage", 0.0) or 0.0))
             if bool(rollout.get("zero_variance_group")):
                 runtime_stats["groups_all_zero_advantage"] += 1
@@ -1768,12 +2616,6 @@ class _NativeGRPOTrainerMixin:
             use_generation_cache=self.rollout_use_generation_cache,
         )
 
-    def _build_fecv_policy(self, model: Any) -> QwenGenerationPolicy:
-        return self._build_policy(
-            model,
-            use_generation_cache=self.fecv_use_generation_cache,
-        )
-
     def _generate_scored_rollouts(
         self,
         item: Dict[str, Any],
@@ -1782,10 +2624,9 @@ class _NativeGRPOTrainerMixin:
         progress: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         rollout_policy = self._build_rollout_policy(model)
-        verification_policy = self._build_fecv_policy(model)
         rollouts: List[Dict[str, Any]] = []
         video_id = str(item.get("video_id") or "")
-        rollout_items = [dict(item) for _ in range(self.num_generations)]
+        rollout_items = [self._prepare_rollout_item(item) for _ in range(self.num_generations)]
         batch_rollout_fn = getattr(self.rollout_runner, "run_episodes", None)
         if callable(batch_rollout_fn):
             generated_rollouts = list(
@@ -1861,48 +2702,12 @@ class _NativeGRPOTrainerMixin:
             if isinstance(evidence, dict) and isinstance(evidence.get("evidence_moments"), list):
                 rollout["scoring_evidence_moments"] = copy.deepcopy(evidence.get("evidence_moments") or [])
             try:
-                rollout.update(
-                    run_counterfactual_verification(
-                        verification_policy,
-                        item=item,
-                        rollout=rollout,
-                        reference_record=item,
-                        max_images=self.counterfactual_max_images,
-                        branch_profile="online_core",
-                    )
-                )
-            except Exception as exc:
-                if self.fecv_failure_policy == "fail":
-                    raise
-                self._fecv_failure_count += 1
-                rollout["fecv_failed"] = True
-                rollout["fecv_failure_message"] = _truncate_error_message(exc)
-                rollout["fecv_failure_type"] = type(exc).__name__
-                rollout["fecv_failure_policy"] = self.fecv_failure_policy
-                if self.fecv_failure_policy == "drop":
-                    rollout["drop_due_to_fecv_failure"] = True
-            finally:
-                if progress is not None:
-                    progress.advance_generation_stage(
-                        video_id=str(rollout.get("video_id") or video_id),
-                        generation_id=int(generation_id),
-                        stage="fecv",
-                    )
-            if bool(rollout.get("drop_due_to_fecv_failure")):
-                continue
-            try:
                 rollout["reward_summary"] = score_rollout_trace(
                     rollout,
                     reward_version=self.reward_version,
                     reward_config=self.reward_config,
                     llm_judge=self.reward_judge,
                 )
-                if bool(rollout.get("fecv_failed")):
-                    rollout["reward_summary"] = _degrade_reward_summary_for_fecv_failure(
-                        rollout["reward_summary"],
-                        error_message=str(rollout.get("fecv_failure_message") or ""),
-                    )
-                    self._fecv_degraded_rollout_count += 1
             finally:
                 if progress is not None:
                     progress.advance_generation_stage(
@@ -1985,7 +2790,7 @@ class _NativeGRPOTrainerMixin:
                 f"group_advantage={float(rollout_advantage):.6f} "
                 f"sample_partition_type={partition} "
                 f"advantage_source={str(rollout.get('advantage_source') or 'group_relative')} "
-                f"normal_case_type={str(reward_summary.get('fecv_normal_case_type') or '')} "
+                f"normal_case_type={str(reward_summary.get('normal_case_type') or '')} "
                 f"sample_loss_multiplier={float(effective_loss_multiplier):.6f} "
                 f"drop_reason={str(result.drop_reason or 'unknown')} "
                 f"completion_token_count={int(getattr(result, 'completion_token_count', 0) or 0)} "
@@ -2007,8 +2812,7 @@ class _NativeGRPOTrainerMixin:
             "sample_partition_multiplier": float(effective_loss_multiplier),
             "advantage_source": str(rollout.get("advantage_source") or "group_relative"),
             "reward_summary": copy.deepcopy(rollout.get("reward_summary") or {}),
-            "fecv_failed": bool(rollout.get("fecv_failed")),
-            "fecv_failure_message": str(rollout.get("fecv_failure_message") or ""),
+            "episode_debug_metadata": copy.deepcopy(dict(result.cached_plan or {})),
         }
 
     def _reserved_episode_spec_keys(self) -> set[str]:
@@ -2025,6 +2829,7 @@ class _NativeGRPOTrainerMixin:
             "token_loss_weight",
             "sample_loss_multiplier",
             "multimodal_inputs",
+            "_source_episode_entries",
         }
 
     def _episode_spec_multimodal_inputs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -2204,6 +3009,23 @@ class _NativeGRPOTrainerMixin:
             )
         return multiplier
 
+    def _sample_loss_weight_summary(
+        self,
+        batch: Dict[str, Any],
+        *,
+        device: torch.device,
+        sample_count: int,
+    ) -> Tuple[torch.Tensor, int, float]:
+        multiplier = self._sample_loss_multiplier(
+            batch,
+            device=device,
+            sample_count=sample_count,
+        )
+        active_mask = multiplier > 0
+        active_count = int(active_mask.sum().item())
+        effective_weight_sum = float(multiplier.clamp_min(0.0).sum().item())
+        return multiplier, active_count, effective_weight_sum
+
     def _sequence_pad_values(self) -> Dict[str, Tuple[Any, str]]:
         return {
             "prompt_ids": (self._pad_token_id(), "left"),
@@ -2224,6 +3046,8 @@ class _NativeGRPOTrainerMixin:
             if not isinstance(value, dict):
                 raise ValueError("Expected dict values for prepared batch key 'multimodal_inputs'.")
             return self._multimodal_inputs_signature(value)
+        if key == "_source_episode_entries":
+            return ("debug_source_entries",)
         if key == "old_policy_token_log_probs" and value is None:
             return ("reuse_current_policy_logprobs",)
         if not isinstance(value, torch.Tensor):
@@ -2373,17 +3197,49 @@ class _NativeGRPOTrainerMixin:
         model: Any,
         *,
         prepared_batch: Dict[str, Any],
+        episode_entries: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
+        multimodal_inputs = self._episode_spec_multimodal_inputs(prepared_batch)
+        model_inputs, logits_to_keep = build_completion_only_model_inputs(
+            prompt_ids=prepared_batch["prompt_ids"],
+            prompt_mask=prepared_batch["prompt_mask"],
+            completion_ids=prepared_batch["completion_ids"],
+            completion_mask=prepared_batch["completion_mask"],
+            multimodal_inputs=multimodal_inputs,
+        )
+        self._assert_finite_old_policy_prefill_inputs(
+            prepared_batch=prepared_batch,
+            model_inputs=model_inputs,
+            episode_entries=episode_entries,
+        )
         with torch.inference_mode():
-            old_policy_token_log_probs, _ = compute_completion_only_token_log_probs_from_ids(
-                model=model,
-                prompt_ids=prepared_batch["prompt_ids"],
-                prompt_mask=prepared_batch["prompt_mask"],
-                completion_ids=prepared_batch["completion_ids"],
-                completion_mask=prepared_batch["completion_mask"],
-                multimodal_inputs=self._episode_spec_multimodal_inputs(prepared_batch),
-                temperature=self.policy_temperature,
-            )
+            try:
+                old_policy_token_log_probs, _ = compute_completion_only_token_log_probs_from_prepared_inputs(
+                    model=model,
+                    model_inputs=model_inputs,
+                    completion_ids=prepared_batch["completion_ids"],
+                    completion_mask=prepared_batch["completion_mask"],
+                    logits_to_keep=logits_to_keep,
+                    temperature=self.policy_temperature,
+                    log_runtime_details=True,
+                )
+            except Exception as exc:
+                dump_path = self._write_old_policy_prefill_debug_dump(
+                    stage="old_policy_prefill_forward_exception",
+                    prepared_batch=prepared_batch,
+                    model_inputs=model_inputs,
+                    episode_entries=episode_entries,
+                    error=exc,
+                )
+                runtime_log(
+                    (
+                        "trainer-native RL old-policy prefill failed and dumped context: "
+                        f"dump={dump_path} error={type(exc).__name__}: {exc}"
+                    ),
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=False,
+                )
+                raise
         return old_policy_token_log_probs.detach().cpu()
 
     def _populate_old_policy_log_probs(
@@ -2401,38 +3257,98 @@ class _NativeGRPOTrainerMixin:
             list(episode_specs),
             signature_fn=lambda item: self._prepared_batch_merge_signature(item["episode_spec"]),
         )
+        retained_episode_specs: List[Dict[str, Any]] = []
         for bucket in grouped_episode_specs:
             prepared_batches = [
                 self._move_episode_spec_to_device(entry["episode_spec"], device=target_device)
                 for entry in bucket
             ]
             if len(prepared_batches) == 1:
-                batched_log_probs = self._compute_old_policy_token_log_probs_for_prepared_batch(
-                    model,
-                    prepared_batch=prepared_batches[0],
-                )
+                try:
+                    batched_log_probs = self._compute_old_policy_token_log_probs_for_prepared_batch(
+                        model,
+                        prepared_batch=prepared_batches[0],
+                        episode_entries=bucket,
+                    )
+                except Exception as exc:
+                    if not self._is_skippable_sample_exception(exc):
+                        raise
+                    dump_path = self._write_skipped_sample_dump(
+                        stage="old_policy_prefill_skipped_sample",
+                        episode_entry=bucket[0],
+                        prepared_batch=prepared_batches[0],
+                        error=exc,
+                    )
+                    runtime_log(
+                        (
+                            "trainer-native RL skipped a sample during old-policy prefill: "
+                            f"video_id={str(bucket[0].get('video_id') or '') or 'unknown'} "
+                            f"generation_id={int(bucket[0].get('generation_id', -1) or -1)} "
+                            f"dump={dump_path}"
+                        ),
+                        runtime=distributed_runtime_from_env(),
+                        main_process_only=False,
+                    )
+                    self._skipped_non_finite_old_policy_samples += 1
+                    continue
             else:
                 try:
                     merged_batch = self._merge_prepared_batches(prepared_batches)
                 except ValueError as exc:
                     if not self._is_merge_fallback_error(exc):
                         raise
-                    for entry, prepared_batch in zip(bucket, prepared_batches):
-                        entry["old_policy_token_log_probs"] = self._compute_old_policy_token_log_probs_for_prepared_batch(
+                    merged_batch = None
+                if merged_batch is not None:
+                    try:
+                        batched_log_probs = self._compute_old_policy_token_log_probs_for_prepared_batch(
                             model,
-                            prepared_batch=prepared_batch,
+                            prepared_batch=merged_batch,
+                            episode_entries=bucket,
                         )
+                    except Exception as exc:
+                        if not self._is_skippable_sample_exception(exc):
+                            raise
+                        merged_batch = None
+                if merged_batch is None:
+                    recovered_entries: List[Dict[str, Any]] = []
+                    for entry, prepared_batch in zip(bucket, prepared_batches):
+                        try:
+                            entry["old_policy_token_log_probs"] = self._compute_old_policy_token_log_probs_for_prepared_batch(
+                                model,
+                                prepared_batch=prepared_batch,
+                                episode_entries=[entry],
+                            )
+                        except Exception as single_exc:
+                            if not self._is_skippable_sample_exception(single_exc):
+                                raise
+                            dump_path = self._write_skipped_sample_dump(
+                                stage="old_policy_prefill_skipped_sample",
+                                episode_entry=entry,
+                                prepared_batch=prepared_batch,
+                                error=single_exc,
+                            )
+                            runtime_log(
+                                (
+                                    "trainer-native RL skipped a sample during old-policy prefill recovery: "
+                                    f"video_id={str(entry.get('video_id') or '') or 'unknown'} "
+                                    f"generation_id={int(entry.get('generation_id', -1) or -1)} "
+                                    f"dump={dump_path}"
+                                ),
+                                runtime=distributed_runtime_from_env(),
+                                main_process_only=False,
+                            )
+                            self._skipped_non_finite_old_policy_samples += 1
+                            continue
+                        recovered_entries.append(entry)
+                    retained_episode_specs.extend(recovered_entries)
                     continue
-                batched_log_probs = self._compute_old_policy_token_log_probs_for_prepared_batch(
-                    model,
-                    prepared_batch=merged_batch,
-                )
             for row_index, entry in enumerate(bucket):
                 completion_length = int(entry["episode_spec"]["completion_ids"].shape[-1])
                 entry["old_policy_token_log_probs"] = (
                     batched_log_probs[row_index : row_index + 1, :completion_length].clone()
                 )
-        return list(episode_specs)
+                retained_episode_specs.append(entry)
+        return retained_episode_specs
 
     def _materialize_episode_spec(
         self,
@@ -2462,6 +3378,7 @@ class _NativeGRPOTrainerMixin:
                     f"{tuple(old_policy_token_log_probs.shape)} vs {tuple(prepared_batch['completion_ids'].shape)}"
                 )
             prepared_batch["old_policy_token_log_probs"] = old_policy_token_log_probs
+        prepared_batch["_source_episode_entries"] = [copy.deepcopy(dict(episode_spec or {}))]
         return prepared_batch
 
     def _pad_token_id(self) -> int:
@@ -2572,6 +3489,17 @@ class _NativeGRPOTrainerMixin:
             if key == "multimodal_inputs":
                 merged[key] = self._merge_multimodal_input_samples(values)
                 continue
+            if key == "_source_episode_entries":
+                merged_entries: List[Dict[str, Any]] = []
+                for value in values:
+                    if not isinstance(value, list):
+                        raise ValueError("Expected _source_episode_entries values to be list[dict].")
+                    for entry in value:
+                        if not isinstance(entry, dict):
+                            raise ValueError("Expected _source_episode_entries items to be dicts.")
+                        merged_entries.append(copy.deepcopy(entry))
+                merged[key] = merged_entries
+                continue
             if key == "old_policy_token_log_probs" and all(value is None for value in values):
                 merged[key] = None
                 continue
@@ -2634,6 +3562,100 @@ class _NativeGRPOTrainerMixin:
                 merged_batches.extend(bucket)
         return merged_batches
 
+    def _prepared_batch_source_entries(self, prepared_batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+        source_entries = prepared_batch.get("_source_episode_entries")
+        if not isinstance(source_entries, list):
+            return []
+        return [dict(entry) for entry in source_entries if isinstance(entry, dict)]
+
+    def _recover_sample_losses_from_source_entries(
+        self,
+        *,
+        model: Any,
+        batch: Dict[str, Any],
+        batch_error: BaseException,
+    ) -> Tuple[Optional[torch.Tensor], int, float]:
+        source_entries = self._prepared_batch_source_entries(batch)
+        if len(source_entries) <= 1:
+            raise batch_error
+        try:
+            target_device = next(model.parameters()).device
+        except StopIteration:
+            target_device = torch.device("cpu")
+        recovered_losses: List[torch.Tensor] = []
+        recovered_trainable_samples = 0
+        recovered_effective_weight_sum = 0.0
+        skipped_count = 0
+        for source_entry in source_entries:
+            prepared_single = self._materialize_episode_spec(source_entry, device=target_device)
+            try:
+                sample_losses = self._compute_sample_losses_for_batch(
+                    model=model,
+                    batch=prepared_single,
+                )
+            except Exception as single_exc:
+                if not self._is_skippable_sample_exception(single_exc):
+                    raise
+                dump_path = self._write_skipped_sample_dump(
+                    stage="compute_loss_skipped_sample",
+                    episode_entry=source_entry,
+                    prepared_batch=prepared_single,
+                    error=single_exc,
+                    extra={
+                        "recovery_from_batch_error": {
+                            "type": type(batch_error).__name__,
+                            "message": str(batch_error),
+                        }
+                    },
+                )
+                runtime_log(
+                    (
+                        "trainer-native RL skipped a sample after compute_loss batch failure: "
+                        f"video_id={str(source_entry.get('video_id') or '') or 'unknown'} "
+                        f"generation_id={int(source_entry.get('generation_id', -1) or -1)} "
+                        f"dump={dump_path}"
+                    ),
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=False,
+                )
+                self._skipped_non_finite_compute_samples += 1
+                skipped_count += 1
+                continue
+            if sample_losses is None or sample_losses.numel() <= 0:
+                continue
+            (
+                _sample_loss_multiplier,
+                active_sample_count,
+                effective_weight_sum,
+            ) = self._sample_loss_weight_summary(
+                prepared_single,
+                device=sample_losses.device,
+                sample_count=int(sample_losses.numel()),
+            )
+            recovered_trainable_samples += int(active_sample_count)
+            recovered_effective_weight_sum += float(effective_weight_sum)
+            recovered_losses.append(sample_losses.view(-1))
+        if recovered_losses:
+            runtime_log(
+                "trainer-native RL recovered compute_loss batch by skipping bad samples: "
+                f"kept={int(sum(int(loss.numel()) for loss in recovered_losses))} "
+                f"skipped={int(skipped_count)}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=False,
+            )
+            return (
+                torch.cat(recovered_losses, dim=0),
+                int(recovered_trainable_samples),
+                float(recovered_effective_weight_sum),
+            )
+        runtime_log(
+            "trainer-native RL dropped an entire compute_loss batch after sample-level recovery failed: "
+            f"batch_error={type(batch_error).__name__}: {batch_error}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        return None, 0, 0.0
+
     def _prepare_advantages(self, batch: Dict[str, Any], device: torch.device) -> torch.Tensor:
         advantages = batch.get("advantage")
         if advantages is None:
@@ -2652,6 +3674,14 @@ class _NativeGRPOTrainerMixin:
         response_mask = response_mask.to(dtype=torch.bool)
         if not bool(torch.any(response_mask)):
             return None
+        self._assert_finite_trainable_parameters(
+            stage="pre_policy_forward_params",
+            model=model,
+            extra={
+                "prompt_ids_shape": tuple(int(dim) for dim in batch["prompt_ids"].shape),
+                "completion_ids_shape": tuple(int(dim) for dim in batch["completion_ids"].shape),
+            },
+        )
         policy_token_log_probs, response_mask = compute_completion_only_token_log_probs_from_ids(
             model=model,
             prompt_ids=batch["prompt_ids"],
@@ -2660,6 +3690,12 @@ class _NativeGRPOTrainerMixin:
             completion_mask=batch["completion_mask"],
             multimodal_inputs=self._episode_spec_multimodal_inputs(batch),
             temperature=self.policy_temperature,
+        )
+        self._assert_finite_tensor(
+            stage="policy_token_log_probs",
+            tensor_name="policy_token_log_probs",
+            tensor_value=policy_token_log_probs,
+            batch=batch,
         )
         if not bool(policy_token_log_probs.requires_grad):
             raise RuntimeError("Policy completion log-probs are detached in the completion-native GRPO path.")
@@ -2670,6 +3706,11 @@ class _NativeGRPOTrainerMixin:
             )
         old_policy_token_log_probs = batch.get("old_policy_token_log_probs")
         if old_policy_token_log_probs is None:
+            if not self._can_reuse_current_policy_as_old_logprobs():
+                raise RuntimeError(
+                    "Active RL requires cached per-token old_policy_token_log_probs for this configuration; "
+                    "current-policy reuse is disabled."
+                )
             old_policy_token_log_probs = policy_token_log_probs.detach()
         else:
             old_policy_token_log_probs = old_policy_token_log_probs.to(
@@ -2678,13 +3719,25 @@ class _NativeGRPOTrainerMixin:
             ).detach()
             if old_policy_token_log_probs.ndim == 1:
                 old_policy_token_log_probs = old_policy_token_log_probs.view(1, -1)
-        if tuple(old_policy_token_log_probs.shape) != tuple(policy_token_log_probs.shape):
-            raise ValueError(
-                "old_policy_token_log_probs must align with policy_token_log_probs shape: "
-                f"{tuple(old_policy_token_log_probs.shape)} vs {tuple(policy_token_log_probs.shape)}"
-            )
+            if tuple(old_policy_token_log_probs.shape) != tuple(policy_token_log_probs.shape):
+                raise ValueError(
+                    "old_policy_token_log_probs must align with policy_token_log_probs shape: "
+                    f"{tuple(old_policy_token_log_probs.shape)} vs {tuple(policy_token_log_probs.shape)}"
+                )
+        self._assert_finite_tensor(
+            stage="old_policy_token_log_probs",
+            tensor_name="old_policy_token_log_probs",
+            tensor_value=old_policy_token_log_probs,
+            batch=batch,
+        )
         advantages = self._prepare_advantages(batch, policy_token_log_probs.device)
         coef_1 = torch.exp(policy_token_log_probs - old_policy_token_log_probs.detach())
+        self._assert_finite_tensor(
+            stage="ppo_ratio",
+            tensor_name="coef_1",
+            tensor_value=coef_1,
+            batch=batch,
+        )
         coef_2 = torch.clamp(
             coef_1,
             1.0 - float(self.ppo_clip_epsilon),
@@ -2726,9 +3779,21 @@ class _NativeGRPOTrainerMixin:
                         "reference_token_log_probs must align with policy_token_log_probs shape: "
                         f"{tuple(reference_token_log_probs.shape)} vs {tuple(policy_token_log_probs.shape)}"
                     )
+                self._assert_finite_tensor(
+                    stage="reference_token_log_probs",
+                    tensor_name="reference_token_log_probs",
+                    tensor_value=reference_token_log_probs,
+                    batch=batch,
+                )
                 delta = reference_token_log_probs.to(policy_token_log_probs.device) - policy_token_log_probs
                 per_token_kl = torch.exp(delta) - delta - 1.0
                 per_token_loss = per_token_loss + per_token_loss.new_tensor(self.kl_beta) * per_token_kl
+        self._assert_finite_tensor(
+            stage="per_token_loss",
+            tensor_name="per_token_loss",
+            tensor_value=per_token_loss,
+            batch=batch,
+        )
         response_mask_f = response_mask.to(dtype=per_token_loss.dtype)
         token_loss_weight = batch.get("token_loss_weight")
         if token_loss_weight is None:
@@ -2759,6 +3824,12 @@ class _NativeGRPOTrainerMixin:
             device=sample_losses.device,
             sample_count=int(sample_losses.shape[0]),
         )
+        self._assert_finite_tensor(
+            stage="sample_losses",
+            tensor_name="sample_losses",
+            tensor_value=sample_losses,
+            batch=batch,
+        )
         return sample_losses
 
     def _disable_adapter_context(self, model: Any):
@@ -2786,12 +3857,12 @@ class _NativeGRPOTrainerMixin:
                 "rl_replay_fill_batches": int(self._replay_fill_batches),
                 "rl_replay_fill_episode_specs": int(self._replay_fill_episode_specs),
                 "rl_groups_all_zero_advantage": int(self._groups_all_zero_advantage),
+                "rl_skipped_non_finite_old_policy_samples": int(self._skipped_non_finite_old_policy_samples),
+                "rl_skipped_non_finite_compute_samples": int(self._skipped_non_finite_compute_samples),
                 "rl_zero_variance_group_count": int(getattr(self, "_zero_variance_group_count", 0)),
                 "rl_zero_variance_rollout_count": int(getattr(self, "_zero_variance_rollout_count", 0)),
                 "rl_zero_variance_skipped_count": int(getattr(self, "_zero_variance_skipped_count", 0)),
                 "rl_groups_filtered_by_min_weight": int(self._groups_filtered_by_min_weight),
-                "rl_fecv_failure_count": int(self._fecv_failure_count),
-                "rl_fecv_degraded_rollout_count": int(self._fecv_degraded_rollout_count),
                 "rl_compute_loss_microbatch_size_effective": int(self.compute_loss_microbatch_size),
             }
         )
@@ -2867,6 +3938,8 @@ class _NativeGRPOTrainerMixin:
         del num_items_in_batch
         if return_outputs:
             raise ValueError("Trainer-native GRPO does not support returning model outputs.")
+        self._debug_compute_loss_call_index += 1
+        compute_loss_call_index = int(self._debug_compute_loss_call_index)
         episode_specs = list(inputs.get("episode_specs") or [])
         runtime_stats = dict(inputs.get("runtime_stats") or {})
         try:
@@ -2900,6 +3973,7 @@ class _NativeGRPOTrainerMixin:
 
         total_loss_sum = None
         total_samples = 0
+        total_effective_weight = 0.0
         microbatch_size = max(1, int(self.compute_loss_microbatch_size))
         prepared_microbatches: List[Dict[str, Any]] = []
         for start_index in range(0, len(episode_specs), microbatch_size):
@@ -2909,6 +3983,8 @@ class _NativeGRPOTrainerMixin:
             )
         runtime_stats["raw_local_prepared_batch_count"] = int(len(prepared_microbatches))
         local_prepared_batch_count = int(len(prepared_microbatches))
+        self._debug_last_compute_loss_call_index = int(compute_loss_call_index)
+        self._debug_last_compute_loss_prepared_batch_count = int(local_prepared_batch_count)
         global_prepared_batch_count = _distributed_sum_int(local_prepared_batch_count, device=target_device)
         all_ranks_have_prepared_batches, any_rank_has_prepared_batches = _distributed_bool_consensus(
             local_prepared_batch_count > 0,
@@ -2927,6 +4003,17 @@ class _NativeGRPOTrainerMixin:
                 ]
                 local_prepared_batch_count = int(len(prepared_microbatches))
                 runtime_stats["ddp_noop_padded_prepared_batches"] = int(local_prepared_batch_count)
+        self._debug_last_compute_loss_rank_local_batch_count = int(local_prepared_batch_count)
+        runtime_log(
+            "rl debug prepared batch layout: "
+            f"compute_loss_call={compute_loss_call_index} "
+            f"local_episode_specs={int(local_episode_spec_count)} "
+            f"local_prepared_batch_count={int(local_prepared_batch_count)} "
+            f"global_prepared_batch_count={int(global_prepared_batch_count)} "
+            f"prepared_batches={[self._debug_prepared_batch_summary(batch) for batch in prepared_microbatches]}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
         if not any_rank_has_prepared_batches or global_prepared_batch_count <= 0:
             if self.all_empty_policy == "true_skip":
                 self._mark_skip_next_optimizer_step(reason="all_empty_prepared_batches", all_empty=True)
@@ -2937,24 +4024,101 @@ class _NativeGRPOTrainerMixin:
             )
             return _zero_loss_from_model(model)
 
-        for batch in prepared_microbatches:
-            sample_losses = self._compute_sample_losses_for_batch(
-                model=model,
+        for prepared_batch_index, batch in enumerate(prepared_microbatches, start=1):
+            recovered_preweighted = False
+            recovered_trainable_samples = 0
+            recovered_effective_weight_sum = 0.0
+            try:
+                sample_losses = self._compute_sample_losses_for_batch(
+                    model=model,
+                    batch=batch,
+                )
+            except Exception as exc:
+                if not self._is_skippable_sample_exception(exc):
+                    raise
+                source_entries = self._prepared_batch_source_entries(batch)
+                if len(source_entries) <= 1:
+                    episode_entry = source_entries[0] if source_entries else {}
+                    dump_path = self._write_skipped_sample_dump(
+                        stage="compute_loss_skipped_sample",
+                        episode_entry=episode_entry,
+                        prepared_batch=batch,
+                        error=exc,
+                    )
+                    runtime_log(
+                        (
+                            "trainer-native RL skipped a sample after compute_loss failure: "
+                            f"video_id={str(episode_entry.get('video_id') or '') or 'unknown'} "
+                            f"generation_id={int(episode_entry.get('generation_id', -1) or -1)} "
+                            f"dump={dump_path}"
+                        ),
+                        runtime=distributed_runtime_from_env(),
+                        main_process_only=False,
+                    )
+                    self._skipped_non_finite_compute_samples += max(1, len(source_entries))
+                    sample_losses = None
+                else:
+                    (
+                        sample_losses,
+                        recovered_trainable_samples,
+                        recovered_effective_weight_sum,
+                    ) = self._recover_sample_losses_from_source_entries(
+                        model=model,
+                        batch=batch,
+                        batch_error=exc,
+                    )
+                    recovered_preweighted = sample_losses is not None
+            if sample_losses is None or sample_losses.numel() <= 0:
+                runtime_log(
+                    "rl debug prepared batch end: "
+                    f"compute_loss_call={compute_loss_call_index} "
+                    f"prepared_batch_index={int(prepared_batch_index)}/{int(local_prepared_batch_count)} "
+                    "status=empty_or_skipped",
+                    runtime=distributed_runtime_from_env(),
+                    main_process_only=False,
+                )
+                continue
+            if recovered_preweighted:
+                sample_loss_multiplier = torch.ones_like(sample_losses, dtype=torch.float32, device=sample_losses.device)
+                active_sample_count = int(recovered_trainable_samples)
+                effective_weight_sum = float(recovered_effective_weight_sum)
+            else:
+                (
+                    sample_loss_multiplier,
+                    active_sample_count,
+                    effective_weight_sum,
+                ) = self._sample_loss_weight_summary(
+                    batch,
+                    device=sample_losses.device,
+                    sample_count=int(sample_losses.numel()),
+                )
+            total_samples += (
+                int(recovered_trainable_samples)
+                if recovered_preweighted
+                else int(active_sample_count)
+            )
+            total_effective_weight += float(effective_weight_sum)
+            batch_loss_sum = sample_losses.sum()
+            self._assert_finite_tensor(
+                stage="batch_loss_sum",
+                tensor_name="batch_loss_sum",
+                tensor_value=batch_loss_sum,
                 batch=batch,
             )
-            if sample_losses is None or sample_losses.numel() <= 0:
-                continue
-            sample_loss_multiplier = self._sample_loss_multiplier(
-                batch,
-                device=sample_losses.device,
-                sample_count=int(sample_losses.numel()),
-            )
-            total_samples += int((sample_loss_multiplier > 0).sum().item())
-            batch_loss_sum = sample_losses.sum()
             total_loss_sum = batch_loss_sum if total_loss_sum is None else total_loss_sum + batch_loss_sum
+            runtime_log(
+                "rl debug prepared batch end: "
+                f"compute_loss_call={compute_loss_call_index} "
+                f"prepared_batch_index={int(prepared_batch_index)}/{int(local_prepared_batch_count)} "
+                f"trainable_samples={int(active_sample_count)} "
+                f"effective_weight_sum={float(effective_weight_sum):.6f} "
+                f"batch_loss_sum={float(batch_loss_sum.detach().float().item()):.6f}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=False,
+            )
         runtime_stats["raw_local_sample_count"] = int(total_samples)
-        global_total_samples = _distributed_sum_int(int(total_samples), device=target_device)
-        if total_loss_sum is None or global_total_samples <= 0:
+        global_total_effective_weight = _distributed_sum_float(float(total_effective_weight), device=target_device)
+        if total_loss_sum is None or global_total_effective_weight <= 0.0:
             if self.all_empty_policy == "true_skip":
                 self._mark_skip_next_optimizer_step(reason="all_empty_trainable_samples", all_empty=True)
             self._maybe_log_empty_batch_rank_summary(
@@ -2964,7 +4128,54 @@ class _NativeGRPOTrainerMixin:
             )
             return _zero_loss_from_model(model)
         world_size = max(1, int(_distributed_world_size()))
-        return total_loss_sum * float(world_size) / float(max(1, int(global_total_samples)))
+        runtime_log(
+            "rl debug trainer backward imminent: "
+            f"compute_loss_call={compute_loss_call_index} "
+            f"local_prepared_batch_count={int(local_prepared_batch_count)} "
+            f"global_total_samples={int(total_samples)} "
+            f"global_effective_weight={float(global_total_effective_weight):.6f}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        final_loss = total_loss_sum * float(world_size) / float(global_total_effective_weight)
+        self._assert_finite_tensor(
+            stage="compute_loss_return",
+            tensor_name="final_loss",
+            tensor_value=final_loss,
+            extra={
+                "global_total_samples": int(total_samples),
+                "global_effective_weight": float(global_total_effective_weight),
+                "world_size": int(world_size),
+            },
+        )
+        return final_loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        detached_loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        sync_gradients = bool(getattr(getattr(self, "accelerator", None), "sync_gradients", False))
+        if sync_gradients:
+            self._assert_finite_trainable_gradients(
+                stage="post_training_step_gradients",
+                model=model,
+                extra={
+                    "global_step": int(getattr(getattr(self, "state", None), "global_step", 0) or 0),
+                    "epoch": float(getattr(getattr(self, "state", None), "epoch", 0.0) or 0.0),
+                },
+            )
+        self._assert_finite_tensor(
+            stage="training_step_detached_loss",
+            tensor_name="detached_loss",
+            tensor_value=detached_loss,
+        )
+        runtime_log(
+            "rl debug trainer backward finished: "
+            f"compute_loss_call={int(getattr(self, '_debug_last_compute_loss_call_index', 0))} "
+            f"local_prepared_batch_count={int(getattr(self, '_debug_last_compute_loss_rank_local_batch_count', 0))} "
+            f"reported_loss={float(detached_loss.detach().float().item()) if isinstance(detached_loss, torch.Tensor) else detached_loss}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        return detached_loss
 
 
 def create_native_grpo_trainer(
@@ -3005,7 +4216,6 @@ def create_native_grpo_trainer(
     keep_recent_tool_image_messages: int = 0,
     keep_recent_text_messages: int = 0,
     max_seq_length: int = 0,
-    counterfactual_max_images: int,
     policy_do_sample: bool,
     policy_temperature: Optional[float],
     policy_top_p: Optional[float],
@@ -3028,6 +4238,8 @@ def create_native_grpo_trainer(
     reward_version: str = DEFAULT_RL_REWARD_VERSION,
     reward_config: Optional[Dict[str, Any]] = None,
     steps_per_generation: int = 1,
+    proposal_runtime: Any = None,
+    strict_feature_guided_proposal: bool = False,
     ddp_find_unused_parameters: bool = False,
     deepspeed: Optional[str] = None,
     save_strategy: str = "no",
@@ -3058,6 +4270,7 @@ def create_native_grpo_trainer(
         runtime=distributed_runtime_from_env(),
         main_process_only=True,
     )
+    os.environ["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(int(gradient_accumulation_steps))
     training_args_kwargs = {
         "output_dir": str(output_dir),
         "learning_rate": float(learning_rate),
@@ -3106,7 +4319,6 @@ def create_native_grpo_trainer(
         "keep_recent_tool_image_messages": int(keep_recent_tool_image_messages),
         "keep_recent_text_messages": int(keep_recent_text_messages),
         "max_seq_length": int(max_seq_length),
-        "counterfactual_max_images": int(counterfactual_max_images),
         "policy_do_sample": bool(policy_do_sample),
         "policy_temperature": policy_temperature,
         "policy_top_p": policy_top_p,
@@ -3117,6 +4329,8 @@ def create_native_grpo_trainer(
         "compute_loss_microbatch_size": int(compute_loss_microbatch_size),
         "steps_per_generation": int(steps_per_generation),
         "per_device_train_batch_size": int(per_device_train_batch_size),
+        "proposal_runtime": proposal_runtime,
+        "strict_feature_guided_proposal": bool(strict_feature_guided_proposal),
         "replay_buffer_enable": bool(replay_buffer_enable),
         "replay_buffer_type": str(replay_buffer_type),
         "replay_buffer_capacity": int(replay_buffer_capacity),
@@ -3156,6 +4370,7 @@ def create_native_grpo_trainer(
         trainer.add_callback(rollout_eval_callback)
     trainer.add_callback(_build_native_grpo_progress_callback(trainer=trainer))
     trainer.add_callback(_build_grad_norm_probe_callback(trainer=trainer))
+    trainer.add_callback(_build_parameter_finite_probe_callback(trainer=trainer))
     return trainer
 
 
@@ -3185,21 +4400,34 @@ def run_trainer_native_grpo(
     resolved_log_dir = Path(str(log_dir).strip()) if str(log_dir or "").strip() else output_dir / "logs"
     materialized_train_items_path = str(getattr(args, "materialized_train_items_path", "") or "").strip()
     include_splits_value = getattr(args, "include_splits", "")
+    saver_config = build_saver_config(args)
     if materialized_train_items_path:
+        expected_protocol_signature = build_protocol_signature(
+            config=saver_config,
+            max_turns=int(
+                getattr(args, "rollout_max_turns", DEFAULT_ROLLOUT_MAX_TURNS) or DEFAULT_ROLLOUT_MAX_TURNS
+            ),
+            policy_max_new_tokens=int(getattr(args, "policy_max_new_tokens", 0) or 0),
+            teacher_role=DEFAULT_TEACHER_ROLE,
+        )
         ensure_materialized_cache_metadata(
             materialized_train_items_path,
             expected_format=MATERIALIZED_RUNTIME_ITEMS_FORMAT,
             expected_source_path=args.data,
             expected_include_splits=include_splits_value,
+            expected_config=saver_config,
+            expected_protocol_signature=expected_protocol_signature,
+            require_config_match=True,
             require_source=True,
         )
         dataset = MaterializedRuntimeItemDataset(
             materialized_train_items_path,
             include_splits=include_splits_value,
+            config=saver_config,
             require_frame_cache=True,
             require_feature_cache=True,
-            proposal_runtime=proposal_runtime,
-            strict_feature_guided_proposal=strict_feature_guided_proposal,
+            proposal_runtime=None,
+            strict_feature_guided_proposal=False,
         )
         raw_records = [dict(record) for record in list(getattr(dataset, "records", []) or [])]
     else:
@@ -3230,16 +4458,6 @@ def run_trainer_native_grpo(
         if strict_feature_guided_proposal
         else None
     )
-    if materialized_train_items_path and strict_feature_guided_proposal:
-        if int(getattr(args, "dataloader_num_workers", 0) or 0) > 0:
-            runtime_log(
-                "trainer-native RL forcing dataloader_num_workers=0 because materialized runtime items still attach CUDA proposal_runtime during item loading.",
-                runtime=runtime,
-                main_process_only=True,
-            )
-            args.dataloader_num_workers = 0
-            args.dataloader_prefetch_factor = 0
-            args.dataloader_persistent_workers = False
     if not materialized_train_items_path:
         dataset = SaverAgentDataset(
             args.data,
@@ -3248,8 +4466,8 @@ def run_trainer_native_grpo(
             include_splits=include_splits_value,
             require_frame_cache=True,
             require_feature_cache=True,
-            proposal_runtime=proposal_runtime,
-            strict_feature_guided_proposal=strict_feature_guided_proposal,
+            proposal_runtime=None,
+            strict_feature_guided_proposal=False,
         )
     current_model_path = str(args.model_path)
     latest_checkpoint = current_model_path
@@ -3429,7 +4647,6 @@ def run_trainer_native_grpo(
             keep_recent_tool_image_messages=args.keep_recent_tool_image_messages,
             keep_recent_text_messages=args.keep_recent_text_messages,
             max_seq_length=args.max_seq_length,
-            counterfactual_max_images=12,
             policy_do_sample=args.policy_do_sample,
             policy_temperature=args.policy_temperature,
             policy_top_p=args.policy_top_p,
@@ -3457,6 +4674,8 @@ def run_trainer_native_grpo(
             iteration_index=int(iteration),
             num_iterations=int(args.num_iterations),
             rollout_eval_callback=rollout_eval_callback,
+            proposal_runtime=proposal_runtime,
+            strict_feature_guided_proposal=bool(strict_feature_guided_proposal),
         )
         try:
             train_result = trainer.train()

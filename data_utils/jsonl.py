@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List
+from typing import Any, Callable, Dict, Iterable, Iterator, List
 
 
 def jsonl_decode_error_message(path: Path, line_number: int, line: str, exc: Exception) -> str:
@@ -44,10 +44,17 @@ def load_jsonl(path: str | Path, *, skip_invalid_lines: bool = False) -> List[Di
     return list(iter_jsonl(path, skip_invalid_lines=skip_invalid_lines))
 
 
-def write_jsonl(records: Iterable[Dict[str, Any]], path: str | Path) -> Path:
+def write_jsonl(
+    records: Iterable[Dict[str, Any]],
+    path: str | Path,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
-        for record in records:
+        for index, record in enumerate(records, start=1):
             f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            if progress_callback is not None:
+                progress_callback(int(index))
     return output_path

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Tuple
 
+from saver_v3.core.initial_observation import mark_initial_global_scan_message
 from saver_v3.core.categories import CANONICAL_POLICY_CATEGORIES
 from saver_v3.core.schema import SaverEnvironmentState
 from saver_v3.core.semantic_answer import augment_finalize_case_schema
@@ -121,11 +122,16 @@ def execute_tool_call(
     arguments = func.get("arguments", {})
     if name not in TOOL_IMPLS:
         raise ValueError(f"Unknown tool name: {name}")
-    content, state, _ = TOOL_IMPLS[name](arguments, multimodal_cache, state)
+    content, state, tool_trace = TOOL_IMPLS[name](arguments, multimodal_cache, state)
     message = {
         "role": "tool",
         "name": name,
         "arguments": arguments,
         "content": content,
     }
+    if isinstance(tool_trace, dict) and bool(tool_trace.get("initial_global_scan")):
+        message = mark_initial_global_scan_message(
+            message,
+            config=multimodal_cache.get("config_snapshot") or {},
+        )
     return message, state

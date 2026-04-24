@@ -8,8 +8,13 @@ from saver_v3.sft.training import run_standard_sft
 from saver_v3.cli.common import apply_config_overrides, load_yaml_mapping, write_json
 from saver_v3.common import distributed_runtime_from_env, ensure_fa3_training_ready, runtime_log
 from saver_v3.data.config import SaverAgentConfig, saver_config_from_mapping
-from saver_v3.data.prepared_metadata import ensure_prepared_sft_metadata
-from saver_v3.data.materialized_cache import MATERIALIZED_SFT_MESSAGES_FORMAT, ensure_materialized_cache_metadata
+from saver_v3.data.prepared_metadata import ensure_prepared_sft_metadata, load_prepared_sft_metadata
+from saver_v3.data.materialized_cache import (
+    MATERIALIZED_SFT_MESSAGES_FORMAT,
+    default_sft_materialized_messages_path,
+    ensure_materialized_cache_metadata,
+)
+from saver_v3.data.protocol_signature import build_protocol_signature, infer_teacher_role_from_metadata
 
 
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -22,6 +27,27 @@ def _saver_config_from_mapping(mapping: Mapping[str, Any]) -> SaverAgentConfig:
 
 def _saver_config_from_dict(payload: Mapping[str, Any] | None) -> SaverAgentConfig:
     return _saver_config_from_mapping(payload or {})
+
+
+def _resolve_materialized_messages_path(
+    *,
+    prepared_data_path: str | Path,
+    prepared_metadata: Mapping[str, Any] | None,
+    materialized_messages_path: str | Path | None,
+    require_materialized_cache: bool,
+) -> str:
+    explicit_path = str(materialized_messages_path or "").strip()
+    if explicit_path:
+        return explicit_path
+    if not require_materialized_cache:
+        return ""
+    teacher_role = infer_teacher_role_from_metadata(prepared_metadata or {})
+    return str(
+        default_sft_materialized_messages_path(
+            prepared_data_path,
+            teacher_role=teacher_role,
+        )
+    )
 
 
 @dataclass
@@ -105,7 +131,7 @@ class SFTJobConfig:
         prepared_data_path = str(data.get("prepared_data_path") or "").strip()
         if not prepared_data_path:
             raise ValueError(
-                "idea2_v3 SFT now requires data.prepared_data_path pointing to compact_trace_v2 JSONL. "
+                "idea2_v3 SFT now requires data.prepared_data_path pointing to compact_trace_v5 JSONL. "
                 "The legacy data.train_manifest path has been removed from the official training entrypoint."
             )
 
@@ -180,17 +206,32 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
     if not job.prepared_data_path:
         raise ValueError("SFT prepared_data_path is required")
     saver_config = _saver_config_from_dict(job.saver_config)
+    prepared_metadata = load_prepared_sft_metadata(job.prepared_data_path)
+    resolved_materialized_messages_path = _resolve_materialized_messages_path(
+        prepared_data_path=job.prepared_data_path,
+        prepared_metadata=prepared_metadata,
+        materialized_messages_path=job.materialized_messages_path,
+        require_materialized_cache=job.require_materialized_cache,
+    )
+    expected_protocol_signature = build_protocol_signature(
+        config=saver_config,
+        teacher_role=infer_teacher_role_from_metadata(prepared_metadata),
+    )
     ensure_prepared_sft_metadata(
         job.prepared_data_path,
         config=saver_config,
         require_config_match=True,
+        expected_protocol_signature=expected_protocol_signature,
     )
-    if job.materialized_messages_path:
+    if resolved_materialized_messages_path:
         ensure_materialized_cache_metadata(
-            job.materialized_messages_path,
+            resolved_materialized_messages_path,
             expected_format=MATERIALIZED_SFT_MESSAGES_FORMAT,
             expected_source_path=job.prepared_data_path,
             expected_include_splits=job.include_splits or None,
+            expected_config=saver_config,
+            expected_protocol_signature=expected_protocol_signature,
+            require_config_match=True,
             require_source=True,
         )
     ensure_fa3_training_ready(require_gpu=True)
@@ -201,23 +242,25 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
         (
             "delegating v3 SFT to saver_agent.run_standard_sft: "
             f"prepared_data={job.prepared_data_path} include_splits={job.include_splits or 'all'} "
-            f"materialized_messages={job.materialized_messages_path or '(none)'} "
+            f"materialized_messages={resolved_materialized_messages_path or '(none)'} "
             f"model_path={job.model_path} deepspeed={job.deepspeed_config_path or '(none)'}"
         ),
         runtime=runtime,
         main_process_only=True,
     )
+    launch_manifest_config = job.to_dict()
+    launch_manifest_config["materialized_messages_path"] = resolved_materialized_messages_path
     launch_manifest_path = write_json(
         {
             "entrypoint": "saver_v3.sft.training.run_standard_sft",
-            "config": job.to_dict(),
+            "config": launch_manifest_config,
         },
         output_dir / "sft_launch_manifest.json",
     )
     standard_result = dict(
         run_standard_sft(
             prepared_data_path=job.prepared_data_path,
-            materialized_messages_path=job.materialized_messages_path,
+            materialized_messages_path=resolved_materialized_messages_path,
             require_materialized_cache=job.require_materialized_cache,
             include_splits=job.include_splits or None,
             model_path=job.model_path,
@@ -284,7 +327,7 @@ def run_sft_job(job: SFTJobConfig) -> SFTTrainingResult:
         notes=[
             "SFT now delegates to saver_agent.run_standard_sft.",
             f"prepared_data_path={job.prepared_data_path}",
-            f"materialized_messages_path={job.materialized_messages_path or '(none)'}",
+            f"materialized_messages_path={resolved_materialized_messages_path or '(none)'}",
             f"include_splits={job.include_splits or 'all'}",
         ],
     )

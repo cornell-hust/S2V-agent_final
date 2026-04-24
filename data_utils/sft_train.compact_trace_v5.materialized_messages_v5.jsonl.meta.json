@@ -1,0 +1,85 @@
+{
+  "config": {
+    "initial_observation": {
+      "error_on_seq_prune": true,
+      "mode": "explicit_first_scan",
+      "protect_from_visual_budget": true,
+      "scan_num_frames": 8,
+      "scan_purpose": "global_overview"
+    },
+    "prompt": {
+      "explicit_first_scan_instruction": "Before any targeted search or verification, call scan_timeline once over the initial scan window with purpose=\"global_overview\" to build the canonical first observation. Use that overview to decide the next step.",
+      "initial_user_template": "Case ID: {public_case_id}\nScene: {scene}\nDuration (sec): {duration}\nTask: {task_prompt}\nSuccess Criteria:\n{criteria_text}",
+      "tool_response_template": "Selected frames: {timestamps}.\nChoose exactly one next step.\nUsually call seek_evidence for another stage or verify_hypothesis to judge sufficiency.\nCall finalize_case only when the gathered evidence is already sufficient.\nWhen finalizing, prioritize a compact finalize_case that closes cleanly.\nIf optional summary, rationale, event_chain_summary, or qa_focus_answers would make the tool call too long, omit them.\nDo not answer before finalize_case returns."
+    },
+    "rollout_trace": {
+      "record_counterfactual_trace": true,
+      "record_message_history": true,
+      "record_observation_content": false,
+      "record_state_deltas": true
+    }
+  },
+  "data_root": "",
+  "include_splits": [
+    "train"
+  ],
+  "input_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",
+  "materialized_format": "materialized_sft_messages_v5",
+  "mode": "sft",
+  "model_config": {
+    "attention_policy_config": "configs/model/attention_fa3_only.yaml",
+    "attn_implementation": "flash_attention_3",
+    "base_model": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct",
+    "compile_model": false,
+    "freeze": {
+      "language_model": false,
+      "multimodal_projector": false,
+      "vision_tower": false
+    },
+    "gradient_checkpointing": true,
+    "model_name": "qwen3_vl_8b_full",
+    "processor_name": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct",
+    "sequence": {
+      "max_length": 8192,
+      "truncation": "right"
+    },
+    "tokenizer_name": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct",
+    "torch_dtype": "bfloat16",
+    "train_mode": "full",
+    "trust_remote_code": true,
+    "vision": {
+      "max_images_per_sample": 28,
+      "max_pixels": 1003520,
+      "min_pixels": 200704
+    }
+  },
+  "num_records": 480,
+  "proposal_device": "",
+  "proposal_model_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip",
+  "proposal_torch_dtype": "auto",
+  "protocol_signature": {
+    "generator_fingerprint": "68369fa86849effdf8e64bc89a4497ecc9476738ef90acfec2a0b161cfd7bfd3",
+    "generator_revision": "2026-04-23-active-contract-v5",
+    "initial_observation_mode": "explicit_first_scan",
+    "main_rollout_terminal_mode": "finalize_case_only",
+    "max_turns": 10,
+    "policy_max_new_tokens": 1024,
+    "protocol_version": "seek_v5",
+    "signature_schema_version": 1,
+    "teacher_role": "none",
+    "verifier_contract": "next_tool_only"
+  },
+  "schema_version": 6,
+  "source_jsonl": {
+    "file_size": 5528099,
+    "include_splits": [
+      "train"
+    ],
+    "mtime_ns": 1776939920466071499,
+    "num_records": 480,
+    "path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",
+    "resolved_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",
+    "sha256": "1226f1490f4e66fe181c2437a4227518f3b1f87e3f9fde86cc1f06438d6d031f",
+    "validation_mode": "canonical_jsonl"
+  }
+}

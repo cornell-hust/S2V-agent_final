@@ -15,30 +15,6 @@ EVENT_CHAIN_ROLE_TO_STAGE: Dict[str, str] = {
 
 
 COUNTERFACTUAL_TYPE_SPECS: List[Dict[str, str]] = [
-    {
-        "value": "none",
-        "description": "no counterfactual intervention is needed because the case is normal or already self-explanatory",
-    },
-    {
-        "value": "remove_actor_interaction",
-        "description": "remove the harmful interaction between people or agents",
-    },
-    {
-        "value": "remove_dangerous_object",
-        "description": "remove the dangerous object or weapon that enables the anomaly",
-    },
-    {
-        "value": "restore_safe_context",
-        "description": "restore the scene to a safe context such as no fire, no crash, or no damage",
-    },
-    {
-        "value": "replace_risky_motion_with_normal_motion",
-        "description": "replace the risky motion with a normal, non-dangerous motion pattern",
-    },
-    {
-        "value": "move_event_out_of_sensitive_area",
-        "description": "move the same activity out of the protected or sensitive area",
-    },
 ]
 
 COUNTERFACTUAL_TYPE_VALUES: List[str] = [spec["value"] for spec in COUNTERFACTUAL_TYPE_SPECS]
@@ -110,16 +86,10 @@ def _format_seconds(value: Any) -> str:
 
 
 def build_counterfactual_type_schema() -> Dict[str, Any]:
-    return {
-        "type": "string",
-        "enum": list(COUNTERFACTUAL_TYPE_VALUES),
-        "description": (
-            COUNTERFACTUAL_TYPE_DESCRIPTION
-            + " Allowed values: "
-            + "; ".join(f"{spec['value']}={spec['description']}" for spec in COUNTERFACTUAL_TYPE_SPECS)
-            + "."
-        ),
-    }
+    raise RuntimeError(
+        "counterfactual_type has been removed from the active v5 contract. "
+        "Do not build or request a counterfactual_type schema."
+    )
 
 
 def summarize_evidence_ledger(
@@ -152,9 +122,10 @@ def _selected_ids_sentence(label: str, values: Iterable[Any]) -> str:
 
 
 def build_counterfactual_type_legend(*, include_descriptions: bool = True) -> str:
-    if include_descriptions:
-        return "; ".join(f"{spec['value']}={spec['description']}" for spec in COUNTERFACTUAL_TYPE_SPECS)
-    return ", ".join(COUNTERFACTUAL_TYPE_VALUES)
+    del include_descriptions
+    raise RuntimeError(
+        "counterfactual_type has been removed from the active v5 contract."
+    )
 
 
 def build_finalize_scaffold(
@@ -202,9 +173,4 @@ def build_finalize_scaffold(
                 stage_parts.append(f"{stage}={','.join(moment_ids)}")
         if stage_parts:
             scaffold_parts.append("Stage-to-moment mapping: " + "; ".join(stage_parts) + ".")
-    schema_counterfactual = (((finalize_schema.get("properties") or {}).get("counterfactual_type")) or {})
-    if "counterfactual_type" in required_fields or schema_counterfactual:
-        scaffold_parts.append(
-            "counterfactual_type allowed values: " + build_counterfactual_type_legend(include_descriptions=True) + "."
-        )
     return " ".join(part for part in scaffold_parts if part)

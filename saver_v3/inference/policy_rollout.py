@@ -5,6 +5,7 @@ from typing import Any, Dict, Mapping
 
 from batch_run_saver_rollout import main as batch_run_saver_rollout_main
 from saver_v3.cli.common import load_yaml_mapping
+from saver_v3.data.config import DEFAULT_ROLLOUT_MAX_TURNS
 
 
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -21,7 +22,7 @@ class PolicyRolloutConfig:
     indices: str = ""
     start_index: int = 0
     count: int = 0
-    max_turns: int = 14
+    max_turns: int = DEFAULT_ROLLOUT_MAX_TURNS
     rollout_batch_size: int = 4
     progress_every: int = 10
     proposal_model_path: str = ""
@@ -44,6 +45,10 @@ class PolicyRolloutConfig:
     keep_recent_tool_image_messages: int = 0
     max_image_side: int = 640
     max_image_pixels: int = 0
+    initial_observation_mode: str = "explicit_first_scan"
+    initial_scan_num_frames: int = 8
+    protect_initial_scan_from_visual_budget: bool = True
+    error_on_initial_scan_seq_prune: bool = True
     num_preview_frames: int = 8
     preview_sampling_fps: float | None = None
     log_dir: str = ""
@@ -54,6 +59,7 @@ class PolicyRolloutConfig:
         client = dict(_mapping(mapping.get("client")))
         io_cfg = dict(_mapping(mapping.get("io")))
         rollout_cfg = dict(_mapping(mapping.get("rollout")))
+        initial_observation = dict(_mapping(mapping.get("initial_observation")))
         data_path = str(io_cfg.get("data_path") or "").strip()
         if not data_path:
             raise ValueError(
@@ -69,7 +75,7 @@ class PolicyRolloutConfig:
             indices=str(io_cfg.get("indices") or "").strip(),
             start_index=int(io_cfg.get("start_index", 0) or 0),
             count=int(io_cfg.get("count", io_cfg.get("max_records", 0)) or 0),
-            max_turns=int(rollout_cfg.get("max_turns", 14) or 14),
+            max_turns=int(rollout_cfg.get("max_turns", DEFAULT_ROLLOUT_MAX_TURNS) or DEFAULT_ROLLOUT_MAX_TURNS),
             rollout_batch_size=int(rollout_cfg.get("rollout_batch_size", 4) or 4),
             progress_every=int(rollout_cfg.get("progress_every", 10) or 10),
             proposal_model_path=str(rollout_cfg.get("proposal_model_path") or "").strip(),
@@ -92,6 +98,12 @@ class PolicyRolloutConfig:
             keep_recent_tool_image_messages=int(client.get("keep_recent_tool_image_messages", 0) or 0),
             max_image_side=int(client.get("max_image_side", 640) or 640),
             max_image_pixels=int(client.get("max_image_pixels", 0) or 0),
+            initial_observation_mode=str(initial_observation.get("mode") or "explicit_first_scan"),
+            initial_scan_num_frames=max(1, int(initial_observation.get("scan_num_frames", 8) or 8)),
+            protect_initial_scan_from_visual_budget=bool(
+                initial_observation.get("protect_from_visual_budget", True)
+            ),
+            error_on_initial_scan_seq_prune=bool(initial_observation.get("error_on_seq_prune", True)),
             num_preview_frames=int(client.get("num_preview_frames", 8) or 8),
             preview_sampling_fps=(
                 None if client.get("preview_sampling_fps") is None else float(client.get("preview_sampling_fps") or 0.0)
@@ -135,6 +147,10 @@ def run_policy_rollout_job(config: PolicyRolloutConfig) -> Dict[str, Any]:
         "--keep-recent-tool-image-messages", str(config.keep_recent_tool_image_messages),
         "--max-image-side", str(config.max_image_side),
         "--max-image-pixels", str(config.max_image_pixels),
+        "--initial-observation-mode", str(config.initial_observation_mode),
+        "--initial-scan-num-frames", str(config.initial_scan_num_frames),
+        "--protect-initial-scan-from-visual-budget", "true" if config.protect_initial_scan_from_visual_budget else "false",
+        "--error-on-initial-scan-seq-prune", "true" if config.error_on_initial_scan_seq_prune else "false",
         "--num-preview-frames", str(config.num_preview_frames),
         "--max-turns", str(config.max_turns),
         "--rollout-batch-size", str(config.rollout_batch_size),

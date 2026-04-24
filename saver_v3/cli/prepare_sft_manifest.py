@@ -8,7 +8,7 @@ from saver_v3.data.prepare_sft_manifest import PrepareSFTManifestConfig, run_pre
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare compact_trace_v2 SFT manifest from raw SAVER JSONL.")
+    parser = argparse.ArgumentParser(description="Prepare compact_trace_v5 SFT manifest from raw SAVER JSONL.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--override", action="append", default=[])
     return parser.parse_args()

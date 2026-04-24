@@ -19,6 +19,7 @@ from saver_v3.data.prepared_metadata import (
     ensure_prepared_sft_metadata,
     prepared_sft_metadata_path,
 )
+from saver_v3.data.protocol_signature import TEACHER_ROLE_AUXILIARY, build_protocol_signature
 from saver_v3.core.environment import parse_actions_and_contents
 from saver_v3.core.proposal import SiglipFeatureEncoder
 from saver_v3.common.runtime import (
@@ -49,7 +50,7 @@ from saver_v3.data.training_data import (
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run distributed online teacher-judge annotation over compact_trace_v2 prepared SFT JSONL."
+        description="Run distributed online teacher-judge annotation over compact_trace_v4 prepared SFT JSONL."
     )
     parser.add_argument("--input", required=True, help="Prepared SFT JSONL path to annotate online.")
     parser.add_argument("--output", required=True, help="Output JSONL path for annotated examples.")
@@ -97,13 +98,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--materialize-teacher-rollout-primary",
         dest="materialize_teacher_rollout_primary",
         action="store_true",
-        help="Deprecated no-op. The output is always the final teacher-annotated compact_trace_v2 prepared SFT file.",
+        help="Deprecated no-op. The output is always the final teacher-annotated compact_trace_v4 prepared SFT file.",
     )
     parser.add_argument(
         "--no-materialize-teacher-rollout-primary",
         dest="materialize_teacher_rollout_primary",
         action="store_false",
-        help="Deprecated no-op retained for CLI compatibility. The output remains the final teacher-annotated compact_trace_v2 file.",
+        help="Deprecated no-op retained for CLI compatibility. The output remains the final teacher-annotated compact_trace_v4 file.",
     )
     return parser.parse_args(argv)
 
@@ -738,6 +739,23 @@ def _input_signature(path: Path, metadata: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _apply_aux_teacher_protocol_signature(
+    rows: List[Dict[str, Any]],
+    *,
+    prepared_metadata: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    signature = build_protocol_signature(
+        config=config_from_prepared_sft_metadata(prepared_metadata),
+        teacher_role=TEACHER_ROLE_AUXILIARY,
+    )
+    patched_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        patched = copy.deepcopy(row)
+        patched["protocol_signature"] = copy.deepcopy(signature)
+        patched_rows.append(patched)
+    return patched_rows
+
+
 def _build_candidate_records(
     rows: List[Dict[str, Any]],
     *,
@@ -851,7 +869,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     if raw_rows and not all(is_compact_trace_sft_record(row) for row in raw_rows):
         raise ValueError(
-            "annotate_teacher_judge_sft.py now only accepts compact_trace_v2 prepared rows. "
+            "annotate_teacher_judge_sft.py now only accepts compact_trace_v4 prepared rows. "
             "Regenerate the prepared SFT JSONL with build_saver_data.py and rerun teacher judge."
         )
     strict_feature_guided_proposal = _prepared_rows_require_feature_guided_proposal(raw_rows)
@@ -1003,7 +1021,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 local_step_rows_by_source_index,
                 local_judgments,
             )
-            local_output_rows = merged_rows
+            local_output_rows = _apply_aux_teacher_protocol_signature(
+                merged_rows,
+                prepared_metadata=input_metadata,
+            )
         _write_jsonl(output_path, local_output_rows)
         runtime_log(f"saved {len(local_output_rows)} teacher-judge records to {output_path}", runtime=runtime)
         if not shard_spec.is_sharded:
@@ -1017,6 +1038,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             )
             metadata["teacher_annotated"] = True
             metadata["teacher_rollout_primary_materialized"] = True
+            metadata["protocol_signature"] = build_protocol_signature(
+                config=config_from_prepared_sft_metadata(metadata),
+                teacher_role=TEACHER_ROLE_AUXILIARY,
+            )
             metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         if shard_spec.is_sharded and runtime.is_distributed and dist_initialized:
             if runtime.is_main_process:
@@ -1043,6 +1068,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                     merged_step_rows_by_source_index,
                     merged_judgments,
                 )
+                merged_rows = _apply_aux_teacher_protocol_signature(
+                    merged_rows,
+                    prepared_metadata=input_metadata,
+                )
                 _write_jsonl(args.output, merged_rows)
                 merged_output_path = Path(args.output)
                 runtime_log(
@@ -1060,6 +1089,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 )
                 merged_metadata["teacher_annotated"] = True
                 merged_metadata["teacher_rollout_primary_materialized"] = True
+                merged_metadata["protocol_signature"] = build_protocol_signature(
+                    config=config_from_prepared_sft_metadata(merged_metadata),
+                    teacher_role=TEACHER_ROLE_AUXILIARY,
+                )
                 prepared_sft_metadata_path(merged_output_path).write_text(
                     json.dumps(merged_metadata, ensure_ascii=False, indent=2),
                     encoding="utf-8",

@@ -46,7 +46,6 @@ from split_utils import parse_include_splits
 from saver_v3.core.categories import CANONICAL_POLICY_CATEGORIES, canonicalize_saver_category
 from saver_v3.core.protocol_guidance import (
     EVENT_CHAIN_STAGES,
-    build_counterfactual_type_schema,
     build_stage_selected_moment_ids_schema,
     event_chain_stage_for_role,
     normalize_event_chain_stages,
@@ -61,9 +60,11 @@ from saver_v3.core.proposal import (
 )
 from saver_v3.core.self_verification import build_policy_self_verification_payload
 from saver_v3.core.semantic_answer import build_semantic_answer_payload
+from saver_v3.data.protocol_signature import build_protocol_signature
 
 
-SCHEMA_VERSION = "saver_agent.v2"
+SCHEMA_VERSION = "saver_agent.v5"
+RUNTIME_CONTRACT_VERSION = 5
 DEFAULT_DERIVED_PRECURSOR_SECONDS = 2.0
 DEFAULT_DERIVED_PRECURSOR_FRACTION = 0.2
 ALLOWED_TOOLS = [
@@ -78,7 +79,6 @@ FINALIZE_CASE_SCHEMA = {
     "properties": {
         "existence": {"type": "string", "enum": ["normal", "anomaly"]},
         "category": {"type": "string", "enum": list(CANONICAL_POLICY_CATEGORIES)},
-        "severity": {"type": "integer"},
         "anomaly_interval_sec": {
             "oneOf": [
                 {"type": "null"},
@@ -90,18 +90,6 @@ FINALIZE_CASE_SCHEMA = {
                 },
             ]
         },
-        "precursor_interval_sec": {
-            "oneOf": [
-                {"type": "null"},
-                {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-            ]
-        },
-        "earliest_actionable_sec": {"oneOf": [{"type": "null"}, {"type": "number"}]},
         "evidence_moment_ids": {
             "type": "array",
             "items": {"type": "string"},
@@ -115,7 +103,6 @@ FINALIZE_CASE_SCHEMA = {
             "items": {"type": "string", "enum": list(EVENT_CHAIN_STAGES)},
         },
         "stage_selected_moment_ids": build_stage_selected_moment_ids_schema(),
-        "counterfactual_type": build_counterfactual_type_schema(),
         "summary": {"type": "string"},
         "rationale": {"type": "string"},
         "event_chain_summary": {
@@ -138,27 +125,20 @@ FINALIZE_CASE_SCHEMA = {
     "required": [
         "existence",
         "category",
-        "severity",
         "anomaly_interval_sec",
-        "precursor_interval_sec",
         "covered_stages",
         "stage_selected_moment_ids",
-        "counterfactual_type",
     ],
 }
 
 FINALIZE_CASE_PRIMARY_FIELDS = (
     "existence",
     "category",
-    "severity",
     "anomaly_interval_sec",
-    "precursor_interval_sec",
-    "earliest_actionable_sec",
     "evidence_moment_ids",
     "covered_stages",
     "missing_required_stages",
     "stage_selected_moment_ids",
-    "counterfactual_type",
     "summary",
     "rationale",
     "event_chain_summary",
@@ -505,12 +485,6 @@ class CanonicalSaverAdapter:
 
         precursor_info = complete_precursor_interval(record)
         earliest_actionable_frame = record["temporal"].get("earliest_alert_frame")
-        earliest_actionable_sec = frame_to_second(
-            earliest_actionable_frame,
-            fps=fps,
-            frame_index_base=frame_index_base,
-            duration_sec=duration_sec,
-        )
 
         evidence_moments = [
             normalize_evidence_moment(
@@ -526,7 +500,7 @@ class CanonicalSaverAdapter:
         temporal = {
             key: value
             for key, value in dict(record["temporal"]).items()
-            if key not in {"earliest_alert_frame", "earliest_alert_sec"}
+            if key not in {"earliest_alert_frame", "earliest_alert_sec", "precursor_interval_sec", "earliest_actionable_sec"}
         }
 
         base = {
@@ -559,9 +533,7 @@ class CanonicalSaverAdapter:
                 **temporal,
                 "anomaly_interval_sec": anomaly_interval_sec,
                 "precursor_interval_frames": precursor_info["frames"],
-                "precursor_interval_sec": precursor_info["seconds"],
                 "earliest_actionable_frame": earliest_actionable_frame,
-                "earliest_actionable_sec": earliest_actionable_sec,
                 "precursor_resolution": {
                     "source": precursor_info["source"],
                     "auto_completed": precursor_info["auto_completed"],
@@ -571,7 +543,6 @@ class CanonicalSaverAdapter:
                 **record.get("evidence", {}),
                 "evidence_moments": evidence_moments,
             },
-            "counterfactual": record.get("counterfactual", {}),
             "language": record.get("language", {}),
             "qa_pairs": _sanitize_qa_pairs(
                 record.get("qa_pairs", []),
@@ -625,16 +596,6 @@ class CanonicalSaverAdapter:
         if not label.get("is_anomaly") or not include_synthetic:
             return {stage: list(stage_to_moments.get(stage) or []) for stage in EVENT_CHAIN_STAGES}
 
-        precursor_interval = temporal.get("precursor_interval_sec")
-        if precursor_interval and not stage_to_moments["precursor"]:
-            stage_to_moments["precursor"].append(
-                self._synthetic_stage_moment(
-                    moment_id="oracle_precursor",
-                    role="precursor",
-                    interval_sec=precursor_interval,
-                    description="lead-up activity before the decisive event",
-                )
-            )
         anomaly_interval = temporal.get("anomaly_interval_sec")
         if anomaly_interval and not stage_to_moments["trigger"]:
             summary = str(language.get("summary") or "decisive anomalous event").strip()
@@ -662,7 +623,7 @@ class CanonicalSaverAdapter:
         }
         required_stages: List[str] = []
         if label.get("is_anomaly"):
-            if stage_to_moment_ids.get("precursor") or temporal.get("precursor_interval_sec"):
+            if stage_to_moment_ids.get("precursor"):
                 required_stages.append("precursor")
             required_stages.append("trigger")
             if stage_to_moment_ids.get("confirmation"):
@@ -720,7 +681,6 @@ class CanonicalSaverAdapter:
                 "stage_queries": stage_queries,
                 "finalize_policy": {
                     "finalize_ready_after_stage": None,
-                    "earliest_actionable_sec": None,
                     "minimal_sufficient_moment_ids": [],
                     "minimal_sufficient_stage_order": [],
                 },
@@ -743,9 +703,6 @@ class CanonicalSaverAdapter:
 
         minimal_sufficient_stage_order: List[str] = []
         minimal_sufficient_moment_ids: List[str] = []
-        earliest_actionable_sec = round6(
-            (base.get("temporal") or {}).get("earliest_actionable_sec")
-        )
         if finalize_ready_after_stage in EVENT_CHAIN_STAGES:
             ready_stage_index = EVENT_CHAIN_STAGES.index(finalize_ready_after_stage)
             for stage in EVENT_CHAIN_STAGES[: ready_stage_index + 1]:
@@ -756,13 +713,10 @@ class CanonicalSaverAdapter:
                 moment_id = str(stage_query.get("moment_id") or "").strip()
                 if moment_id:
                     minimal_sufficient_moment_ids.append(moment_id)
-        if earliest_actionable_sec is None and stage_queries.get("trigger"):
-            earliest_actionable_sec = round6((stage_queries.get("trigger") or {}).get("window_sec", [None])[0])
         return {
             "stage_queries": stage_queries,
             "finalize_policy": {
                 "finalize_ready_after_stage": finalize_ready_after_stage,
-                "earliest_actionable_sec": earliest_actionable_sec,
                 "minimal_sufficient_moment_ids": minimal_sufficient_moment_ids,
                 "minimal_sufficient_stage_order": minimal_sufficient_stage_order,
             },
@@ -781,15 +735,7 @@ class CanonicalSaverAdapter:
         language = base.get("language") or {}
         existence = "anomaly" if label["is_anomaly"] else "normal"
         anomaly_interval_sec = temporal.get("anomaly_interval_sec")
-        precursor_interval_sec = temporal.get("precursor_interval_sec")
         search_supervision = self._build_search_supervision(base)
-        earliest_actionable_sec = (
-            (search_supervision.get("finalize_policy") or {}).get("earliest_actionable_sec")
-            if label["is_anomaly"]
-            else None
-        )
-        if earliest_actionable_sec is None:
-            earliest_actionable_sec = temporal.get("earliest_actionable_sec")
         event_chain_target = self._build_event_chain_target(base)
         stage_selected_moment_ids = normalize_stage_selected_moment_ids(
             event_chain_target.get("stage_to_moment_ids")
@@ -805,11 +751,8 @@ class CanonicalSaverAdapter:
         structured_target = {
             "existence": existence,
             "category": canonicalize_saver_category(label["category"], existence=existence),
-            "severity": label["severity"],
             "hard_normal": label["hard_normal"],
             "anomaly_interval_sec": anomaly_interval_sec,
-            "precursor_interval_sec": precursor_interval_sec,
-            "earliest_actionable_sec": earliest_actionable_sec,
             "evidence_moment_ids": [moment["moment_id"] for moment in evidence_moments],
             "event_chain_target": event_chain_target,
             "covered_stages": covered_stages,
@@ -823,8 +766,6 @@ class CanonicalSaverAdapter:
                 }
                 for moment in evidence_moments
             ],
-            "counterfactual_type": base["counterfactual"].get("type", "none"),
-            "counterfactual_text": base["counterfactual"].get("text"),
             "summary": language.get("summary"),
             "rationale": language.get("rationale"),
         }
@@ -901,6 +842,8 @@ class CanonicalSaverAdapter:
         base["agent_task"] = agent_task
         base["structured_target"] = structured_target
         base["tool_io"] = tool_io
+        base["runtime_contract_version"] = int(RUNTIME_CONTRACT_VERSION)
+        base["protocol_signature"] = build_protocol_signature()
         base["search_supervision"] = search_supervision
         base["stage_supervision"] = copy.deepcopy(search_supervision.get("stage_supervision") or {})
         base["source_video_id"] = source_video_id
@@ -1148,8 +1091,6 @@ class CanonicalSaverAdapter:
                 or event_chain_target.get("required_stages")
             )
             stage_to_moments = self._build_event_chain_stage_moments(base, include_synthetic=True)
-            earliest_actionable_sec = structured_target.get("earliest_actionable_sec")
-
             def current_stage_selected_moment_ids() -> Dict[str, List[str]]:
                 grouped: Dict[str, List[str]] = {}
                 for stage in EVENT_CHAIN_STAGES:
@@ -1235,7 +1176,7 @@ class CanonicalSaverAdapter:
                     {
                         "tool": "verify_hypothesis",
                         "arguments": {
-                            "verification_mode": "final_check" if event_chain_complete else "full_keep_drop",
+                            "verification_mode": "final_check" if event_chain_complete else "stage_check",
                             "selected_evidence_moment_ids": selected_evidence_moment_ids,
                             "covered_stages": covered_stages,
                             "missing_required_stages": missing_required_stages,
@@ -1243,13 +1184,12 @@ class CanonicalSaverAdapter:
                             "claim": {
                                 "existence": "anomaly",
                                 "category": category,
-                                "earliest_actionable_sec": earliest_actionable_sec,
                             },
                         },
                         "oracle_verifier_feedback": self._oracle_verifier_feedback(
-                            verification_mode="final_check" if event_chain_complete else "full_keep_drop",
+                            verification_mode="final_check" if event_chain_complete else "stage_check",
                             verification_decision="sufficient" if event_chain_complete else "insufficient",
-                            recommended_action="finalize" if event_chain_complete else "continue_search",
+                            next_tool="finalize_case" if event_chain_complete else "seek_evidence",
                             selected_refs=searched_real_refs,
                             selected_evidence_moment_ids=selected_evidence_moment_ids,
                             covered_stages=covered_stages,
@@ -1258,7 +1198,6 @@ class CanonicalSaverAdapter:
                             sufficiency_score=0.28 + 0.62 * progress_ratio if not event_chain_complete else 0.92,
                             necessity_score=0.24 + 0.48 * progress_ratio if not event_chain_complete else 0.76,
                             finalize_readiness_score=current_finalize_readiness,
-                            counterfactual_faithfulness=0.32 + 0.44 * progress_ratio if not event_chain_complete else 0.84,
                             rationale=(
                                 f"The current evidence covers {', '.join(covered_stages) or 'no required stage'} and still misses "
                                 f"{', '.join(missing_required_stages)}, so search should continue before finalization."
@@ -1289,13 +1228,12 @@ class CanonicalSaverAdapter:
                     "oracle_verifier_feedback": self._oracle_verifier_feedback(
                         verification_mode="final_check",
                         verification_decision="sufficient",
-                        recommended_action="finalize",
+                        next_tool="finalize_case",
                         selected_refs=normal_search_refs,
                         selected_evidence_moment_ids=[],
                         sufficiency_score=0.9,
                         necessity_score=0.58,
                         finalize_readiness_score=0.0,
-                        counterfactual_faithfulness=0.74,
                         rationale="The searched windows are enough to justify a normal decision, so the case can be finalized.",
                     ),
                 }
@@ -1402,7 +1340,6 @@ class CanonicalSaverAdapter:
         duration = round6(base["video_meta"]["duration_sec"]) or 0.0
         temporal = base.get("temporal") or {}
         anomaly_interval = temporal.get("anomaly_interval_sec") or [0.0, duration]
-        precursor_interval = temporal.get("precursor_interval_sec")
         anomaly_start = float((anomaly_interval or [0.0, duration])[0] or 0.0)
         anomaly_end = float((anomaly_interval or [0.0, duration])[1] or duration)
         if anomaly_end <= anomaly_start:
@@ -1410,16 +1347,6 @@ class CanonicalSaverAdapter:
         anomaly_span = max(anomaly_end - anomaly_start, 0.5)
 
         candidate_specs: List[Dict[str, Any]] = []
-        if precursor_interval:
-            candidate_specs.append(
-                {
-                    "query": self._query_for_role("precursor", category),
-                    "start_sec": precursor_interval[0],
-                    "end_sec": precursor_interval[1],
-                    "role": "precursor",
-                    "query_source": "oracle_role_fallback",
-                }
-            )
         candidate_specs.extend(
             [
                 {
@@ -1517,7 +1444,7 @@ class CanonicalSaverAdapter:
         *,
         verification_mode: str,
         verification_decision: str,
-        recommended_action: str,
+        next_tool: str,
         selected_refs: Optional[List[Dict[str, Any]]] = None,
         selected_evidence_moment_ids: Optional[List[str]] = None,
         covered_stages: Optional[List[str]] = None,
@@ -1526,7 +1453,6 @@ class CanonicalSaverAdapter:
         sufficiency_score: float,
         necessity_score: float,
         finalize_readiness_score: float,
-        counterfactual_faithfulness: float,
         rationale: str,
         teacher_judge_scores: Optional[Dict[str, Any]] = None,
         teacher_judge_decision: Optional[str] = None,
@@ -1536,7 +1462,7 @@ class CanonicalSaverAdapter:
             {
                 "verification_mode": verification_mode,
                 "verification_decision": verification_decision,
-                "recommended_action": recommended_action,
+                "next_tool": next_tool,
                 "selected_window_ids": [
                     str(ref.get("window_id"))
                     for ref in list(selected_refs or [])
@@ -1553,7 +1479,6 @@ class CanonicalSaverAdapter:
                 "sufficiency_score": round6(sufficiency_score),
                 "necessity_score": round6(necessity_score),
                 "finalize_readiness_score": round6(finalize_readiness_score),
-                "counterfactual_faithfulness": round6(counterfactual_faithfulness),
                 "rationale": rationale,
             }
         )

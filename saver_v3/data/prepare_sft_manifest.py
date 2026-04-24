@@ -10,6 +10,8 @@ from split_utils import parse_include_splits
 from saver_v3.data.config import SaverAgentConfig, saver_config_from_mapping
 from saver_v3.data.dataset import SaverRecordItemBuilder
 from saver_v3.data.prepared_metadata import build_jsonl_provenance, write_prepared_sft_metadata
+from saver_v3.data.prepared_schema import PREPARED_SFT_FORMAT
+from saver_v3.data.runtime_contract import validate_runtime_record_contract
 from saver_v3.data.training_data import build_compact_trace_sft_record
 from saver_v3.cli.common import load_yaml_mapping, write_json
 from saver_v3.common import distributed_runtime_from_env, runtime_log
@@ -92,6 +94,7 @@ def run_prepare_sft_manifest_job(config: PrepareSFTManifestConfig) -> Dict[str, 
     )
 
     for row in iter_jsonl(config.input_data_path, skip_invalid_lines=False):
+        row = validate_runtime_record_contract(dict(row))
         if include_splits and str(row.get("split") or "") not in include_splits:
             continue
         item = record_builder.build_item(dict(row))
@@ -115,7 +118,7 @@ def run_prepare_sft_manifest_job(config: PrepareSFTManifestConfig) -> Dict[str, 
         "output_path": str(output_path),
         "metadata_path": str(metadata_path),
         "num_records": int(len(prepared_rows)),
-        "prepared_format": "compact_trace_v2",
+        "prepared_format": PREPARED_SFT_FORMAT,
     }
     write_json(summary, output_path.with_suffix(output_path.suffix + ".summary.json"))
     return summary

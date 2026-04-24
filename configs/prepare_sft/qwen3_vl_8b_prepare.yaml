@@ -2,10 +2,13 @@ saver_config_source: configs/sft/qwen3_vl_8b_full_train.yaml
 
 io:
   input_data_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl
-  output_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v2.jsonl
+  output_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl
   data_root: /mnt/shared-storage-user/mineru2-shared/zengweijun
   include_splits: train
 
-preview:
-  num_preview_frames: 8
-  preview_sampling_fps: null
+initial_observation:
+  mode: explicit_first_scan
+  scan_num_frames: 8
+  scan_purpose: global_overview
+  protect_from_visual_budget: true
+  error_on_seq_prune: true

@@ -5,9 +5,12 @@ from __future__ import annotations
 import copy
 from typing import Any, Iterable
 
+from saver_v3.data.protocol_signature import extract_protocol_signature
+from saver_v3.data.runtime_contract import ensure_removed_fields_absent, validate_finalize_case_schema_removed_fields
 
-PREPARED_SCHEMA_VERSION = 1
-PREPARED_FORMAT = "compact_trace_v2"
+
+PREPARED_SCHEMA_VERSION = 5
+PREPARED_FORMAT = "compact_trace_v5"
 PREPARED_SFT_FORMAT = PREPARED_FORMAT
 LEGACY_PREPARED_FORMATS = ()
 _ALLOWED_FORMATS = {PREPARED_FORMAT, *LEGACY_PREPARED_FORMATS}
@@ -44,6 +47,16 @@ def _validate_trajectory(trajectory: Iterable[Any]) -> list[dict[str, Any]]:
         step = copy.deepcopy(raw_step)
         step["tool"] = tool_name
         step["arguments"] = copy.deepcopy(arguments)
+        if tool_name == "verify_hypothesis":
+            ensure_removed_fields_absent(
+                dict(step["arguments"].get("claim") or {}),
+                context=f"oracle_trajectory[{step_index}].arguments.claim",
+            )
+        elif tool_name == "finalize_case":
+            ensure_removed_fields_absent(
+                step["arguments"],
+                context=f"oracle_trajectory[{step_index}].arguments",
+            )
         validated_steps.append(step)
     return validated_steps
 
@@ -62,6 +75,32 @@ def validate_prepared_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized["prepared_format"] = prepared_format
     normalized["video_id"] = str(normalized.get("video_id") or normalized.get("id") or "").strip() or "unknown"
     normalized["video_path"] = _require_non_empty_string(normalized, "video_path")
+    protocol_signature = extract_protocol_signature(normalized)
+    if not protocol_signature.get("protocol_version"):
+        raise PreparedDataError("Prepared row is missing required `protocol_signature`.")
+    normalized["protocol_signature"] = protocol_signature
+    if "structured_target" in normalized and normalized["structured_target"] is not None:
+        normalized["structured_target"] = ensure_removed_fields_absent(
+            normalized.get("structured_target"),
+            context="prepared.structured_target",
+        )
+    if "oracle_final_decision" in normalized and normalized["oracle_final_decision"] is not None:
+        normalized["oracle_final_decision"] = ensure_removed_fields_absent(
+            normalized.get("oracle_final_decision"),
+            context="prepared.oracle_final_decision",
+        )
+    tool_io = normalized.get("tool_io")
+    if isinstance(tool_io, dict):
+        validate_finalize_case_schema_removed_fields(
+            dict(tool_io.get("finalize_case_schema") or {}),
+            context="prepared.tool_io.finalize_case_schema",
+        )
+    search_supervision = normalized.get("search_supervision")
+    if isinstance(search_supervision, dict):
+        ensure_removed_fields_absent(
+            dict(search_supervision.get("finalize_policy") or {}),
+            context="prepared.search_supervision.finalize_policy",
+        )
 
     trajectory = normalized.get("oracle_trajectory")
     if not isinstance(trajectory, list):

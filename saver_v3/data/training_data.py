@@ -40,6 +40,24 @@ _EPISODE_LOSS_WEIGHT_BY_KIND = {
     "semantic_replay": 0.2,
     "answer": 0.1,
 }
+
+
+def _sanitize_teacher_next_tool_text(text: str) -> str:
+    sanitized = str(text or "")
+    replacements = (
+        (r"\bcontinue_search\b", "seek_evidence"),
+        (r"\brefine_evidence\b", "seek_evidence"),
+        (r"\brevise_claim\b", "seek_evidence"),
+        (r"\bcontinue searching\b", "call seek_evidence"),
+        (r"\bcontinue the search\b", "call seek_evidence"),
+        (r"\brefine the selected evidence subset\b", "call seek_evidence on a better evidence subset"),
+        (r"\brevise the claim\b", "call seek_evidence to gather aligned evidence"),
+        (r"\bshould finalize\b", "should call finalize_case"),
+        (r"\bbefore finalize\b", "before calling finalize_case"),
+    )
+    for pattern, replacement in replacements:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+    return sanitized
 _EPISODE_PASSTHROUGH_KEYS = (
     "multimodal_cache",
     "rollout_context",
@@ -101,11 +119,12 @@ def build_compact_trace_sft_record(
     *,
     config: Optional[SaverAgentConfig] = None,
 ) -> Dict[str, Any]:
-    del config  # compact trace stores the canonical episode trace; prompt/preview live in metadata
+    del config  # compact trace stores the canonical episode trace; initial-observation/prompt live in metadata
     oracle_sft = _ensure_oracle_sft(record)
     compact_record = _compact_trace_record_payload(item, record)
     compact_record["prepared_format"] = str(PREPARED_SFT_FORMAT)
-    compact_record["source"] = "oracle_sft_compact_trace_v2"
+    compact_record["source"] = "oracle_sft_compact_trace_v5"
+    compact_record["protocol_signature"] = copy.deepcopy(item.get("protocol_signature") or record.get("protocol_signature") or {})
     compact_record["oracle_trajectory"] = copy.deepcopy(list(oracle_sft.get("trajectory") or []))
     compact_record["oracle_final_decision"] = copy.deepcopy(
         oracle_sft.get("final_decision")
@@ -172,10 +191,10 @@ def _tool_reasoning_text(
         if str(arguments.get("purpose") or "") == "global_overview":
             if task_prompt:
                 return _clip_text(
-                    f"I only have a limited preview, so I should scan {span_text} for a global overview before deciding how to investigate {task_prompt.lower()}."
+                    f"I should scan {span_text} first to build a global overview before deciding how to investigate {task_prompt.lower()}."
                 )
             return _clip_text(
-                f"I only have a limited preview, so I should scan {span_text} for a global overview before making a decision about the clip."
+                f"I should scan {span_text} first to build a global overview before making a decision about the clip."
             )
         return _clip_text(f"I should inspect {span_text} to refine my overview before taking the next step.")
 
@@ -641,20 +660,6 @@ def _is_anomaly_record(record: Dict[str, Any]) -> bool:
     return bool((record.get("label") or {}).get("is_anomaly"))
 
 
-def _counterfactual_terminal_multiplier(record: Dict[str, Any]) -> float:
-    structured_target = record.get("structured_target") or {}
-    counterfactual_type = str(structured_target.get("counterfactual_type") or "none").strip().lower()
-    if not counterfactual_type or counterfactual_type == "none":
-        return 1.0
-    return {
-        "remove_actor_interaction": 1.35,
-        "remove_dangerous_object": 1.55,
-        "restore_safe_context": 1.25,
-        "replace_risky_motion_with_normal_motion": 1.7,
-        "move_event_out_of_sensitive_area": 1.7,
-    }.get(counterfactual_type, 1.35)
-
-
 def _oracle_step_sample_weight(step: Dict[str, Any], *, record: Dict[str, Any]) -> float:
     tool_name = str(step.get("tool") or "")
     weight = 1.0
@@ -667,13 +672,12 @@ def _oracle_step_sample_weight(step: Dict[str, Any], *, record: Dict[str, Any]) 
         if isinstance(step.get("oracle_verifier_feedback"), dict):
             merged.update(copy.deepcopy(step.get("oracle_verifier_feedback") or {}))
         verification_decision = str(merged.get("verification_decision") or "").strip().lower()
-        recommended_action = str(merged.get("recommended_action") or "").strip().lower()
-        if recommended_action == "finalize" or verification_decision == "sufficient":
+        next_tool = str(merged.get("next_tool") or "").strip().lower()
+        if next_tool == "finalize_case" or verification_decision == "sufficient":
             weight = 2.0
 
     if tool_name in {"verify_hypothesis", "finalize_case"} and _is_anomaly_record(record):
         weight *= 2.0
-        weight *= _counterfactual_terminal_multiplier(record)
     return float(weight)
 
 
@@ -786,15 +790,11 @@ def _extract_tool_call_arguments(response_text: str) -> Dict[str, Any]:
     return copy.deepcopy(arguments) if isinstance(arguments, dict) else {}
 
 
-def _teacher_decision_to_recommended_action(decision: str) -> str:
+def _teacher_decision_to_next_tool(decision: str) -> str:
     normalized = str(decision or "").strip().lower()
     if normalized == "sufficient":
-        return "finalize"
-    if normalized == "misaligned":
-        return "revise_claim"
-    if normalized == "redundant":
-        return "refine_evidence"
-    return "continue_search"
+        return "finalize_case"
+    return "seek_evidence"
 
 
 def _build_teacher_override_verify_payload(example: Dict[str, Any]) -> Dict[str, Any]:
@@ -809,15 +809,13 @@ def _build_teacher_override_verify_payload(example: Dict[str, Any]) -> Dict[str,
         merged["necessity_score"] = teacher_scores.get("necessity")
     if "finalize_readiness" in teacher_scores:
         merged["finalize_readiness_score"] = teacher_scores.get("finalize_readiness")
-    if "counterfactual_faithfulness" in teacher_scores:
-        merged["counterfactual_faithfulness"] = teacher_scores.get("counterfactual_faithfulness")
     teacher_decision = str(example.get("teacher_judge_decision") or "").strip().lower()
     if teacher_decision:
         merged["verification_decision"] = teacher_decision
-        merged["recommended_action"] = _teacher_decision_to_recommended_action(teacher_decision)
+        merged["next_tool"] = _teacher_decision_to_next_tool(teacher_decision)
     rationale = str(example.get("teacher_judge_rationale") or "").strip()
     if rationale:
-        merged["rationale"] = rationale
+        merged["rationale"] = _sanitize_teacher_next_tool_text(rationale)
     return build_policy_self_verification_payload(merged)
 
 
@@ -967,7 +965,7 @@ def rebuild_teacher_rollout_primary_examples(
                     group_changed = True
                     rebuilt_group.append(example)
 
-                    if str(verify_payload.get("recommended_action") or "") == "finalize":
+                    if str(verify_payload.get("next_tool") or "") == "finalize_case":
                         finalize_template = None
                         for candidate in group[idx + 1 :]:
                             if str(candidate.get("tool_name") or "") == "finalize_case":
@@ -1038,7 +1036,7 @@ def rebuild_teacher_rollout_primary_examples(
             str(example.get("tool_name") or "") in {"verify_hypothesis", "finalize_case"}
             and (
                 str(example.get("teacher_judge_decision") or "").strip().lower() == "sufficient"
-                or '"recommended_action":"finalize"' in str(example.get("target_response") or "")
+                or '"next_tool":"finalize_case"' in str(example.get("target_response") or "")
             )
             for example in rebuilt_group
         )
@@ -1080,15 +1078,13 @@ def _weighted_verifier_turn_credit(turn: Dict[str, Any]) -> float:
     sufficiency = float(derived.get("sufficiency", 0.0) or 0.0)
     necessity = float(derived.get("necessity", 0.0) or 0.0)
     finalize_readiness = float(derived.get("finalize_readiness", 0.0) or 0.0)
-    counterfactual = float(derived.get("counterfactual_faithfulness", 0.0) or 0.0)
     primary_status = str(turn.get("verifier_primary_status") or "")
 
     verification_credit = _clamp_score(
         0.35 * float(PRIMARY_STATUS_REWARD.get(primary_status, 0.0))
         + 0.20 * sufficiency
         + 0.15 * necessity
-        + 0.15 * finalize_readiness
-        + 0.15 * counterfactual
+        + 0.30 * finalize_readiness
     )
     stage_credit = _clamp_score(0.5 * consistency + 0.5 * sufficiency)
     return (
@@ -1143,7 +1139,7 @@ def _compute_turn_credit(
     repeated_search: bool = False,
     search_after_finalize_recommendation: bool = False,
 ) -> float:
-    valid_action = bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"}))
+    valid_action = bool(turn.get("valid_action", turn.get("action") in {"tool_call"}))
     tool_name = str(turn.get("tool_name") or "")
     step_index = int(turn.get("step_index") or 0)
     turn_credit = 0.0
@@ -1238,7 +1234,7 @@ def _compute_turn_level_advantages(
             turn_credit += float(finalize_bonus)
         turn_credits.append(turn_credit)
         if tool_name == "verify_hypothesis":
-            pending_finalize_recommendation = str(turn.get("verifier_recommended_action") or "") == "finalize"
+            pending_finalize_recommendation = str(turn.get("verifier_next_tool") or "") == "finalize_case"
         elif tool_name == "finalize_case":
             pending_finalize_recommendation = False
         previous_search_signature = current_search_signature
@@ -1701,7 +1697,7 @@ def build_reward_weighted_examples(
             if isinstance(tool_message, dict) and tool_message.get("role") == "tool":
                 messages.append(adapter.adapt_tool_observation(tool_message, multimodal_cache))
             continue
-        valid_action = bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"}))
+        valid_action = bool(turn.get("valid_action", turn.get("action") in {"tool_call"}))
         teacher_signal = compute_teacher_judge_signal(turn)
         turn_advantage_info = (
             turn_advantages[step_index - 1]

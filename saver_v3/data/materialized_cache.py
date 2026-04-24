@@ -5,16 +5,28 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from split_utils import parse_include_splits
 
 from saver_v3.data.prepared_schema import validate_compact_trace_row
+from saver_v3.data.config import saver_config_cache_semantic_snapshot
+from saver_v3.data.runtime_contract import validate_runtime_record_contract
+from saver_v3.data.protocol_signature import (
+    DEFAULT_TEACHER_ROLE,
+    TEACHER_ROLE_AUXILIARY,
+    build_protocol_signature,
+    ensure_protocol_signature_matches,
+    extract_protocol_signature,
+    infer_teacher_role_from_metadata,
+)
 
 
-MATERIALIZED_CACHE_METADATA_SCHEMA_VERSION = 1
-MATERIALIZED_SFT_MESSAGES_FORMAT = "materialized_sft_messages_v1"
-MATERIALIZED_RUNTIME_ITEMS_FORMAT = "materialized_runtime_items_v1"
+MATERIALIZED_CACHE_METADATA_SCHEMA_VERSION = 6
+MATERIALIZED_SFT_MESSAGES_FORMAT = "materialized_sft_messages_v5"
+MATERIALIZED_RUNTIME_ITEMS_FORMAT = "materialized_runtime_items_v5"
+DEFAULT_BASE_SFT_MATERIALIZED_MESSAGES_SUFFIX = ".materialized_messages_v5.jsonl"
+DEFAULT_TEACHER_SFT_MATERIALIZED_MESSAGES_SUFFIX = ".teacher_materialized_messages_v5.jsonl"
 
 
 class MaterializedCacheError(ValueError):
@@ -41,6 +53,22 @@ def canonical_json_hash(payload: Any) -> str:
 
 def materialized_cache_metadata_path(cache_path: str | Path) -> Path:
     return Path(str(cache_path) + ".meta.json")
+
+
+def default_sft_materialized_messages_path(
+    prepared_data_path: str | Path,
+    *,
+    teacher_role: str = DEFAULT_TEACHER_ROLE,
+) -> Path:
+    prepared_path = Path(prepared_data_path).expanduser()
+    basename = prepared_path.name
+    stem = basename[:-6] if basename.endswith(".jsonl") else basename
+    if str(teacher_role or "").strip() == TEACHER_ROLE_AUXILIARY:
+        normalized_stem = stem.replace(".teacher_rollout_primary", "", 1)
+        return prepared_path.with_name(
+            f"{normalized_stem}{DEFAULT_TEACHER_SFT_MATERIALIZED_MESSAGES_SUFFIX}"
+        )
+    return prepared_path.with_name(f"{stem}{DEFAULT_BASE_SFT_MATERIALIZED_MESSAGES_SUFFIX}")
 
 
 def build_jsonl_provenance(
@@ -87,14 +115,7 @@ def build_jsonl_provenance(
 
 
 def _config_snapshot(config: Any) -> dict[str, Any]:
-    if config is None:
-        return {}
-    if hasattr(config, "to_dict"):
-        payload = config.to_dict()
-        return copy.deepcopy(payload) if isinstance(payload, dict) else {}
-    if isinstance(config, Mapping):
-        return copy.deepcopy(dict(config))
-    return {}
+    return saver_config_cache_semantic_snapshot(config)
 
 
 def build_materialized_cache_metadata(
@@ -102,12 +123,19 @@ def build_materialized_cache_metadata(
     materialized_format: str,
     config: Any = None,
     model_config: Mapping[str, Any] | None = None,
+    protocol_signature: Mapping[str, Any] | None = None,
     extra_fields: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "schema_version": int(MATERIALIZED_CACHE_METADATA_SCHEMA_VERSION),
         "materialized_format": str(materialized_format),
     }
+    resolved_signature = (
+        copy.deepcopy(dict(protocol_signature))
+        if isinstance(protocol_signature, Mapping)
+        else build_protocol_signature(config=config, teacher_role=DEFAULT_TEACHER_ROLE)
+    )
+    metadata["protocol_signature"] = resolved_signature
     config_payload = _config_snapshot(config)
     if config_payload:
         metadata["config"] = config_payload
@@ -135,6 +163,7 @@ def write_materialized_cache_metadata(
     materialized_format: str,
     config: Any = None,
     model_config: Mapping[str, Any] | None = None,
+    protocol_signature: Mapping[str, Any] | None = None,
     source_path: str | Path | None = None,
     include_splits: str | Sequence[str] | None = None,
     source_field_name: str = "source_jsonl",
@@ -150,6 +179,7 @@ def write_materialized_cache_metadata(
         materialized_format=materialized_format,
         config=config,
         model_config=model_config,
+        protocol_signature=protocol_signature,
         extra_fields=merged_extra_fields,
     )
     metadata_path = materialized_cache_metadata_path(cache_path)
@@ -191,6 +221,12 @@ def _validate_jsonl_provenance_block(
     if not actual_path.exists():
         raise ValueError(f"Materialized cache metadata `{field_name}` points to a missing file: {actual_path}.")
 
+    stat = actual_path.stat()
+    recorded_size = int(block.get("file_size", -1) or -1)
+    recorded_mtime_ns = int(block.get("mtime_ns", -1) or -1)
+    if int(stat.st_size) == recorded_size and int(stat.st_mtime_ns) == recorded_mtime_ns:
+        return
+
     rebuilt = build_jsonl_provenance(actual_path, include_splits=recorded_splits)
     if rebuilt.get("sha256") != str(block.get("sha256") or "") or int(rebuilt.get("num_records", -1)) != int(
         block.get("num_records", -1) or -1
@@ -204,6 +240,9 @@ def ensure_materialized_cache_metadata(
     expected_format: str | None = None,
     expected_source_path: str | Path | None = None,
     expected_include_splits: str | Sequence[str] | None = None,
+    expected_config: Any = None,
+    expected_protocol_signature: Mapping[str, Any] | None = None,
+    require_config_match: bool = False,
     require_source: bool = False,
     source_field_name: str = "source_jsonl",
 ) -> dict[str, Any]:
@@ -223,6 +262,20 @@ def ensure_materialized_cache_metadata(
         raise ValueError(
             f"Materialized cache metadata format mismatch for {cache_path}: "
             f"found {materialized_format or '(missing)'}, expected {expected_format}."
+        )
+    if require_config_match and expected_config is not None:
+        expected_snapshot = _config_snapshot(expected_config)
+        actual_snapshot = _config_snapshot(dict(metadata.get("config") or {}))
+        if actual_snapshot != expected_snapshot:
+            raise ValueError(
+                f"Materialized cache metadata config mismatch for {cache_path}. "
+                "Rebuild the cache with the current initial-observation/prompt/rollout settings."
+            )
+    if expected_protocol_signature is not None:
+        ensure_protocol_signature_matches(
+            actual_signature=extract_protocol_signature(metadata),
+            expected_signature=dict(expected_protocol_signature),
+            context=f"Materialized cache metadata for {cache_path}",
         )
 
     if require_source or expected_source_path is not None:
@@ -280,6 +333,10 @@ def validate_materialized_sft_row(row: dict[str, Any]) -> dict[str, Any]:
     )
     normalized["materialized_format"] = MATERIALIZED_SFT_MESSAGES_FORMAT
     normalized.pop("prepared_format", None)
+    signature = extract_protocol_signature(normalized)
+    if not signature.get("protocol_version"):
+        raise MaterializedCacheError("Materialized SFT row is missing required `protocol_signature`.")
+    normalized["protocol_signature"] = signature
     normalized["messages"] = _validate_messages(normalized.get("messages"))
     normalized["sample_weight"] = _coerce_finite_float(normalized.get("sample_weight", 1.0), field_name="sample_weight")
     return normalized
@@ -296,10 +353,15 @@ def validate_materialized_runtime_item_row(row: dict[str, Any]) -> dict[str, Any
     )
     normalized["materialized_format"] = MATERIALIZED_RUNTIME_ITEMS_FORMAT
     normalized.pop("prepared_format", None)
+    signature = extract_protocol_signature(normalized)
+    if not signature.get("protocol_version"):
+        raise MaterializedCacheError("Materialized runtime row is missing required `protocol_signature`.")
+    normalized["protocol_signature"] = signature
     if not isinstance(normalized.get("record"), dict):
         raise MaterializedCacheError("Materialized runtime row is missing required object field `record`.")
     if not isinstance(normalized.get("multimodal_cache"), dict):
         raise MaterializedCacheError("Materialized runtime row is missing required object field `multimodal_cache`.")
+    normalized["record"] = validate_runtime_record_contract(copy.deepcopy(normalized.get("record") or {}))
     normalized["messages"] = _validate_messages(normalized.get("messages"))
     return normalized
 
@@ -376,9 +438,10 @@ def build_sft_materialized_rows(
     config: Any = None,
     proposal_runtime: Any = None,
     strict: bool = False,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> list[dict[str, Any]]:
     materialized_rows: list[dict[str, Any]] = []
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         normalized = validate_compact_trace_row(row)
         messages = _replay_compact_trace_messages(
             normalized,
@@ -391,6 +454,10 @@ def build_sft_materialized_rows(
             "materialized_format": MATERIALIZED_SFT_MESSAGES_FORMAT,
             "source_prepared_format": normalized.get("prepared_format"),
             "source_row_sha256": canonical_json_hash(normalized),
+            "protocol_signature": copy.deepcopy(
+                normalized.get("protocol_signature")
+                or build_protocol_signature(config=config, teacher_role=DEFAULT_TEACHER_ROLE)
+            ),
             "video_id": normalized.get("video_id"),
             "split": normalized.get("split"),
             "source": normalized.get("source"),
@@ -401,6 +468,8 @@ def build_sft_materialized_rows(
             "sample_weight": _episode_sample_weight(normalized),
         }
         materialized_rows.append(validate_materialized_sft_row(materialized))
+        if progress_callback is not None:
+            progress_callback(int(index))
     return materialized_rows
 
 
@@ -490,6 +559,7 @@ def build_runtime_materialized_rows(
     config: Any = None,
     data_root: str | Path | None = None,
     strict: bool = False,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> list[dict[str, Any]]:
     record_builder_cls = SaverRecordItemBuilder
     if record_builder_cls is None:
@@ -504,9 +574,9 @@ def build_runtime_materialized_rows(
         load_feature_cache=False,
     )
     materialized_rows: list[dict[str, Any]] = []
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         try:
-            record = copy.deepcopy(dict(row))
+            record = validate_runtime_record_contract(copy.deepcopy(dict(row)))
             item = record_builder.build_item(record)
             multimodal_cache = _sanitize_multimodal_cache(item.get("multimodal_cache") or {})
             video_path = str(multimodal_cache.get("video_path") or item.get("video") or record.get("video_path") or "")
@@ -514,6 +584,10 @@ def build_runtime_materialized_rows(
                 "schema_version": int(MATERIALIZED_CACHE_METADATA_SCHEMA_VERSION),
                 "materialized_format": MATERIALIZED_RUNTIME_ITEMS_FORMAT,
                 "source_row_sha256": canonical_json_hash(record),
+                "protocol_signature": copy.deepcopy(
+                    record.get("protocol_signature")
+                    or build_protocol_signature(config=config, teacher_role=DEFAULT_TEACHER_ROLE)
+                ),
                 "video_id": item.get("video_id", record.get("video_id")),
                 "split": item.get("split", record.get("split")),
                 "source": item.get("source", record.get("source")),
@@ -526,6 +600,9 @@ def build_runtime_materialized_rows(
         except Exception:
             if strict:
                 raise
+        finally:
+            if progress_callback is not None:
+                progress_callback(int(index))
     return materialized_rows
 
 
@@ -537,7 +614,19 @@ class MaterializedMessagesSFTDataset:
         include_splits: str | Sequence[str] | None = None,
         config: Any = None,
     ):
-        del config
+        metadata = load_materialized_cache_metadata(materialized_messages_path)
+        expected_protocol_signature = build_protocol_signature(
+            config=config,
+            teacher_role=infer_teacher_role_from_metadata(metadata),
+        )
+        ensure_materialized_cache_metadata(
+            materialized_messages_path,
+            expected_format=MATERIALIZED_SFT_MESSAGES_FORMAT,
+            expected_config=config,
+            expected_protocol_signature=expected_protocol_signature,
+            require_config_match=config is not None,
+            require_source=False,
+        )
         include_split_set = set(_normalize_include_splits(include_splits))
         self.rows = [
             row
@@ -564,11 +653,24 @@ class MaterializedRuntimeItemDataset:
         materialized_items_path: str | Path,
         *,
         include_splits: str | Sequence[str] | None = None,
+        config: Any = None,
         require_frame_cache: bool = True,
         require_feature_cache: bool = True,
         proposal_runtime: Any = None,
         strict_feature_guided_proposal: bool = False,
     ):
+        expected_protocol_signature = build_protocol_signature(
+            config=config,
+            teacher_role=DEFAULT_TEACHER_ROLE,
+        )
+        ensure_materialized_cache_metadata(
+            materialized_items_path,
+            expected_format=MATERIALIZED_RUNTIME_ITEMS_FORMAT,
+            expected_config=config,
+            expected_protocol_signature=expected_protocol_signature,
+            require_config_match=config is not None,
+            require_source=False,
+        )
         include_split_set = set(_normalize_include_splits(include_splits))
         self.items = [
             row

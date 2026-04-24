@@ -234,6 +234,53 @@ raise SystemExit(1)
 PY
 }
 
+resolve_rl_resume_state_json() {
+  local rl_dir="$1"
+  python3 - "${rl_dir}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from saver_v3.rl.resume import resolve_rl_training_resume_state
+
+rl_dir = Path(sys.argv[1]).expanduser().resolve()
+state = resolve_rl_training_resume_state(rl_dir)
+print(json.dumps(state.to_dict() if state is not None else {}, ensure_ascii=False))
+PY
+}
+
+resolve_rl_resume_checkpoint_path() {
+  local rl_dir="$1"
+  python3 - "${rl_dir}" <<'PY'
+import sys
+from pathlib import Path
+
+from saver_v3.rl.resume import resolve_rl_training_resume_state
+
+rl_dir = Path(sys.argv[1]).expanduser().resolve()
+state = resolve_rl_training_resume_state(rl_dir)
+if state is None:
+    raise SystemExit(1)
+print(state.checkpoint_path)
+PY
+}
+
+resolve_rl_resume_iteration() {
+  local rl_dir="$1"
+  python3 - "${rl_dir}" <<'PY'
+import sys
+from pathlib import Path
+
+from saver_v3.rl.resume import resolve_rl_training_resume_state
+
+rl_dir = Path(sys.argv[1]).expanduser().resolve()
+state = resolve_rl_training_resume_state(rl_dir)
+if state is None:
+    raise SystemExit(1)
+print(state.resume_iteration)
+PY
+}
+
 collect_rl_output_issues() {
   local rl_dir="$1"
   local latest_checkpoint=""
@@ -278,14 +325,34 @@ validate_materialized_cache() {
   local expected_format="$2"
   local source_path="$3"
   local include_splits="$4"
-  python3 - "$cache_path" "$expected_format" "$source_path" "$include_splits" <<'INNERPY'
-from saver_v3.data.materialized_cache import ensure_materialized_cache_metadata
+  local config_path="$5"
+  python3 - "$cache_path" "$expected_format" "$source_path" "$include_splits" "$config_path" <<'INNERPY'
+from pathlib import Path
 import sys
+
+from saver_v3.cli.common import load_json_mapping, load_yaml_mapping
+from saver_v3.data.config import saver_config_from_mapping
+from saver_v3.data.materialized_cache import ensure_materialized_cache_metadata
+
+config_path = str(sys.argv[5] or "").strip()
+expected_config = None
+if config_path:
+    path = Path(config_path)
+    mapping = load_json_mapping(path) if path.suffix.lower() == ".json" else load_yaml_mapping(path)
+    saver_mapping = mapping.get("saver_config") if isinstance(mapping.get("saver_config"), dict) else mapping
+    expected_config = saver_config_from_mapping(
+        saver_mapping,
+        saver_config_source=mapping.get("saver_config_source"),
+        source_anchor=path,
+    )
+
 ensure_materialized_cache_metadata(
     sys.argv[1],
     expected_format=sys.argv[2],
     expected_source_path=sys.argv[3],
     expected_include_splits=sys.argv[4] or None,
+    expected_config=expected_config,
+    require_config_match=expected_config is not None,
     require_source=True,
 )
 INNERPY
@@ -307,10 +374,11 @@ resolve_materialized_cache() {
   local output_path="$4"
   local expected_format="$5"
   local include_splits="$6"
-  shift 6
+  local config_path="$7"
+  shift 7
   local rebuild=0
   if [[ -f "$output_path" && -f "${output_path}.meta.json" ]]; then
-    if validate_materialized_cache "$output_path" "$expected_format" "$input_path" "$include_splits"; then
+    if validate_materialized_cache "$output_path" "$expected_format" "$input_path" "$include_splits" "$config_path"; then
       skip "$label already valid at $output_path — skipping rebuild."
       return 0
     fi
@@ -323,8 +391,28 @@ resolve_materialized_cache() {
       info "Building $label -> $output_path"
     fi
     build_materialized_cache "$mode" "$input_path" "$output_path" "$include_splits" "$@"
-    validate_materialized_cache "$output_path" "$expected_format" "$input_path" "$include_splits"
+    validate_materialized_cache "$output_path" "$expected_format" "$input_path" "$include_splits" "$config_path"
     ok "$label ready: $output_path"
+  fi
+}
+
+maybe_migrate_teacher_materialized_cache() {
+  local legacy_path="${BASE_SFT_MATERIALIZED_FILE}"
+  local target_path="${TEACHER_SFT_MATERIALIZED_FILE}"
+  if [[ ! -f "${legacy_path}" || -f "${target_path}" ]]; then
+    return 0
+  fi
+  if validate_materialized_cache \
+    "${legacy_path}" \
+    "materialized_sft_messages_v5" \
+    "${TEACHER_PREPARED_FILE}" \
+    "${TRAIN_INCLUDE_SPLIT}" \
+    "${SFT_CONFIG}" >/dev/null 2>&1; then
+    info "Migrating teacher SFT materialized cache to dedicated path: ${legacy_path} -> ${target_path}"
+    mv "${legacy_path}" "${target_path}"
+    [[ -f "${legacy_path}.meta.json" ]] && mv "${legacy_path}.meta.json" "${target_path}.meta.json"
+    [[ -f "${legacy_path}.summary.json" ]] && mv "${legacy_path}.summary.json" "${target_path}.summary.json"
+    ok "Teacher SFT materialized cache migrated to ${target_path}"
   fi
 }
 
@@ -367,7 +455,7 @@ ROLLOUT_CONFIG="${ROLLOUT_CONFIG:-${ROOT_DIR}/configs/rollout_eval/vllm_qwen3_vl
 MODEL_CONFIG="${MODEL_CONFIG:-${ROOT_DIR}/configs/model/qwen3_vl_8b_full.yaml}"
 ATTENTION_CONFIG="${ATTENTION_CONFIG:-${ROOT_DIR}/configs/model/attention_fa3_only.yaml}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
-RL_DEEPSPEED_CONFIG="${RL_DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero2_rl.json}"
+RL_DEEPSPEED_CONFIG="${RL_DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
 
 NNODES="${NNODES:-1}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
@@ -388,11 +476,17 @@ RL_GRADIENT_ACCUMULATION_STEPS="${RL_GRADIENT_ACCUMULATION_STEPS:-${RL_OPTIMAL_G
 
 NUM_SFT_EPOCHS="${NUM_SFT_EPOCHS:-3}"
 PREPARE_SFT_OVERWRITE_EXISTING="${PREPARE_SFT_OVERWRITE_EXISTING:-0}"
-SFT_PREPARED_FILE="${SFT_PREPARED_FILE:-${DATA_DIR}/sft_train.compact_trace_v2.jsonl}"
+SFT_PREPARED_FILE="${SFT_PREPARED_FILE:-${DATA_DIR}/sft_train.compact_trace_v5.jsonl}"
 SFT_PREPARED_META_FILE="${SFT_PREPARED_META_FILE:-${SFT_PREPARED_FILE}.meta.json}"
-TEACHER_PREPARED_FILE="${TEACHER_PREPARED_FILE:-${DATA_DIR}/sft_train.teacher_rollout_primary.compact_trace_v2.jsonl}"
+TEACHER_PREPARED_FILE="${TEACHER_PREPARED_FILE:-${DATA_DIR}/sft_train.teacher_rollout_primary.compact_trace_v5.jsonl}"
 TEACHER_PREPARED_META_FILE="${TEACHER_PREPARED_META_FILE:-${TEACHER_PREPARED_FILE}.meta.json}"
-TEACHER_JUDGE_MODEL_PATH="${TEACHER_JUDGE_MODEL_PATH:-}"
+USE_TEACHER_PREPARED="${USE_TEACHER_PREPARED:-1}"
+DEFAULT_TEACHER_JUDGE_MODEL_PATH="${DATA_ROOT}/Wmh/MLLMs/Qwen3-VL-32B-Instruct"
+if [[ "${USE_TEACHER_PREPARED}" == "1" ]]; then
+  TEACHER_JUDGE_MODEL_PATH="${TEACHER_JUDGE_MODEL_PATH:-${DEFAULT_TEACHER_JUDGE_MODEL_PATH}}"
+else
+  TEACHER_JUDGE_MODEL_PATH="${TEACHER_JUDGE_MODEL_PATH:-}"
+fi
 TEACHER_JUDGE_INPUT_MODE="${TEACHER_JUDGE_INPUT_MODE:-auto}"
 TEACHER_JUDGE_TORCH_DTYPE="${TEACHER_JUDGE_TORCH_DTYPE:-auto}"
 TEACHER_JUDGE_DEVICE_MAP="${TEACHER_JUDGE_DEVICE_MAP:-auto}"
@@ -402,14 +496,18 @@ TEACHER_JUDGE_MAX_IMAGES="${TEACHER_JUDGE_MAX_IMAGES:-8}"
 TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW="${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW:-4}"
 TEACHER_JUDGE_FRAME_CACHE_MAX_CACHED_VIDEOS="${TEACHER_JUDGE_FRAME_CACHE_MAX_CACHED_VIDEOS:-64}"
 TEACHER_JUDGE_BATCH_SIZE="${TEACHER_JUDGE_BATCH_SIZE:-1}"
+TEACHER_JUDGE_NUM_SHARDS="${TEACHER_JUDGE_NUM_SHARDS:-${NPROC_PER_NODE}}"
+TEACHER_JUDGE_MASTER_PORT="${TEACHER_JUDGE_MASTER_PORT:-29711}"
 TEACHER_JUDGE_OVERWRITE_EXISTING="${TEACHER_JUDGE_OVERWRITE_EXISTING:-0}"
 RUNTIME_TRAIN_FILE="${RUNTIME_TRAIN_FILE:-${DATA_DIR}/msad_saver_runtime_train.jsonl}"
 RUNTIME_EVAL_FILE="${RUNTIME_EVAL_FILE:-${DATA_DIR}/msad_saver_runtime_test.jsonl}"
 TRAIN_INCLUDE_SPLIT="${TRAIN_INCLUDE_SPLIT:-train}"
 EVAL_INCLUDE_SPLIT="${EVAL_INCLUDE_SPLIT:-test}"
-SFT_MATERIALIZED_FILE="${SFT_MATERIALIZED_FILE:-${DATA_DIR}/sft_train.compact_trace_v2.materialized_messages_v1.jsonl}"
-RUNTIME_TRAIN_ITEMS_FILE="${RUNTIME_TRAIN_ITEMS_FILE:-${DATA_DIR}/msad_saver_runtime_train.materialized_items_v1.jsonl}"
-RUNTIME_EVAL_ITEMS_FILE="${RUNTIME_EVAL_ITEMS_FILE:-${DATA_DIR}/msad_saver_runtime_test.materialized_items_v1.jsonl}"
+LEGACY_SFT_MATERIALIZED_FILE="${SFT_MATERIALIZED_FILE:-}"
+BASE_SFT_MATERIALIZED_FILE="${BASE_SFT_MATERIALIZED_FILE:-${LEGACY_SFT_MATERIALIZED_FILE:-${DATA_DIR}/sft_train.compact_trace_v5.materialized_messages_v5.jsonl}}"
+TEACHER_SFT_MATERIALIZED_FILE="${TEACHER_SFT_MATERIALIZED_FILE:-${DATA_DIR}/sft_train.compact_trace_v5.teacher_materialized_messages_v5.jsonl}"
+RUNTIME_TRAIN_ITEMS_FILE="${RUNTIME_TRAIN_ITEMS_FILE:-${DATA_DIR}/msad_saver_runtime_train.materialized_items_v5.jsonl}"
+RUNTIME_EVAL_ITEMS_FILE="${RUNTIME_EVAL_ITEMS_FILE:-${DATA_DIR}/msad_saver_runtime_test.materialized_items_v5.jsonl}"
 
 # Derived paths
 ARTIFACTS_DIR="${ROOT_DIR}/artifacts/${EXP_NAME}"
@@ -449,116 +547,16 @@ printf "  RL_DEEPSPEED_CONFIG= %s\n" "${RL_DEEPSPEED_CONFIG}"
 printf "  RL_PROPOSAL_DTYPE  = %s\n" "${RL_PROPOSAL_TORCH_DTYPE}"
 printf "  SFT_PREPARED_FILE      = %s\n" "${SFT_PREPARED_FILE}"
 printf "  TEACHER_PREPARED_FILE  = %s\n" "${TEACHER_PREPARED_FILE}"
+printf "  USE_TEACHER_PREPARED   = %s\n" "${USE_TEACHER_PREPARED}"
 printf "  TEACHER_JUDGE_MODEL    = %s\n" "${TEACHER_JUDGE_MODEL_PATH:-disabled}"
+printf "  TEACHER_JUDGE_SHARDS   = %s\n" "${TEACHER_JUDGE_NUM_SHARDS}"
 printf "  RUNTIME_TRAIN_FILE     = %s\n" "${RUNTIME_TRAIN_FILE}"
 printf "  RUNTIME_EVAL_FILE      = %s\n" "${RUNTIME_EVAL_FILE}"
-printf "  SFT_MATERIALIZED_FILE  = %s\n" "${SFT_MATERIALIZED_FILE}"
+printf "  BASE_SFT_MATERIALIZED  = %s\n" "${BASE_SFT_MATERIALIZED_FILE}"
+printf "  TEACHER_SFT_MATERIALIZED = %s\n" "${TEACHER_SFT_MATERIALIZED_FILE}"
 printf "  RUNTIME_TRAIN_ITEMS    = %s\n" "${RUNTIME_TRAIN_ITEMS_FILE}"
 printf "  RUNTIME_EVAL_ITEMS     = %s\n" "${RUNTIME_EVAL_ITEMS_FILE}"
 printf "  PROPOSAL_MODEL         = %s\n" "${PROPOSAL_MODEL_PATH}"
-
-# ---------------------------------------------------------------------------
-# Stage 1: Data preprocessing check
-# ---------------------------------------------------------------------------
-banner "${GREEN}" "Stage 1: Data Preprocessing Check"
-
-MISSING=0
-for f in "${PREPARE_SFT_CONFIG}" "${SFT_CONFIG}" "${RL_CONFIG}" "${ROLLOUT_CONFIG}" "${MODEL_CONFIG}" "${ATTENTION_CONFIG}" "${DEEPSPEED_CONFIG}" "${RL_DEEPSPEED_CONFIG}" "${RUNTIME_TRAIN_FILE}" "${RUNTIME_EVAL_FILE}"; do
-  if [[ ! -f "${f}" ]]; then
-    err "Missing required file: ${f}"
-    MISSING=1
-  fi
-done
-if [[ -z "${PROPOSAL_MODEL_PATH}" || ! -e "${PROPOSAL_MODEL_PATH}" ]]; then
-  err "Missing required proposal model path: ${PROPOSAL_MODEL_PATH:-'(empty)'}"
-  MISSING=1
-fi
-if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" && ! -e "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
-  err "Missing teacher judge model path: ${TEACHER_JUDGE_MODEL_PATH}"
-  MISSING=1
-fi
-if (( MISSING )); then
-  err "One or more required data/model paths are missing. Aborting."
-  exit 1
-fi
-
-TRAIN_LINES="$(wc -l < "${RUNTIME_TRAIN_FILE}")"
-EVAL_LINES="$(wc -l < "${RUNTIME_EVAL_FILE}")"
-ok "RL train data     : ${RUNTIME_TRAIN_FILE} (${TRAIN_LINES} lines)"
-ok "Evaluation data   : ${RUNTIME_EVAL_FILE} (${EVAL_LINES} lines)"
-
-python3 - "${RUNTIME_TRAIN_FILE}" "${RUNTIME_EVAL_FILE}" "${DATA_ROOT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-runtime_train_path = Path(sys.argv[1]).resolve()
-runtime_eval_path = Path(sys.argv[2]).resolve()
-data_root = Path(sys.argv[3]).resolve()
-
-
-def iter_jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            text = line.strip()
-            if not text:
-                continue
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise ValueError(f"{path}:{line_no}: expected dict JSONL row")
-            yield line_no, payload
-
-
-def candidate_roots(base: Path, data_path: Path):
-    return [
-        base,
-        base / "data",
-        base / "datasets",
-        base / "Wmh" / "datasets",
-        base / "Wmh" / "datasets" / "MSDA",
-        data_path.parent,
-    ]
-
-
-def resolve_video_path(raw_video_path: str, *, data_path: Path) -> Path:
-    raw_path = Path(str(raw_video_path))
-    if raw_path.is_absolute() and raw_path.exists():
-        return raw_path
-    variants = [raw_path]
-    if raw_path.parts and raw_path.parts[0] in {"data", "datasets"} and len(raw_path.parts) > 1:
-        variants.append(Path(*raw_path.parts[1:]))
-    for relative_path in variants:
-        for root in candidate_roots(data_root, data_path):
-            candidate = root / relative_path
-            if candidate.exists():
-                return candidate
-    return candidate_roots(data_root, data_path)[0] / variants[0]
-
-
-def validate_runtime(path: Path) -> None:
-    missing = []
-    for line_no, row in iter_jsonl(path):
-        video_path = resolve_video_path(str(row.get("video_path") or ""), data_path=path)
-        if not video_path.exists():
-            missing.append(f"missing video: {path.name}:{line_no}:{video_path}")
-            continue
-        frame_cache = Path(str(video_path) + ".frame_cache")
-        feature_cache = Path(str(video_path) + ".feature_cache")
-        if not frame_cache.exists():
-            missing.append(f"missing frame_cache: {path.name}:{line_no}:{frame_cache}")
-        if not feature_cache.exists():
-            missing.append(f"missing feature_cache: {path.name}:{line_no}:{feature_cache}")
-        if len(missing) >= 8:
-            break
-    if missing:
-        raise SystemExit("Preprocessing cache validation failed:\n" + "\n".join(missing))
-
-
-
-validate_runtime(runtime_train_path)
-validate_runtime(runtime_eval_path)
-print("[OK] preprocessing cache validation passed for runtime train/eval manifests")
-PY
 
 validate_prepared_metadata() {
   local prepared_file="${1}"
@@ -608,6 +606,112 @@ ensure_prepared_sft_metadata(
 PY
 }
 
+validate_runtime_manifest_caches() {
+  local progress_every="${1:-25}"
+  python3 - "${RUNTIME_TRAIN_FILE}" "${RUNTIME_EVAL_FILE}" "${DATA_ROOT}" "${TRAIN_LINES}" "${EVAL_LINES}" "${progress_every}" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+runtime_train_path = Path(sys.argv[1]).resolve()
+runtime_eval_path = Path(sys.argv[2]).resolve()
+data_root = Path(sys.argv[3]).resolve()
+train_total = max(0, int(sys.argv[4]))
+eval_total = max(0, int(sys.argv[5]))
+progress_every = max(1, int(sys.argv[6]))
+
+
+def iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path}:{line_no}: expected dict JSONL row")
+            yield line_no, payload
+
+
+def candidate_roots(base: Path, data_path: Path):
+    return [
+        base,
+        base / "data",
+        base / "datasets",
+        base / "Wmh" / "datasets",
+        base / "Wmh" / "datasets" / "MSDA",
+        data_path.parent,
+    ]
+
+
+def resolve_video_path(raw_video_path: str, *, data_path: Path) -> Path:
+    raw_path = Path(str(raw_video_path))
+    if raw_path.is_absolute() and raw_path.exists():
+        return raw_path
+    variants = [raw_path]
+    if raw_path.parts and raw_path.parts[0] in {"data", "datasets"} and len(raw_path.parts) > 1:
+        variants.append(Path(*raw_path.parts[1:]))
+    for relative_path in variants:
+        for root in candidate_roots(data_root, data_path):
+            candidate = root / relative_path
+            if candidate.exists():
+                return candidate
+    return candidate_roots(data_root, data_path)[0] / variants[0]
+
+
+def emit_progress(path: Path, *, current: int, total: int, elapsed_sec: float) -> None:
+    total_text = str(total) if total > 0 else "?"
+    print(
+        f"[INFO] runtime cache check {path.name}: {current}/{total_text} rows "
+        f"(elapsed={elapsed_sec:.1f}s)",
+        flush=True,
+    )
+
+
+def validate_runtime(path: Path, *, total_rows: int) -> None:
+    missing = []
+    started_at = time.time()
+    last_current = 0
+    emit_progress(path, current=0, total=total_rows, elapsed_sec=0.0)
+    for current, (line_no, row) in enumerate(iter_jsonl(path), start=1):
+        last_current = current
+        video_path = resolve_video_path(str(row.get("video_path") or ""), data_path=path)
+        if not video_path.exists():
+            missing.append(f"missing video: {path.name}:{line_no}:{video_path}")
+            continue
+        frame_cache = Path(str(video_path) + ".frame_cache")
+        feature_cache = Path(str(video_path) + ".feature_cache")
+        if not frame_cache.exists():
+            missing.append(f"missing frame_cache: {path.name}:{line_no}:{frame_cache}")
+        if not feature_cache.exists():
+            missing.append(f"missing feature_cache: {path.name}:{line_no}:{feature_cache}")
+        if current == total_rows or current % progress_every == 0:
+            emit_progress(path, current=current, total=total_rows, elapsed_sec=time.time() - started_at)
+        if len(missing) >= 8:
+            break
+    if missing:
+        raise SystemExit("Preprocessing cache validation failed:\n" + "\n".join(missing))
+    if last_current != total_rows:
+        emit_progress(path, current=total_rows, total=total_rows, elapsed_sec=time.time() - started_at)
+
+
+validate_runtime(runtime_train_path, total_rows=train_total)
+validate_runtime(runtime_eval_path, total_rows=eval_total)
+print("[OK] preprocessing cache validation passed for runtime train/eval manifests", flush=True)
+PY
+}
+
+runtime_cache_prereqs_ready_for_reuse() {
+  validate_prepared_metadata "${SFT_PREPARED_FILE}" "base SFT prepared" "base" >/dev/null 2>&1 || return 1
+  if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
+    validate_prepared_metadata "${TEACHER_PREPARED_FILE}" "teacher SFT prepared" "teacher" >/dev/null 2>&1 || return 1
+  fi
+  validate_materialized_cache "${RUNTIME_TRAIN_ITEMS_FILE}" "materialized_runtime_items_v5" "${RUNTIME_TRAIN_FILE}" "${TRAIN_INCLUDE_SPLIT}" "${RL_CONFIG}" >/dev/null 2>&1 || return 1
+  validate_materialized_cache "${RUNTIME_EVAL_ITEMS_FILE}" "materialized_runtime_items_v5" "${RUNTIME_EVAL_FILE}" "${EVAL_INCLUDE_SPLIT}" "${ROLLOUT_CONFIG}" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 prepare_base_sft_manifest() {
   python3 -m saver_v3.cli.prepare_sft_manifest \
     --config "${PREPARE_SFT_CONFIG}" \
@@ -623,12 +727,50 @@ validate_prepared_metadata_or_die() {
   local label="${2}"
   local mode="${3}"
   if validate_prepared_metadata "${prepared_file}" "${label}" "${mode}"; then
-    ok "${label} metadata matches SFT preview/prompt/rollout_trace config: ${prepared_file}"
+    ok "${label} metadata matches SFT initial_observation/prompt/rollout_trace config: ${prepared_file}"
   else
     err "${label} metadata does not match current SFT config: ${prepared_file}. Regenerate it before continuing."
     exit 1
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Stage 1: Data preprocessing check
+# ---------------------------------------------------------------------------
+banner "${GREEN}" "Stage 1: Data Preprocessing Check"
+
+MISSING=0
+for f in "${PREPARE_SFT_CONFIG}" "${SFT_CONFIG}" "${RL_CONFIG}" "${ROLLOUT_CONFIG}" "${MODEL_CONFIG}" "${ATTENTION_CONFIG}" "${DEEPSPEED_CONFIG}" "${RL_DEEPSPEED_CONFIG}" "${RUNTIME_TRAIN_FILE}" "${RUNTIME_EVAL_FILE}"; do
+  if [[ ! -f "${f}" ]]; then
+    err "Missing required file: ${f}"
+    MISSING=1
+  fi
+done
+if [[ -z "${PROPOSAL_MODEL_PATH}" || ! -e "${PROPOSAL_MODEL_PATH}" ]]; then
+  err "Missing required proposal model path: ${PROPOSAL_MODEL_PATH:-'(empty)'}"
+  MISSING=1
+fi
+if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" && ! -e "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
+  err "Missing teacher judge model path: ${TEACHER_JUDGE_MODEL_PATH}"
+  MISSING=1
+fi
+if (( MISSING )); then
+  err "One or more required data/model paths are missing. Aborting."
+  exit 1
+fi
+
+TRAIN_LINES="$(wc -l < "${RUNTIME_TRAIN_FILE}")"
+EVAL_LINES="$(wc -l < "${RUNTIME_EVAL_FILE}")"
+ok "RL train data     : ${RUNTIME_TRAIN_FILE} (${TRAIN_LINES} lines)"
+ok "Evaluation data   : ${RUNTIME_EVAL_FILE} (${EVAL_LINES} lines)"
+info "Checking prepared/runtime-item metadata for fast reuse..."
+
+if runtime_cache_prereqs_ready_for_reuse; then
+  skip "Skipping slow runtime video/frame/feature cache scan because prepared plus runtime-item artifacts already match the current config."
+else
+  info "Running runtime video/frame/feature cache scan because a prepared file or runtime-item cache is missing or stale."
+  validate_runtime_manifest_caches 25
+fi
 
 banner "${GREEN}" "Stage 1b: Base Prepared SFT Resolve"
 BASE_PREPARE_REBUILD_REASON=""
@@ -651,6 +793,7 @@ validate_prepared_metadata_or_die "${SFT_PREPARED_FILE}" "base SFT prepared" "ba
 
 EFFECTIVE_SFT_PREPARED_FILE="${SFT_PREPARED_FILE}"
 EFFECTIVE_SFT_PREPARED_META_FILE="${SFT_PREPARED_META_FILE}"
+EFFECTIVE_SFT_MATERIALIZED_FILE="${BASE_SFT_MATERIALIZED_FILE}"
 
 if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
   banner "${GREEN}" "Stage 1b: Teacher-Judge Prepared SFT Resolve"
@@ -667,8 +810,22 @@ if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
 
   if [[ -n "${TEACHER_REBUILD_REASON}" ]]; then
     info "Regenerating teacher prepared SFT: ${TEACHER_REBUILD_REASON}"
-    teacher_cmd=(
-      python "${ROOT_DIR}/annotate_teacher_judge_sft.py"
+    teacher_cmd=()
+    if (( TEACHER_JUDGE_NUM_SHARDS > 1 )); then
+      teacher_cmd+=(
+        torchrun
+        --standalone
+        --nproc_per_node "${TEACHER_JUDGE_NUM_SHARDS}"
+        --master_port "${TEACHER_JUDGE_MASTER_PORT}"
+        "${ROOT_DIR}/annotate_teacher_judge_sft.py"
+        --num-shards "${TEACHER_JUDGE_NUM_SHARDS}"
+      )
+    else
+      teacher_cmd+=(
+        python "${ROOT_DIR}/annotate_teacher_judge_sft.py"
+      )
+    fi
+    teacher_cmd+=(
       --input "${SFT_PREPARED_FILE}"
       --output "${TEACHER_PREPARED_FILE}"
       --model-path "${TEACHER_JUDGE_MODEL_PATH}"
@@ -700,11 +857,13 @@ if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
   fi
   EFFECTIVE_SFT_PREPARED_FILE="${TEACHER_PREPARED_FILE}"
   EFFECTIVE_SFT_PREPARED_META_FILE="${TEACHER_PREPARED_META_FILE}"
+  EFFECTIVE_SFT_MATERIALIZED_FILE="${TEACHER_SFT_MATERIALIZED_FILE}"
 fi
 
 EFFECTIVE_SFT_LINES="$(wc -l < "${EFFECTIVE_SFT_PREPARED_FILE}")"
 ok "Effective SFT data : ${EFFECTIVE_SFT_PREPARED_FILE} (${EFFECTIVE_SFT_LINES} lines)"
 ok "Effective SFT meta : ${EFFECTIVE_SFT_PREPARED_META_FILE}"
+ok "Effective SFT materialized cache target : ${EFFECTIVE_SFT_MATERIALIZED_FILE}"
 
 # ---------------------------------------------------------------------------
 # Helper: print eval metrics from a metrics.json file (if it exists)
@@ -768,14 +927,18 @@ resolve_eval_summary_file() {
 # ---------------------------------------------------------------------------
 banner "${GREEN}" "Stage 1c: Materialized Cache Resolve"
 
-resolve_materialized_cache   "SFT materialized messages"   "sft"   "${EFFECTIVE_SFT_PREPARED_FILE}"   "${SFT_MATERIALIZED_FILE}"   "materialized_sft_messages_v1"   "${TRAIN_INCLUDE_SPLIT}"   --config "${SFT_CONFIG}"   --model-config "${MODEL_CONFIG}"   --proposal-model-path "${PROPOSAL_MODEL_PATH}"   --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"   --proposal-device "${PROPOSAL_DEVICE}"
+if [[ -n "${TEACHER_JUDGE_MODEL_PATH}" ]]; then
+  maybe_migrate_teacher_materialized_cache
+fi
 
-resolve_materialized_cache   "Runtime train materialized items"   "runtime"   "${RUNTIME_TRAIN_FILE}"   "${RUNTIME_TRAIN_ITEMS_FILE}"   "materialized_runtime_items_v1"   "${TRAIN_INCLUDE_SPLIT}"   --config "${SFT_CONFIG}"   --data-root "${DATA_ROOT}"
+resolve_materialized_cache   "SFT materialized messages"   "sft"   "${EFFECTIVE_SFT_PREPARED_FILE}"   "${EFFECTIVE_SFT_MATERIALIZED_FILE}"   "materialized_sft_messages_v5"   "${TRAIN_INCLUDE_SPLIT}"   "${SFT_CONFIG}"   --config "${SFT_CONFIG}"   --model-config "${MODEL_CONFIG}"   --proposal-model-path "${PROPOSAL_MODEL_PATH}"   --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"   --proposal-device "${PROPOSAL_DEVICE}"
 
-resolve_materialized_cache   "Runtime eval materialized items"   "runtime"   "${RUNTIME_EVAL_FILE}"   "${RUNTIME_EVAL_ITEMS_FILE}"   "materialized_runtime_items_v1"   "${EVAL_INCLUDE_SPLIT}"   --config "${SFT_CONFIG}"   --data-root "${DATA_ROOT}"
+resolve_materialized_cache   "Runtime train materialized items"   "runtime"   "${RUNTIME_TRAIN_FILE}"   "${RUNTIME_TRAIN_ITEMS_FILE}"   "materialized_runtime_items_v5"   "${TRAIN_INCLUDE_SPLIT}"   "${RL_CONFIG}"   --config "${RL_CONFIG}"   --data-root "${DATA_ROOT}"
+
+resolve_materialized_cache   "Runtime eval materialized items"   "runtime"   "${RUNTIME_EVAL_FILE}"   "${RUNTIME_EVAL_ITEMS_FILE}"   "materialized_runtime_items_v5"   "${EVAL_INCLUDE_SPLIT}"   "${ROLLOUT_CONFIG}"   --config "${ROLLOUT_CONFIG}"   --data-root "${DATA_ROOT}"
 
 # ---------------------------------------------------------------------------
-# Stage 2: SFT Training — 5 epochs with per-epoch evaluation
+# Stage 2: SFT Training — per-epoch evaluation
 # ---------------------------------------------------------------------------
 banner "${GREEN}" "Stage 2: SFT Training (${NUM_SFT_EPOCHS} epochs)"
 
@@ -805,7 +968,7 @@ for (( epoch=1; epoch<=NUM_SFT_EPOCHS; epoch++ )); do
       --deepspeed-config "${DEEPSPEED_CONFIG}"
       --override "data.prepared_data_path=${EFFECTIVE_SFT_PREPARED_FILE}"
       --override "data.include_splits=${TRAIN_INCLUDE_SPLIT}"
-      --override "data.materialized_messages_path=${SFT_MATERIALIZED_FILE}"
+      --override "data.materialized_messages_path=${EFFECTIVE_SFT_MATERIALIZED_FILE}"
       --override "data.require_materialized_cache=true"
       --override "proposal.model_path=${PROPOSAL_MODEL_PATH}"
       --override "proposal.torch_dtype=${PROPOSAL_TORCH_DTYPE}"
@@ -889,7 +1052,17 @@ if is_complete_rl_output "${RL_DIR}"; then
   RL_CKPT="$(resolve_rl_latest_checkpoint_path "${RL_DIR}")"
   skip "RL output already complete at ${RL_DIR}; latest checkpoint=${RL_CKPT} — skipping RL training."
 else
-  if [[ -d "${RL_DIR}" && -n "$(ls -A "${RL_DIR}" 2>/dev/null)" ]]; then
+  RL_RESUME_CKPT=""
+  RL_RESUME_ITERATION=""
+  if [[ -d "${RL_DIR}" ]]; then
+    RL_RESUME_CKPT="$(resolve_rl_resume_checkpoint_path "${RL_DIR}" 2>/dev/null || true)"
+    RL_RESUME_ITERATION="$(resolve_rl_resume_iteration "${RL_DIR}" 2>/dev/null || true)"
+  fi
+  RL_EXTRA_OVERRIDES=()
+  if [[ -n "${RL_RESUME_CKPT}" ]]; then
+    info "Resuming RL training from checkpoint ${RL_RESUME_CKPT} (next iteration=${RL_RESUME_ITERATION:-unknown})."
+    RL_EXTRA_OVERRIDES+=(--override "resume_from_checkpoint=${RL_RESUME_CKPT}")
+  elif [[ -d "${RL_DIR}" && -n "$(ls -A "${RL_DIR}" 2>/dev/null)" ]]; then
     info "Removing stale/incomplete RL output at ${RL_DIR} before retraining."
     rm -rf "${RL_DIR}"
     mkdir -p "${RL_DIR}"
@@ -926,7 +1099,9 @@ else
     --override "distributed.nproc_per_node=${NPROC_PER_NODE}" \
     --override "policy_init_from=${LAST_SFT_CKPT}" \
     --override "output_dir=${RL_DIR}" \
-    --override "logging.log_dir=${LOG_DIR}"
+    --override "logging.rollout_eval_output_dir=${EVAL_DIR}" \
+    --override "logging.log_dir=${LOG_DIR}" \
+    "${RL_EXTRA_OVERRIDES[@]}"
 
   ok "RL training complete → ${RL_DIR}"
   require_valid_rl_output "${RL_DIR}" "RL output after training"

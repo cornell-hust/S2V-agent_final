@@ -1,0 +1,7 @@
+{"time":"2026-04-13T17:25:07.728173971+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmpg7hn084z/port-138658.txt","pid":138658,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
+{"time":"2026-04-13T17:25:07.728707652+08:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":138658}
+{"time":"2026-04-13T17:25:07.728688559+08:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/wandb-138658-139744-519423070/socket","Net":"unix"}}
+{"time":"2026-04-13T17:25:07.793323001+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
+{"time":"2026-04-13T17:25:07.797679125+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"0wowymp0","id":"1(@)"}
+{"time":"2026-04-13T17:25:08.631561877+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"0wowymp0","id":"1(@)"}
+{"time":"2026-04-13T17:57:28.198737676+08:00","level":"INFO","msg":"server: parent process exited, terminating service process"}

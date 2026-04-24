@@ -1,45 +1,5 @@
-# Python
-__pycache__/
-*.py[cod]
-*.so
-
-# Environments
-.venv/
-.env
-.env.*
-conda-meta/
-
-# Tool caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-
-# Editors
-.idea/
-.vscode/
-
-# Training and inference artifacts
-artifacts/
-*.bin
-*.pth
-*.safetensors
-*.pt
-checkpoints/
-logs/
-runs/
-wandb/
-data_utils/*.jsonl
-data_utils/*.json
-
-# Data and cache mounts
-.cache/
-hf_home/
-
-# OS files
-.DS_Store
-tests/
-wandb/
-/AGENTS.md
-/.omx
-tmp/
-tmp_sync_placeholder/
+/__pycache__
+/.pytest_cache
+/artifacts
+/tests
+/data_utils/*jsonl

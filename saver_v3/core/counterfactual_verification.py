@@ -16,7 +16,7 @@ from saver_v3.core.environment import (
     parse_actions_and_contents,
 )
 from saver_v3.core.proposal import compose_scene_anchored_query, normalize_description_query_phrases
-from saver_v3.core.protocol_guidance import summarize_evidence_ledger
+from saver_v3.core.protocol_guidance import normalize_stage_selected_moment_ids, summarize_evidence_ledger
 from saver_v3.core.semantic_answer import (
     build_replay_decision_scaffold,
     build_semantic_answer_payload,
@@ -31,7 +31,9 @@ from saver_v3.core.semantic_answer import (
 STAGE_ORDER = ("precursor", "trigger", "confirmation")
 ROLE_TO_STAGE = {
     "precursor": "precursor",
+    "evidence": "precursor",
     "trigger": "trigger",
+    "peak": "trigger",
     "peak_action": "trigger",
     "confirmation": "confirmation",
     "aftermath": "confirmation",
@@ -349,7 +351,7 @@ def derive_counterfactual_stage_requirements(
         has_confirmation = True
     else:
         for moment in list(evidence_moments or []):
-            stage = ROLE_TO_STAGE.get(str(moment.get("role") or "").strip().lower())
+            stage = _role_stage(moment.get("role"))
             if stage == "confirmation":
                 has_confirmation = True
                 break
@@ -415,7 +417,7 @@ def _reference_stage_moments(reference_record: Dict[str, Any]) -> Dict[str, List
             if moment is not None:
                 grouped[stage].append(moment)
     for moment in evidence_moments:
-        stage = ROLE_TO_STAGE.get(str(moment.get("role") or "").strip().lower(), "")
+        stage = _role_stage(moment.get("role"))
         if stage and all(str(existing.get("moment_id") or "") != str(moment.get("moment_id") or "") for existing in grouped[stage]):
             grouped[stage].append(dict(moment))
     return grouped
@@ -507,7 +509,11 @@ def _build_normal_skip_profile(
     selection_resolution = _resolve_selected_window_ids_for_normal_skip(rollout)
     selected_window_ids = list(selection_resolution.get("selected_window_ids") or [])
     selected_records = _selected_window_records(rollout, selected_window_ids)
-    selected_by_stage = _stage_window_ids(selected_records)
+    stage_by_moment_id = _stage_lookup_from_target(
+        ((item.get("multimodal_cache") or {}).get("structured_target") or item.get("structured_target")),
+        reference_record=item.get("record") or item,
+    )
+    selected_by_stage = _stage_window_ids(selected_records, stage_by_moment_id=stage_by_moment_id)
     profile_source = "normal_skip_v1"
     return {
         "counterfactual_branches": {},
@@ -606,14 +612,59 @@ def _selected_window_records(rollout: Dict[str, Any], window_ids: Sequence[str])
     return [copy.deepcopy(lookup[window_id]) for window_id in _dedupe_window_ids(window_ids) if window_id in lookup]
 
 
-def _stage_for_entry(entry: Dict[str, Any]) -> str:
-    return ROLE_TO_STAGE.get(str(entry.get("role") or "").strip().lower(), "")
+def _role_stage(role: Any) -> str:
+    return ROLE_TO_STAGE.get(str(role or "").strip().lower(), "")
 
 
-def _stage_window_ids(records: Sequence[Dict[str, Any]]) -> Dict[str, List[str]]:
+def _stage_lookup_from_target(
+    target: Dict[str, Any] | None,
+    *,
+    reference_record: Dict[str, Any] | None = None,
+) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    normalized_target = dict(target or {})
+    chain_target = dict(normalized_target.get("event_chain_target") or {})
+    stage_to_moment_ids = normalize_stage_selected_moment_ids(
+        chain_target.get("stage_to_moment_ids") or normalized_target.get("stage_selected_moment_ids")
+    )
+    for stage, moment_ids in stage_to_moment_ids.items():
+        for moment_id in moment_ids:
+            text = str(moment_id).strip()
+            if text:
+                lookup[text] = stage
+    if not isinstance(reference_record, dict):
+        return lookup
+    evidence_moments = list(((reference_record.get("evidence") or {}).get("evidence_moments") or []))
+    for moment in evidence_moments:
+        moment_id = str(moment.get("moment_id") or "").strip()
+        stage = _role_stage(moment.get("role"))
+        if moment_id and stage and moment_id not in lookup:
+            lookup[moment_id] = stage
+    return lookup
+
+
+def _stage_for_entry(
+    entry: Dict[str, Any],
+    *,
+    stage_by_moment_id: Dict[str, str] | None = None,
+) -> str:
+    stage = _role_stage(entry.get("role"))
+    if stage:
+        return stage
+    moment_id = str(entry.get("moment_id") or "").strip()
+    if moment_id:
+        return str((stage_by_moment_id or {}).get(moment_id) or "")
+    return ""
+
+
+def _stage_window_ids(
+    records: Sequence[Dict[str, Any]],
+    *,
+    stage_by_moment_id: Dict[str, str] | None = None,
+) -> Dict[str, List[str]]:
     grouped = {stage: [] for stage in STAGE_ORDER}
     for entry in list(records or []):
-        stage = _stage_for_entry(entry)
+        stage = _stage_for_entry(entry, stage_by_moment_id=stage_by_moment_id)
         if not stage:
             continue
         window_id = str(entry.get("window_id") or "").strip()
@@ -648,7 +699,7 @@ def _build_stage_query_map(
     scene_context = _derive_scene_context(item, reference_record)
     stage_queries: Dict[str, str] = {}
     for moment in list(((reference_record.get("evidence") or {}).get("evidence_moments") or [])):
-        stage = ROLE_TO_STAGE.get(str(moment.get("role") or "").strip().lower())
+        stage = _role_stage(moment.get("role"))
         description = str(moment.get("description") or "").strip()
         if not stage or not description or stage in stage_queries:
             continue
@@ -670,11 +721,12 @@ def _choose_minimal_subset_window_ids(
     selected_records: Sequence[Dict[str, Any]],
     *,
     stage_requirements: Dict[str, List[str]],
+    stage_by_moment_id: Dict[str, str] | None = None,
 ) -> List[str]:
     selected_records = list(selected_records or [])
     if not selected_records:
         return []
-    by_stage = _stage_window_ids(selected_records)
+    by_stage = _stage_window_ids(selected_records, stage_by_moment_id=stage_by_moment_id)
     wanted_stages = []
     for key in ("decision_required_stages", "finalize_required_stages"):
         for stage in list(stage_requirements.get(key) or []):
@@ -694,8 +746,11 @@ def _branch_stage_drop_window_ids(
     selected_records: Sequence[Dict[str, Any]],
     *,
     stage: str,
+    stage_by_moment_id: Dict[str, str] | None = None,
 ) -> Tuple[List[str], bool]:
-    stage_window_ids = set(_stage_window_ids(selected_records).get(stage) or [])
+    stage_window_ids = set(
+        _stage_window_ids(selected_records, stage_by_moment_id=stage_by_moment_id).get(stage) or []
+    )
     if not stage_window_ids:
         return [], False
     kept = [window_id for window_id in _dedupe_window_ids(selected_window_ids) if window_id not in stage_window_ids]
@@ -712,11 +767,12 @@ def _build_hard_negative_swap_window_ids(
     selected_window_ids: Sequence[str],
     selected_records: Sequence[Dict[str, Any]],
     stage_queries: Dict[str, str] | None = None,
+    stage_by_moment_id: Dict[str, str] | None = None,
 ) -> Tuple[List[str], bool, str]:
     selected_window_ids = _dedupe_window_ids(selected_window_ids)
     if not selected_window_ids:
         return [], False, "no_selected_windows"
-    stage_groups = _stage_window_ids(selected_records)
+    stage_groups = _stage_window_ids(selected_records, stage_by_moment_id=stage_by_moment_id)
     key_stage = ""
     for stage in ("trigger", "confirmation", "precursor"):
         if stage_groups.get(stage):
@@ -894,7 +950,12 @@ def _branch_finalize_readiness(
     target: Dict[str, Any],
 ) -> Dict[str, Any]:
     records = _selected_window_records(rollout, branch_window_ids)
-    supported_stages = [stage for stage, values in _stage_window_ids(records).items() if values]
+    stage_by_moment_id = _stage_lookup_from_target(target)
+    supported_stages = [
+        stage
+        for stage, values in _stage_window_ids(records, stage_by_moment_id=stage_by_moment_id).items()
+        if values
+    ]
     finalize_required = list(stage_requirements.get("finalize_required_stages") or [])
     missing_required_stages = [stage for stage in finalize_required if stage not in supported_stages]
     coverage_ratio = (
@@ -1459,8 +1520,6 @@ def _salvage_compact_decision_fields(payload_text: str) -> Optional[Dict[str, An
         "severity",
         "hard_normal",
         "anomaly_interval_sec",
-        "precursor_interval_sec",
-        "earliest_actionable_sec",
         "evidence_moment_ids",
     ):
         snippet = _extract_json_value_snippet(payload_text, key=key)
@@ -1970,13 +2029,14 @@ def run_counterfactual_verification_batch(
         normalized_branch_profile = _normalize_counterfactual_branch_profile(branch_profile)
         compact_decision_only = False
         stage_queries = _build_stage_query_map(item=item, reference_record=reference_record)
+        stage_by_moment_id = _stage_lookup_from_target(target, reference_record=reference_record)
 
         selection_resolution = resolve_selected_window_ids_for_fecv(rollout)
         selected_window_ids = list(selection_resolution.get("selected_window_ids") or [])
         selection_resolution_source = str(selection_resolution.get("selection_resolution_source") or "")
         recovered_from_trace = bool(selection_resolution.get("recovered_from_trace", False))
         selected_records = _selected_window_records(rollout, selected_window_ids)
-        selected_by_stage = _stage_window_ids(selected_records)
+        selected_by_stage = _stage_window_ids(selected_records, stage_by_moment_id=stage_by_moment_id)
         if not selected_window_ids:
             logger.info(
                 "fecv selected-window debug: video_id=%s generation_id=%s branch_profile=%s "
@@ -2010,22 +2070,26 @@ def run_counterfactual_verification_batch(
             selected_window_ids,
             selected_records,
             stage="precursor",
+            stage_by_moment_id=stage_by_moment_id,
         )
         drop_trigger_ids, drop_trigger_available = _branch_stage_drop_window_ids(
             selected_window_ids,
             selected_records,
             stage="trigger",
+            stage_by_moment_id=stage_by_moment_id,
         )
         drop_confirmation_ids, drop_confirmation_available = _branch_stage_drop_window_ids(
             selected_window_ids,
             selected_records,
             stage="confirmation",
+            stage_by_moment_id=stage_by_moment_id,
         )
         hard_negative_ids, hard_negative_available, hard_negative_reason = _build_hard_negative_swap_window_ids(
             rollout,
             selected_window_ids=selected_window_ids,
             selected_records=selected_records,
             stage_queries=stage_queries,
+            stage_by_moment_id=stage_by_moment_id,
         )
         entries.append(
             {

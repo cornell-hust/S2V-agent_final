@@ -1,0 +1,8 @@
+{
+  "input_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",
+  "materialized_format": "materialized_sft_messages_v5",
+  "metadata_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.materialized_messages_v5.jsonl.meta.json",
+  "mode": "sft",
+  "num_records": 480,
+  "output_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.materialized_messages_v5.jsonl"
+}

@@ -1,0 +1,51 @@
+{
+  "schema_version": 8,
+  "prepared_format": "compact_trace_v5",
+  "protocol_signature": {
+    "signature_schema_version": 1,
+    "protocol_version": "seek_v5",
+    "initial_observation_mode": "explicit_first_scan",
+    "main_rollout_terminal_mode": "finalize_case_only",
+    "verifier_contract": "next_tool_only",
+    "teacher_role": "none",
+    "max_turns": 10,
+    "policy_max_new_tokens": 1024,
+    "generator_revision": "2026-04-23-active-contract-v5",
+    "generator_fingerprint": "68369fa86849effdf8e64bc89a4497ecc9476738ef90acfec2a0b161cfd7bfd3"
+  },
+  "initial_observation": {
+    "mode": "explicit_first_scan",
+    "scan_num_frames": 8,
+    "scan_purpose": "global_overview",
+    "protect_from_visual_budget": true,
+    "error_on_seq_prune": true
+  },
+  "prompt": {
+    "initial_user_template": "Case ID: {public_case_id}\nScene: {scene}\nDuration (sec): {duration}\nTask: {task_prompt}\nSuccess Criteria:\n{criteria_text}",
+    "tool_response_template": "Selected frames: {timestamps}.\nChoose exactly one next step.\nUsually call seek_evidence for another stage or verify_hypothesis to judge sufficiency.\nCall finalize_case only when the gathered evidence is already sufficient.\nWhen finalizing, prioritize a compact finalize_case that closes cleanly.\nIf optional summary, rationale, event_chain_summary, or qa_focus_answers would make the tool call too long, omit them.\nDo not answer before finalize_case returns.",
+    "explicit_first_scan_instruction": "Before any targeted search or verification, call scan_timeline once over the initial scan window with purpose=\"global_overview\" to build the canonical first observation. Use that overview to decide the next step."
+  },
+  "rollout_trace": {
+    "record_observation_content": false,
+    "record_state_deltas": true,
+    "record_counterfactual_trace": true,
+    "record_message_history": true
+  },
+  "input_data_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
+  "num_records": 480,
+  "include_splits": [
+    "train"
+  ],
+  "source_runtime": {
+    "path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
+    "resolved_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
+    "include_splits": [
+      "train"
+    ],
+    "file_size": 5940152,
+    "mtime_ns": 1776939914818888422,
+    "num_records": 480,
+    "sha256": "9fda38eac189d6694a00a7815ef7315da843d276045da7dd92158336b15e9137",
+    "validation_mode": "hybrid"
+  }
+}
