@@ -37,16 +37,16 @@ initial_observation:
   error_on_seq_prune: true
 
 optimization:
-  num_iterations: 120
-  learning_rate: 5.0e-7
+  num_iterations: 80
+  learning_rate: 4.0e-7
   per_device_batch_size: 1
   min_weight: 0.01
   advantage_clip: 3.0
   ppo_clip_epsilon: 0.2
   kl_beta: 0.0
-  rollout_count: 12
+  rollout_count: 8
   num_generations: 4
-  rollout_max_turns: 10
+  rollout_max_turns: 12
   policy_do_sample: true
   policy_temperature: 0.8
   policy_top_p: 0.95
@@ -56,7 +56,10 @@ optimization:
   keep_recent_tool_image_messages: 3
   max_tool_message_frames: 4
   max_total_video_frames: 16
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  dataloader_persistent_workers: false
   compute_loss_microbatch_size: 4
   rl_steps_per_generation: 1
   rollout_stage_batch_size: 8
@@ -66,13 +69,15 @@ optimization:
 distributed:
   seed: 42
   nnodes: 1
-  nproc_per_node: 3
+  nproc_per_node: 8
   bf16: true
 
 logging:
+  save_steps: 10
+  save_only_model: true
   inline_rollout_eval: true
-  rollout_eval_start_iteration: 40
-  rollout_eval_interval_iterations: 40
+  rollout_eval_start_iteration: 10
+  rollout_eval_interval_iterations: 10
   final_rollout_eval: true
 
 rewards:

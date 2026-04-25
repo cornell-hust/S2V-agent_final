@@ -70,7 +70,7 @@ class StepRolloutEvalConfig:
     verifier_max_new_tokens: int = 512
     attach_reference_diagnostics: bool = False
     enable_semantic_metrics: bool = True
-    semantic_metrics: Sequence[str] | str = "qa_accuracy,bertscore"
+    semantic_metrics: Sequence[str] | str = "qa_accuracy"
     semantic_judge_base_url: str = ""
     semantic_judge_model: str = ""
     semantic_judge_cache_path: str = ""
@@ -110,7 +110,7 @@ class StepRolloutEvalConfig:
                 "run_sft_rollout_eval_vllm now requires io.data_path pointing to raw SAVER JSONL. "
                 "The legacy io.input_manifest compact-trace eval path has been retired."
             )
-        semantic_metrics = semantic.get("metrics", "qa_accuracy,bertscore")
+        semantic_metrics = semantic.get("metrics", "qa_accuracy")
         return cls(
             base_model=str(mapping.get("base_model") or "").strip(),
             data_path=data_path,

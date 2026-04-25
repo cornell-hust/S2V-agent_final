@@ -27,7 +27,7 @@ QA_ACCURACY_FIELDS = (
     "trigger",
     "confirmation",
 )
-DEFAULT_SEMANTIC_METRICS = ("rouge", "bertscore", "qa_accuracy", "qa_relaxed")
+DEFAULT_SEMANTIC_METRICS = ("rouge", "qa_accuracy", "qa_relaxed")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -242,43 +242,15 @@ def _evaluate_bertscore(
     predictions, references = _collect_summary_strings(rollouts, reference_data=reference_data)
     coverage = sum(1 for prediction in predictions if str(prediction).strip())
     total = len(references)
-    try:
-        from bert_score import score as bert_score
-    except Exception:
-        return {
-            "available": False,
-            "skipped_reason": "BERTScore requested but the `bert_score` package is not installed.",
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "coverage": int(coverage),
-            "coverage_rate": float(coverage) / float(total) if total > 0 else 0.0,
-        }
-    if not references:
-        return {
-            "available": True,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "coverage": 0,
-            "coverage_rate": 0.0,
-        }
-    model_type = str(bertscore_model_path or "").strip()
-    bertscore_kwargs: Dict[str, Any] = {
-        "lang": "en",
-        "verbose": False,
-    }
-    if model_type:
-        bertscore_kwargs["model_type"] = model_type
-    precision, recall, f1 = bert_score(predictions, references, **bertscore_kwargs)
     return {
-        "available": True,
-        "precision": float(precision.mean().item()),
-        "recall": float(recall.mean().item()),
-        "f1": float(f1.mean().item()),
+        "available": False,
+        "skipped_reason": "BERTScore is temporarily disabled in this repository.",
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
         "coverage": int(coverage),
         "coverage_rate": float(coverage) / float(total) if total > 0 else 0.0,
-        "model_type": model_type,
+        "model_type": str(bertscore_model_path or "").strip(),
     }
 
 

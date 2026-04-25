@@ -16,9 +16,7 @@ from PIL import Image
 from saver_v3.common.message_budget import (
     apply_message_budget,
     drop_oldest_history_turn,
-    summarize_visual_budget,
 )
-from saver_v3.common.runtime import distributed_runtime_from_env, runtime_log
 from saver_v3.model.model_loading import build_hf_model_init_kwargs, ensure_flash_attention_supported_dtype
 from saver_v3.core.self_verification import build_policy_self_verification_payload
 
@@ -668,7 +666,6 @@ class QwenGenerationPolicy:
         self._prepared_messages_cache_len = len(messages)
         self._prepared_messages_cache_signatures = current_signatures
         prepared_messages: List[Dict[str, Any]] = _clone_prepared_messages_view(self._prepared_messages_cache)
-        before_budget = summarize_visual_budget(prepared_messages)
         budgeted_messages = apply_message_budget(
             prepared_messages,
             keep_recent_text_messages=self.keep_recent_text_messages,
@@ -678,31 +675,6 @@ class QwenGenerationPolicy:
             max_total_video_frames=self.max_total_video_frames,
             copy_messages=False,
         )
-        after_budget = summarize_visual_budget(budgeted_messages)
-        if (
-            any(
-                int(value) > 0
-                for value in (
-                    self.keep_recent_text_messages,
-                    self.keep_recent_tool_image_messages,
-                    self.max_total_images,
-                    self.max_tool_message_frames,
-                    self.max_total_video_frames,
-                )
-            )
-            and before_budget != after_budget
-        ):
-            runtime_log(
-                "rollout visual budget debug: "
-                f"before={before_budget} after={after_budget} "
-                f"keep_recent_text_messages={int(self.keep_recent_text_messages) or 'all'} "
-                f"keep_recent_tool_image_messages={int(self.keep_recent_tool_image_messages) or 'all'} "
-                f"max_total_images={int(self.max_total_images) or 'all'} "
-                f"max_tool_message_frames={int(self.max_tool_message_frames) or 'all'} "
-                f"max_total_video_frames={int(self.max_total_video_frames) or 'all'}",
-                runtime=distributed_runtime_from_env(),
-                main_process_only=True,
-            )
         return budgeted_messages
 
     def _prepare_message_slice(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

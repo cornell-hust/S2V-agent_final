@@ -603,3 +603,146 @@ def test_recover_sample_losses_from_source_entries_fail_fast_on_bad_sample(
     assert trainer._skipped_non_finite_compute_samples == 0
     dump_files = sorted((tmp_path / "non_finite_dumps").glob("*compute_loss_skipped_sample*.json"))
     assert not dump_files
+
+
+def test_pad_prepared_batches_to_distributed_max_adds_noop_donor_batch(monkeypatch: pytest.MonkeyPatch):
+    trainer = object.__new__(env_mod._NativeGRPOTrainerMixin)
+    trainer._native_visual_tensor_dtype = None
+    for method_name in (
+        "_reserved_episode_spec_keys",
+        "_is_visual_multimodal_tensor_key",
+        "_move_multimodal_payload_to_device",
+        "_move_episode_spec_to_device",
+        "_prepared_batch_sample_count",
+        "_clone_prepared_batch_as_noop",
+        "_prepared_batch_cpu_copy",
+        "_pad_prepared_batches_to_distributed_max",
+    ):
+        setattr(
+            trainer,
+            method_name,
+            getattr(env_mod._NativeGRPOTrainerMixin, method_name).__get__(trainer, env_mod._NativeGRPOTrainerMixin),
+        )
+
+    local_batch = {
+        "prompt_ids": torch.tensor([[11, 12]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[21, 22]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+        "sample_weight": torch.ones(1, dtype=torch.float32),
+        "advantage": torch.ones(1, dtype=torch.float32),
+        "sample_loss_multiplier": torch.ones(1, dtype=torch.float32),
+        "multimodal_inputs": {
+            "pixel_values": torch.ones((4, 8), dtype=torch.bfloat16),
+            "image_grid_thw": torch.ones((1, 3), dtype=torch.int64),
+        },
+    }
+    donor_text_only_batch = {
+        "prompt_ids": torch.tensor([[31, 32, 33]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[41, 42, 43, 44]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.bool),
+        "sample_weight": torch.ones(1, dtype=torch.float32),
+        "advantage": torch.full((1,), 2.0, dtype=torch.float32),
+        "sample_loss_multiplier": torch.ones(1, dtype=torch.float32),
+        "multimodal_inputs": {},
+    }
+
+    monkeypatch.setattr(env_mod, "_distributed_max_int", lambda local_value, device: 2)
+    monkeypatch.setattr(env_mod, "_distributed_min_int", lambda local_value, device: 1)
+    monkeypatch.setattr(
+        env_mod,
+        "_distributed_first_available_object",
+        lambda local_object, device=None: donor_text_only_batch if local_object is None else local_object,
+    )
+
+    runtime_stats = {}
+    padded = trainer._pad_prepared_batches_to_distributed_max(
+        [local_batch],
+        device=torch.device("cpu"),
+        runtime_stats=runtime_stats,
+    )
+
+    assert len(padded) == 2
+    assert runtime_stats["ddp_noop_padded_prepared_batches"] == 1
+    assert torch.equal(padded[0]["sample_weight"], local_batch["sample_weight"])
+    assert padded[1]["multimodal_inputs"] == {}
+    assert torch.equal(
+        padded[1]["sample_loss_multiplier"],
+        torch.zeros_like(donor_text_only_batch["sample_loss_multiplier"], dtype=torch.float32),
+    )
+    assert torch.equal(
+        padded[1]["sample_weight"],
+        torch.zeros_like(donor_text_only_batch["sample_weight"], dtype=torch.float32),
+    )
+    assert torch.equal(
+        padded[1]["advantage"],
+        torch.zeros_like(donor_text_only_batch["advantage"], dtype=torch.float32),
+    )
+
+
+def test_pad_prepared_batches_to_distributed_max_uses_symmetric_donor_gather(monkeypatch: pytest.MonkeyPatch):
+    trainer = object.__new__(env_mod._NativeGRPOTrainerMixin)
+    trainer._native_visual_tensor_dtype = None
+    for method_name in (
+        "_reserved_episode_spec_keys",
+        "_is_visual_multimodal_tensor_key",
+        "_move_multimodal_payload_to_device",
+        "_move_episode_spec_to_device",
+        "_prepared_batch_sample_count",
+        "_clone_prepared_batch_as_noop",
+        "_prepared_batch_cpu_copy",
+        "_pad_prepared_batches_to_distributed_max",
+    ):
+        setattr(
+            trainer,
+            method_name,
+            getattr(env_mod._NativeGRPOTrainerMixin, method_name).__get__(trainer, env_mod._NativeGRPOTrainerMixin),
+        )
+
+    local_batches = [
+        {
+            "prompt_ids": torch.tensor([[11, 12]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[21, 22]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "sample_weight": torch.ones(1, dtype=torch.float32),
+            "advantage": torch.ones(1, dtype=torch.float32),
+            "sample_loss_multiplier": torch.ones(1, dtype=torch.float32),
+            "multimodal_inputs": {},
+        },
+        {
+            "prompt_ids": torch.tensor([[31, 32]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[41, 42]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "sample_weight": torch.ones(1, dtype=torch.float32),
+            "advantage": torch.ones(1, dtype=torch.float32),
+            "sample_loss_multiplier": torch.ones(1, dtype=torch.float32),
+            "multimodal_inputs": {},
+        },
+    ]
+
+    gathered_positions = []
+    monkeypatch.setattr(env_mod, "_distributed_max_int", lambda local_value, device: 2)
+    monkeypatch.setattr(env_mod, "_distributed_min_int", lambda local_value, device: 1)
+
+    def _fake_first_available(local_object, device=None):
+        del device
+        gathered_positions.append(local_object)
+        return local_object
+
+    monkeypatch.setattr(env_mod, "_distributed_first_available_object", _fake_first_available)
+
+    runtime_stats = {}
+    padded = trainer._pad_prepared_batches_to_distributed_max(
+        local_batches,
+        device=torch.device("cpu"),
+        runtime_stats=runtime_stats,
+    )
+
+    assert len(padded) == 2
+    assert len(gathered_positions) == 2
+    assert "ddp_noop_padded_prepared_batches" not in runtime_stats
+    assert runtime_stats["distributed_min_prepared_batch_count"] == 1
+    assert runtime_stats["distributed_max_prepared_batch_count"] == 2

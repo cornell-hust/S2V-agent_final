@@ -38,6 +38,6 @@ baseline:
 evaluation:
   progress_every: 10
   enable_semantic_metrics: true
-  semantic_bertscore_model_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/roberta-large
+  semantic_bertscore_model_path: ""
   semantic_metrics:
     - qa_accuracy

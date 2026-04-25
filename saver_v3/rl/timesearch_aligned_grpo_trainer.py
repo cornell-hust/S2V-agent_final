@@ -22,6 +22,7 @@ from saver_v3.rl.grpo_trainer_env import (
     _NativeGRPOProgressReporter,
     _RawItemDataset,
     _build_native_grpo_progress_callback,
+    _build_seed_worker_init_fn,
     _compute_group_relative_advantages,
     _degrade_reward_summary_for_fecv_failure,
     _distributed_bool_consensus,
@@ -950,10 +951,7 @@ class TimesearchAlignedGRPOTrainerMixin:
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = bool(getattr(self.args, "dataloader_drop_last", False))
-            try:
-                from transformers.trainer_utils import seed_worker as _seed_worker
-            except Exception:
-                _seed_worker = None
+            _seed_worker = _build_seed_worker_init_fn(args=self.args)
             if _seed_worker is not None:
                 dataloader_params["worker_init_fn"] = _seed_worker
             if int(dataloader_params["num_workers"]) > 0:
@@ -3734,7 +3732,8 @@ def create_timesearch_aligned_grpo_trainer(
     logging_steps: int,
     save_steps: int,
     save_total_limit: int,
-    warmup_ratio: float,
+    save_only_model: bool = False,
+    warmup_ratio: float = 0.03,
     weight_decay: float,
     max_grad_norm: float,
     bf16: bool,
@@ -3822,6 +3821,7 @@ def create_timesearch_aligned_grpo_trainer(
         "logging_steps": int(logging_steps),
         "save_steps": int(save_steps),
         "save_total_limit": int(save_total_limit),
+        "save_only_model": bool(save_only_model),
         "warmup_ratio": float(warmup_ratio),
         "weight_decay": float(weight_decay),
         "max_grad_norm": float(max_grad_norm),

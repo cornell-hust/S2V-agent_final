@@ -35,7 +35,7 @@
     "generator_revision": "2026-04-23-active-contract-v5",
     "initial_observation_mode": "explicit_first_scan",
     "main_rollout_terminal_mode": "finalize_case_only",
-    "max_turns": 10,
+    "max_turns": 12,
     "policy_max_new_tokens": 1024,
     "protocol_version": "seek_v5",
     "signature_schema_version": 1,
@@ -48,11 +48,11 @@
     "include_splits": [
       "train"
     ],
-    "mtime_ns": 1776939914818888422,
+    "mtime_ns": 1777092405182493926,
     "num_records": 480,
     "path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
     "resolved_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
-    "sha256": "9fda38eac189d6694a00a7815ef7315da843d276045da7dd92158336b15e9137",
+    "sha256": "064322cabc5d7dd4a465a310789cb68f0d366a7b8c03d7f4231631ec444ad66b",
     "validation_mode": "canonical_jsonl"
   }
 }

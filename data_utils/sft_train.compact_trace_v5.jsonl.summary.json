@@ -1,5 +1,5 @@
 {
-  "input_data_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
+  "input_data_path": "data_utils/msad_saver_runtime_train.jsonl",
   "metadata_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl.meta.json",
   "num_records": 480,
   "output_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",

@@ -37,7 +37,7 @@ io:
   log_dir: artifacts/vllm/logs
 
 rollout:
-  max_turns: 10
+  max_turns: 12
   rollout_batch_size: 4
   progress_every: 10
   proposal_model_path: /abs/path/to/proposal_model

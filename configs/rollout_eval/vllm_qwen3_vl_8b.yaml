@@ -36,7 +36,7 @@ io:
 
 evaluation:
   epoch_index: 0
-  max_turns: 10
+  max_turns: 12
   rollout_batch_size: 4
   progress_every: 10
   enable_semantic_replay: true
@@ -60,8 +60,7 @@ semantic_metrics:
   enabled: true
   metrics:
     - qa_accuracy
-    - bertscore
-  bertscore_model_path: /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/roberta-large
+  bertscore_model_path: ""
   judge_base_url: ""
   judge_model: ""
   judge_cache_path: ""

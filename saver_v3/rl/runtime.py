@@ -212,6 +212,9 @@ class RLJobConfig:
     learning_rate: float = 5e-7
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 8
+    dataloader_num_workers: int = 4
+    dataloader_prefetch_factor: int = 2
+    dataloader_persistent_workers: bool = False
     min_weight: float = 0.1
     advantage_clip: float = 3.0
     ppo_clip_epsilon: float = 0.2
@@ -229,6 +232,7 @@ class RLJobConfig:
     logging_steps: int = 10
     save_steps: int = 100
     save_total_limit: int = 2
+    save_only_model: bool = False
     bf16: bool = True
     fp16: bool = False
     max_seq_length: int = 8192
@@ -374,6 +378,9 @@ class RLJobConfig:
             learning_rate=float(optimization.get("learning_rate", 5e-7) or 5e-7),
             per_device_train_batch_size=int(optimization.get("per_device_batch_size", optimization.get("per_device_train_batch_size", 1)) or 1),
             gradient_accumulation_steps=int(optimization.get("gradient_accumulation_steps", 8) or 8),
+            dataloader_num_workers=int(optimization.get("dataloader_num_workers", 4) or 0),
+            dataloader_prefetch_factor=int(optimization.get("dataloader_prefetch_factor", 2) or 0),
+            dataloader_persistent_workers=_resolve_bool(optimization, "dataloader_persistent_workers", False),
             min_weight=(
                 float(optimization.get("min_weight"))
                 if optimization.get("min_weight") is not None
@@ -437,6 +444,7 @@ class RLJobConfig:
             logging_steps=int(logging_cfg.get("logging_steps", logging_cfg.get("log_every_n_steps", 10)) or 10),
             save_steps=int(logging_cfg.get("save_steps", logging_cfg.get("save_every_n_steps", 100)) or 100),
             save_total_limit=int(logging_cfg.get("save_total_limit", 2) or 2),
+            save_only_model=_resolve_bool(logging_cfg, "save_only_model", False),
             bf16=_resolve_bool(distributed, "bf16", True),
             fp16=_resolve_bool(distributed, "fp16", False),
             max_seq_length=int(((model_config.get("sequence") or {}).get("max_length", 8192)) or 8192),
@@ -522,6 +530,8 @@ def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
         "--num-train-epochs", str(job.num_train_epochs),
         "--per-device-train-batch-size", str(job.per_device_train_batch_size),
         "--gradient-accumulation-steps", str(job.gradient_accumulation_steps),
+        "--dataloader-num-workers", str(job.dataloader_num_workers),
+        "--dataloader-prefetch-factor", str(job.dataloader_prefetch_factor),
         "--min-weight", str(job.min_weight),
         "--advantage-clip", str(job.advantage_clip),
         "--ppo-clip-epsilon", str(job.ppo_clip_epsilon),
@@ -554,6 +564,8 @@ def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
         "--vllm-fallback-max-num-seqs", str(job.vllm_fallback_max_num_seqs),
         "--rl-reward-config-json", json.dumps(job.reward_config, ensure_ascii=False),
     ]
+    if job.save_only_model:
+        argv.append("--save-only-model")
     if job.gradient_checkpointing:
         argv.append("--gradient-checkpointing")
     argv.append("--inline-rollout-eval" if job.inline_rollout_eval else "--defer-rollout-eval")
@@ -564,6 +576,8 @@ def build_active_rl_trl_argv(job: RLJobConfig) -> list[str]:
         argv.append("--fp16")
     if job.policy_do_sample:
         argv.append("--policy-do-sample")
+    if job.dataloader_persistent_workers:
+        argv.append("--dataloader-persistent-workers")
     argv.extend(["--use-liger-loss", "true" if ACTIVE_RL_USE_LIGER_LOSS else "false"])
     _append_flag(argv, "--rollout-eval-output-dir", job.rollout_eval_output_dir)
     _append_flag(argv, "--include-splits", job.include_splits)

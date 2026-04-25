@@ -15,7 +15,7 @@
 | Conda env | `qwen3-vl` |
 | Policy model | Qwen3-VL-8B (`$DATA_ROOT/Wmh/MLLMs/qwen3-vl-8b-Instruct`) |
 | Teacher model | Qwen3-VL-32B (`$DATA_ROOT/Wmh/MLLMs/Qwen3-VL-32B-Instruct`) |
-| Hardware | 3×H200 GPU server |
+| Hardware | 8×H200 GPU server |
 | DATA_ROOT | `/mnt/shared-storage-user/mineru2-shared/zengweijun` |
 | Artifacts | `artifacts/<EXP_NAME>/` under project root |
 | WandB project | `idea2_v3_qwen3_vl_8b` |
@@ -69,7 +69,11 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
 ### RL Runtime Note
 
 - As of 2026-04-24, the default RL DeepSpeed config should be `configs/deepspeed/zero3_full_model.json`.
-- As of the current RL config, `gradient_accumulation_steps` for the active 3-GPU setup is `22`.
+- As of the current RL config, `gradient_accumulation_steps` for the active 8-GPU setup is `4`.
+  This preserves the GRPO whole-iteration effective batch: `8 GPUs * per_device_batch_size=1 * GA=4 = num_generations=4 * rollout_count=8 = 32`.
+- As of the current RL config, the default throughput-oriented 8-GPU RL shape is `rollout_count=8`, `num_generations=4`, and `dataloader_num_workers=4` with `dataloader_prefetch_factor=2`.
+  This keeps one prompt-group per GPU per iteration shard, preserves depth-related budgets, and avoids partial-rank tail imbalance.
+- As of 2026-04-25, inline RL checkpointing and rollout evaluation should start at iteration 10 and repeat every 10 iterations.
 - Optional RL memory-pressure fallback: `configs/deepspeed/zero3_offload_rl.json`.
   Use it only when `zero3_full_model.json` still exceeds memory; expect it to be slower than plain ZeRO-3 because parameters and optimizer state are offloaded to CPU.
 - As of 2026-04-17, the default RL `keep_recent_tool_image_messages` should be `3`.
@@ -97,7 +101,7 @@ Current official preprocessing outputs under `data_utils/`:
 - `msad_saver_runtime_test.materialized_items_v5.jsonl` — offline `materialized_runtime_items_v5` cache for rollout eval / RL eval.
 - `*.meta.json` and `*.summary.json` sidecars next to the prepared/materialized files — provenance, validation, and summary metadata.
 - Active verify payloads must use `next_tool`; legacy `recommended_action` / `verifier_recommended_action` are rejected.
-- Active data / cache / eval / RL artifacts must share the same v5 `protocol_signature`: `explicit_first_scan`, main-rollout `finalize_case_only`, verifier `next_tool_only`, `max_turns=10`, and `policy_max_new_tokens=1024`.
+- Active data / cache / eval / RL artifacts must share the same v5 `protocol_signature`: `explicit_first_scan`, main-rollout `finalize_case_only`, verifier `next_tool_only`, `max_turns=12`, and `policy_max_new_tokens=1024`.
 
 ### Data Prep Command Ownership
 
@@ -151,7 +155,7 @@ Current official preprocessing outputs under `data_utils/`:
 
 ```bash
 # Step 1: SSH to GPU server (Server 2)
-ssh -CAXY ws-410ca32fa4aae17e-worker-mzzbd.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn
+ssh -CAXY ws-410ca32fa4aae17e-worker-6qqv4.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn
 
 # Step 2: Attach to an existing GPU tmux session if needed
 tmux ls
@@ -165,7 +169,7 @@ export SAVER_V3_DATA_ROOT=/mnt/shared-storage-user/mineru2-shared/zengweijun
 export WANDB_PROJECT=idea2_v3_qwen3_vl_8b
 ```
 
-- Agent-started experiment rule: when an agent launches experiments autonomously, always do so on the GPU server via `ssh -CAXY ws-410ca32fa4aae17e-worker-mzzbd.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn`.
+- Agent-started experiment rule: when an agent launches experiments autonomously, always do so on the GPU server via `ssh -CAXY ws-410ca32fa4aae17e-worker-6qqv4.zengweijun+root.ailab-mineru2.pod@h.pjlab.org.cn`.
 - Do not start experiments on non-GPU servers or local machines when acting autonomously.
 - Agent-started experiment rule: when an agent launches experiments autonomously, always use the tmux session named `agent`.
 - If `agent` already exists, attach with `tmux a -t agent`.
@@ -269,7 +273,7 @@ bash scripts/prepare_sft_manifest.sh --run
 bash scripts/train_sft_qwen3_vl_8b_ds8.sh --run
 ```
 
-- DeepSpeed ZeRO-3, 3×H200
+- DeepSpeed ZeRO-3, 8×H200
 - Assistant-turn-only loss masking
 - Per-epoch checkpoint saved
 - **After each epoch:** run SFT eval (Stage 2) to pick best checkpoint

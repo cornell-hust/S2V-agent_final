@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import gc
+import inspect
 import json
 import math
 import os
 import random
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -76,6 +78,54 @@ class _RawItemDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         return dict(self.items[int(index)])
+
+
+def _compute_rank_local_total_groups(total_groups: int, *, runtime: Any) -> int:
+    total_groups = max(0, int(total_groups))
+    world_size = max(1, int(getattr(runtime, "world_size", 1) or 1))
+    rank = max(0, int(getattr(runtime, "rank", 0) or 0))
+    if total_groups <= 0 or world_size <= 1:
+        return total_groups
+    base = total_groups // world_size
+    remainder = total_groups % world_size
+    return int(base + (1 if rank < remainder else 0))
+
+
+def _build_seed_worker_init_fn(*, args: Any) -> Optional[Callable[..., Any]]:
+    try:
+        from transformers.trainer_utils import seed_worker as _seed_worker
+    except Exception:
+        return None
+
+    try:
+        parameter_names = tuple(inspect.signature(_seed_worker).parameters.keys())
+    except (TypeError, ValueError):
+        parameter_names = ()
+
+    if not parameter_names or parameter_names == ("worker_id",):
+        return _seed_worker
+
+    worker_kwargs: Dict[str, Any] = {}
+    if "num_workers" in parameter_names:
+        worker_kwargs["num_workers"] = int(getattr(args, "dataloader_num_workers", 0) or 0)
+    if "rank" in parameter_names:
+        worker_kwargs["rank"] = int(
+            getattr(
+                args,
+                "process_index",
+                getattr(distributed_runtime_from_env(), "rank", 0),
+            )
+            or 0
+        )
+    if "seed" in parameter_names:
+        seed_value = getattr(args, "data_seed", None)
+        if seed_value is None:
+            seed_value = getattr(args, "seed", None)
+        if seed_value is not None:
+            worker_kwargs["seed"] = int(seed_value)
+    if not worker_kwargs:
+        return _seed_worker
+    return partial(_seed_worker, **worker_kwargs)
 
 
 class RepeatSampler(torch.utils.data.Sampler[int]):
@@ -235,6 +285,15 @@ def _distributed_sum_int(local_value: int, *, device: torch.device) -> int:
     return int(total_tensor.item())
 
 
+def _distributed_min_int(local_value: int, *, device: torch.device) -> int:
+    local_min = int(local_value)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_min
+    min_tensor = torch.tensor([local_min], dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(min_tensor, op=torch.distributed.ReduceOp.MIN)
+    return int(min_tensor.item())
+
+
 def _distributed_sum_float(local_value: float, *, device: torch.device) -> float:
     local_total = float(local_value)
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -242,6 +301,15 @@ def _distributed_sum_float(local_value: float, *, device: torch.device) -> float
     total_tensor = torch.tensor([local_total], dtype=torch.float32, device=device)
     torch.distributed.all_reduce(total_tensor, op=torch.distributed.ReduceOp.SUM)
     return float(total_tensor.item())
+
+
+def _distributed_max_int(local_value: int, *, device: torch.device) -> int:
+    local_max = int(local_value)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_max
+    max_tensor = torch.tensor([local_max], dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(max_tensor, op=torch.distributed.ReduceOp.MAX)
+    return int(max_tensor.item())
 
 
 def _distributed_first_available_object(local_object: Any, *, device: Optional[torch.device] = None) -> Any:
@@ -831,6 +899,7 @@ class _NativeGRPOProgressReporter:
         self.iteration_index = max(0, int(iteration_index))
         self.num_iterations = max(1, int(num_iterations))
         self.total_groups = max(0, int(total_groups))
+        self.local_total_groups = 0
         self.num_generations = max(1, int(num_generations))
         self.compute_loss_microbatch_size = max(1, int(compute_loss_microbatch_size))
         self.rollout_use_generation_cache = bool(rollout_use_generation_cache)
@@ -844,6 +913,9 @@ class _NativeGRPOProgressReporter:
     def set_total_groups(self, total_groups: int) -> None:
         self.total_groups = max(0, int(total_groups))
 
+    def set_local_total_groups(self, local_total_groups: int) -> None:
+        self.local_total_groups = max(0, int(local_total_groups))
+
     def set_trainer_step(self, trainer_step: int) -> None:
         self.trainer_step = max(0, int(trainer_step))
 
@@ -855,14 +927,15 @@ class _NativeGRPOProgressReporter:
         self.last_stage = ""
 
     def _local_total_groups(self) -> int:
-        total_groups = max(0, int(self.total_groups))
-        world_size = max(1, int(getattr(self.runtime, "world_size", 1) or 1))
-        rank = max(0, int(getattr(self.runtime, "rank", 0) or 0))
-        if total_groups <= 0 or world_size <= 1:
-            return total_groups
-        base = total_groups // world_size
-        remainder = total_groups % world_size
-        return int(base + (1 if rank < remainder else 0))
+        if self.local_total_groups > 0:
+            return int(self.local_total_groups)
+        return _compute_rank_local_total_groups(int(self.total_groups), runtime=self.runtime)
+
+    def _display_global_processed_groups(self, global_processed: int) -> int:
+        processed = max(0, int(global_processed))
+        if self.total_groups > 0:
+            return min(processed, int(self.total_groups))
+        return processed
 
     def _global_processed_groups(self) -> int:
         local_processed = max(0, int(self.processed_groups))
@@ -918,7 +991,7 @@ class _NativeGRPOProgressReporter:
         local_total = self._local_total_groups()
         local_total_display = int(local_total) if local_total > 0 else "?"
         global_total_display = int(self.total_groups) if self.total_groups > 0 else "?"
-        global_processed = self._global_processed_groups()
+        global_processed = self._display_global_processed_groups(self._global_processed_groups())
         runtime_log(
             (
                 f"RL rank progress: iter={int(self.iteration_index) + 1}/{int(self.num_iterations)} "
@@ -979,6 +1052,35 @@ def _rl_epoch_resume_dir(output_dir: str | Path, epoch_index: int) -> Path:
     return Path(output_dir) / "epoch_resume" / f"epoch_{int(epoch_index):03d}"
 
 
+def _should_publish_rl_iteration_artifacts(
+    iteration_index: int,
+    *,
+    eval_start_iteration: int,
+    eval_every_iterations: int,
+) -> bool:
+    iteration_number = int(iteration_index) + 1
+    start_iteration = max(1, int(eval_start_iteration))
+    interval = max(1, int(eval_every_iterations))
+    if iteration_number < start_iteration:
+        return False
+    return ((iteration_number - start_iteration) % interval) == 0
+
+
+def _rl_iteration_checkpoint_strategy(
+    *,
+    publish_iteration_artifacts: bool,
+    eval_start_iteration: int,
+    eval_every_iterations: int,
+) -> str:
+    if publish_iteration_artifacts:
+        return (
+            "epoch_resume_inline_eval"
+            f"_start_{max(1, int(eval_start_iteration))}"
+            f"_every_{max(1, int(eval_every_iterations))}_iterations"
+        )
+    return "rolling_epoch_resume_continuation"
+
+
 def _write_rl_checkpoint_authority_metadata(
     *,
     checkpoint_root: str | Path,
@@ -1010,6 +1112,7 @@ def _build_rl_authority_checkpoint_callback(
     rollout_eval_output_dir: str | Path = "",
     iteration_index: int = 0,
     policy_factory: Any = None,
+    checkpoint_strategy: str = "epoch_resume_only",
 ):
     try:
         from transformers import TrainerCallback
@@ -1025,7 +1128,7 @@ def _build_rl_authority_checkpoint_callback(
             self.iteration_index = max(0, int(iteration_index))
             self.policy_factory = policy_factory
             self.runtime = distributed_runtime_from_env()
-            self.checkpoint_strategy = "epoch_resume_only"
+            self.checkpoint_strategy = str(checkpoint_strategy or "epoch_resume_only")
             self.last_authority_checkpoint_path: Optional[Path] = None
             self.last_authority_epoch_index: Optional[int] = None
 
@@ -1173,7 +1276,7 @@ def _build_native_grpo_progress_callback(*, trainer: Any):
         def on_train_begin(self, args, state, control, **kwargs):
             progress = getattr(trainer, "_native_grpo_progress", None)
             if progress is not None:
-                progress.set_total_groups(_estimate_local_total_groups(trainer=trainer, args=args))
+                progress.set_local_total_groups(_estimate_local_total_groups(trainer=trainer, args=args))
                 progress.set_trainer_step(int(getattr(state, "global_step", 0) or 0))
             return control
 
@@ -2269,10 +2372,7 @@ class _NativeGRPOTrainerMixin:
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = bool(getattr(self.args, "dataloader_drop_last", False))
-            try:
-                from transformers.trainer_utils import seed_worker as _seed_worker
-            except Exception:
-                _seed_worker = None
+            _seed_worker = _build_seed_worker_init_fn(args=self.args)
             if _seed_worker is not None:
                 dataloader_params["worker_init_fn"] = _seed_worker
             if int(dataloader_params["num_workers"]) > 0:
@@ -2983,6 +3083,56 @@ class _NativeGRPOTrainerMixin:
         if isinstance(cloned.get("advantage"), torch.Tensor):
             cloned["advantage"] = torch.zeros_like(cloned["advantage"], dtype=torch.float32)
         return cloned
+
+    def _pad_prepared_batches_to_distributed_max(
+        self,
+        prepared_batches: Sequence[Dict[str, Any]],
+        *,
+        device: torch.device,
+        runtime_stats: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        padded_batches = [dict(batch) for batch in list(prepared_batches or [])]
+        local_prepared_batch_count = int(len(padded_batches))
+        min_prepared_batch_count = _distributed_min_int(local_prepared_batch_count, device=device)
+        max_prepared_batch_count = _distributed_max_int(local_prepared_batch_count, device=device)
+        runtime_stats["distributed_min_prepared_batch_count"] = int(min_prepared_batch_count)
+        runtime_stats["distributed_max_prepared_batch_count"] = int(max_prepared_batch_count)
+        runtime_log(
+            "rl debug prepared batch padding: "
+            f"raw_local_prepared_batch_count={int(local_prepared_batch_count)} "
+            f"distributed_min_prepared_batch_count={int(min_prepared_batch_count)} "
+            f"distributed_max_prepared_batch_count={int(max_prepared_batch_count)}",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=False,
+        )
+        if int(max_prepared_batch_count) <= 0 or int(min_prepared_batch_count) == int(max_prepared_batch_count):
+            return padded_batches
+        padded_count = 0
+        for batch_position in range(int(max_prepared_batch_count)):
+            donor_prepared_batch = _distributed_first_available_object(
+                (
+                    self._prepared_batch_cpu_copy(padded_batches[batch_position])
+                    if batch_position < int(local_prepared_batch_count)
+                    else None
+                ),
+                device=device,
+            )
+            if donor_prepared_batch is None:
+                raise RuntimeError(
+                    "Active native RL could not find a donor prepared batch for DDP noop padding: "
+                    f"batch_position={int(batch_position)} local_prepared_batch_count={int(local_prepared_batch_count)} "
+                    f"max_prepared_batch_count={int(max_prepared_batch_count)}"
+                )
+            if batch_position < int(local_prepared_batch_count):
+                continue
+            donor_prepared_batch = self._move_episode_spec_to_device(donor_prepared_batch, device=device)
+            padded_batches.append(self._clone_prepared_batch_as_noop(donor_prepared_batch))
+            padded_count += 1
+        if padded_count > 0:
+            runtime_stats["ddp_noop_padded_prepared_batches"] = int(
+                runtime_stats.get("ddp_noop_padded_prepared_batches", 0)
+            ) + int(padded_count)
+        return padded_batches
 
     def _prepared_batch_cpu_copy(self, prepared_batch: Dict[str, Any]) -> Dict[str, Any]:
         return self._move_episode_spec_to_device(prepared_batch, device=torch.device("cpu"))
@@ -3982,37 +4132,19 @@ class _NativeGRPOTrainerMixin:
                 self._materialize_episode_spec_microbatch(chunk, device=target_device)
             )
         runtime_stats["raw_local_prepared_batch_count"] = int(len(prepared_microbatches))
+        prepared_microbatches = self._pad_prepared_batches_to_distributed_max(
+            prepared_microbatches,
+            device=target_device,
+            runtime_stats=runtime_stats,
+        )
         local_prepared_batch_count = int(len(prepared_microbatches))
         self._debug_last_compute_loss_call_index = int(compute_loss_call_index)
         self._debug_last_compute_loss_prepared_batch_count = int(local_prepared_batch_count)
+        self._debug_last_compute_loss_rank_local_batch_count = int(local_prepared_batch_count)
         global_prepared_batch_count = _distributed_sum_int(local_prepared_batch_count, device=target_device)
         all_ranks_have_prepared_batches, any_rank_has_prepared_batches = _distributed_bool_consensus(
             local_prepared_batch_count > 0,
             device=target_device,
-        )
-        if any_rank_has_prepared_batches and not all_ranks_have_prepared_batches:
-            donor_prepared_batch = _distributed_first_available_object(
-                self._prepared_batch_cpu_copy(prepared_microbatches[0]) if prepared_microbatches else None,
-                device=target_device,
-            )
-            if local_prepared_batch_count <= 0 and donor_prepared_batch is not None:
-                prepared_microbatches = [
-                    self._clone_prepared_batch_as_noop(
-                        self._move_episode_spec_to_device(donor_prepared_batch, device=target_device)
-                    )
-                ]
-                local_prepared_batch_count = int(len(prepared_microbatches))
-                runtime_stats["ddp_noop_padded_prepared_batches"] = int(local_prepared_batch_count)
-        self._debug_last_compute_loss_rank_local_batch_count = int(local_prepared_batch_count)
-        runtime_log(
-            "rl debug prepared batch layout: "
-            f"compute_loss_call={compute_loss_call_index} "
-            f"local_episode_specs={int(local_episode_spec_count)} "
-            f"local_prepared_batch_count={int(local_prepared_batch_count)} "
-            f"global_prepared_batch_count={int(global_prepared_batch_count)} "
-            f"prepared_batches={[self._debug_prepared_batch_summary(batch) for batch in prepared_microbatches]}",
-            runtime=distributed_runtime_from_env(),
-            main_process_only=False,
         )
         if not any_rank_has_prepared_batches or global_prepared_batch_count <= 0:
             if self.all_empty_policy == "true_skip":
@@ -4191,7 +4323,8 @@ def create_native_grpo_trainer(
     logging_steps: int,
     save_steps: int,
     save_total_limit: int,
-    warmup_ratio: float,
+    save_only_model: bool = False,
+    warmup_ratio: float = 0.03,
     weight_decay: float,
     max_grad_norm: float,
     bf16: bool,
@@ -4280,6 +4413,7 @@ def create_native_grpo_trainer(
         "logging_steps": int(logging_steps),
         "save_steps": int(save_steps),
         "save_total_limit": int(save_total_limit),
+        "save_only_model": bool(save_only_model),
         "warmup_ratio": float(warmup_ratio),
         "weight_decay": float(weight_decay),
         "max_grad_norm": float(max_grad_norm),
@@ -4532,8 +4666,17 @@ def run_trainer_native_grpo(
 
     for iteration in range(int(args.num_iterations)):
         iter_dir = output_dir / f"iter_{int(iteration):03d}"
-        checkpoint_dir = iter_dir / "checkpoint"
         iter_dir.mkdir(parents=True, exist_ok=True)
+        publish_iteration_artifacts = _should_publish_rl_iteration_artifacts(
+            int(iteration),
+            eval_start_iteration=int(getattr(args, "rollout_eval_start_iteration", 1) or 1),
+            eval_every_iterations=int(getattr(args, "rollout_eval_interval_iterations", 1) or 1),
+        )
+        checkpoint_dir = (
+            iter_dir / "checkpoint"
+            if publish_iteration_artifacts
+            else output_dir / "_rolling_iteration_checkpoint" / "checkpoint"
+        )
         try:
             indices = select_iteration_indices_fn(
                 len(raw_records),
@@ -4574,6 +4717,7 @@ def run_trainer_native_grpo(
             "rl_open_ended_judge_base_url": str(getattr(args, "rl_open_ended_judge_base_url", "") or ""),
             "rl_open_ended_judge_model": str(getattr(args, "rl_open_ended_judge_model", "") or ""),
             "rl_open_ended_judge_cache_path": str(getattr(args, "rl_open_ended_judge_cache_path", "") or ""),
+            "publish_iteration_artifacts": bool(publish_iteration_artifacts),
         }
         if args.dry_run or not items:
             summary["latest_checkpoint"] = str(current_model_path)
@@ -4599,11 +4743,26 @@ def run_trainer_native_grpo(
             reference_model_path=reference_model_path,
             config=config_builder(args),
         )
+        if hasattr(rollout_eval_config, "inline_rollout_eval"):
+            rollout_eval_config.inline_rollout_eval = bool(
+                getattr(args, "inline_rollout_eval", False) and publish_iteration_artifacts
+            )
+        rollout_eval_output_dir = (
+            rollout_eval_output_root / f"iter_{int(iteration):03d}"
+            if publish_iteration_artifacts
+            else rollout_eval_output_root / "_rolling_iteration_eval"
+        )
+        checkpoint_strategy = _rl_iteration_checkpoint_strategy(
+            publish_iteration_artifacts=publish_iteration_artifacts,
+            eval_start_iteration=int(getattr(args, "rollout_eval_start_iteration", 1) or 1),
+            eval_every_iterations=int(getattr(args, "rollout_eval_interval_iterations", 1) or 1),
+        )
         rollout_eval_callback = _build_rl_authority_checkpoint_callback(
             processor=processor,
             rollout_eval_config=rollout_eval_config,
-            rollout_eval_output_dir=rollout_eval_output_root / f"iter_{int(iteration):03d}",
+            rollout_eval_output_dir=rollout_eval_output_dir,
             iteration_index=int(iteration),
+            checkpoint_strategy=checkpoint_strategy,
         )
         trainer = create_native_grpo_trainer(
             model=model,
@@ -4617,6 +4776,7 @@ def run_trainer_native_grpo(
             logging_steps=args.logging_steps,
             save_steps=args.save_steps,
             save_total_limit=args.save_total_limit,
+            save_only_model=bool(getattr(args, "save_only_model", False)),
             warmup_ratio=args.warmup_ratio,
             weight_decay=args.weight_decay,
             max_grad_norm=args.max_grad_norm,
@@ -4688,7 +4848,7 @@ def run_trainer_native_grpo(
             )
             authority_checkpoint = getattr(rollout_eval_callback, "last_authority_checkpoint_path", None)
             authority_epoch_index = getattr(rollout_eval_callback, "last_authority_epoch_index", None)
-            checkpoint_strategy = str(getattr(rollout_eval_callback, "checkpoint_strategy", "epoch_resume_only"))
+            checkpoint_strategy = str(getattr(rollout_eval_callback, "checkpoint_strategy", checkpoint_strategy))
             if authority_checkpoint is None:
                 raise RuntimeError(
                     f"trainer-native RL iteration {int(iteration)} did not publish an authority checkpoint."

@@ -19,6 +19,7 @@ from saver_v3.data.protocol_signature import DEFAULT_TEACHER_ROLE, build_protoco
 from saver_v3.common.experiment_logging import append_jsonl, utc_timestamp, write_json
 from saver_v3.rl.grpo_trainer_env import (
     _build_rl_authority_checkpoint_callback,
+    _compute_rank_local_total_groups,
     create_native_grpo_trainer,
     _load_training_proposal_runtime,
     _raw_records_require_feature_guided_proposal,
@@ -78,11 +79,21 @@ def _save_loadable_hf_authority_checkpoint(
         )
     unwrap_model = getattr(accelerator, "unwrap_model", None)
     model_to_save = unwrap_model(wrapped_model) if callable(unwrap_model) else _unwrap_model(wrapped_model)
+    get_state_dict = getattr(accelerator, "get_state_dict", None)
+    if not callable(get_state_dict):
+        raise RuntimeError("Accelerator.get_state_dict is required to save a loadable RL authority checkpoint.")
+    runtime_log(
+        f"entering loadable RL authority checkpoint state_dict gather at {loadable_dir}",
+        runtime=runtime,
+        main_process_only=False,
+    )
+    state_dict = get_state_dict(wrapped_model, unwrap=False)
+    runtime_log(
+        f"passed loadable RL authority checkpoint state_dict gather at {loadable_dir}",
+        runtime=runtime,
+        main_process_only=False,
+    )
     if runtime.is_main_process:
-        get_state_dict = getattr(accelerator, "get_state_dict", None)
-        if not callable(get_state_dict):
-            raise RuntimeError("Accelerator.get_state_dict is required to save a loadable RL authority checkpoint.")
-        state_dict = get_state_dict(wrapped_model, unwrap=False)
         model_to_save.save_pretrained(str(loadable_dir), state_dict=state_dict)
         if hasattr(processor, "save_pretrained"):
             processor.save_pretrained(str(loadable_dir))
@@ -94,6 +105,7 @@ def _save_loadable_hf_authority_checkpoint(
                 "checkpoint_root": str(checkpoint_root),
             },
         )
+    del state_dict
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
     return loadable_dir
@@ -502,6 +514,9 @@ def _build_continuous_iteration_callback(
                 native_progress.iteration_index = int(iteration_index)
                 native_progress.num_iterations = int(self.owner.args.num_iterations)
                 native_progress.set_total_groups(len(items))
+                native_progress.set_local_total_groups(
+                    _compute_rank_local_total_groups(len(items), runtime=self.owner.runtime)
+                )
             if hasattr(self.trainer, "_buffered_generation_step_payloads"):
                 self.trainer._buffered_generation_step_payloads = []
             if hasattr(self.trainer, "_buffered_generation_batch_key"):
@@ -541,9 +556,21 @@ def _build_continuous_iteration_callback(
             if not self._should_trigger_checkpoint(int(iteration_index)):
                 return
             checkpoint = get_last_checkpoint(args.output_dir)
-            if not checkpoint:
-                raise RuntimeError("Continuous RL expected a standard Trainer checkpoint after save, but none was found.")
-            checkpoint_path = Path(checkpoint)
+            checkpoint_path = (
+                Path(checkpoint)
+                if checkpoint
+                else _resolve_standard_trainer_checkpoint_path(
+                    args.output_dir,
+                    int(getattr(state, "global_step", 0) or 0),
+                )
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if not checkpoint_path.exists():
+                raise RuntimeError(
+                    "Continuous RL expected a Trainer checkpoint after save, "
+                    f"but none was found at {checkpoint_path}."
+                )
             self.last_saved_checkpoint = checkpoint_path
             runtime_log(
                 (
@@ -807,6 +834,7 @@ def create_trl_vllm_grpo_trainer(
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
+        save_only_model=bool(getattr(args, "save_only_model", False)),
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,

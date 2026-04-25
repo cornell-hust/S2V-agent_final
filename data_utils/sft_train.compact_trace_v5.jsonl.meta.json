@@ -8,7 +8,7 @@
     "main_rollout_terminal_mode": "finalize_case_only",
     "verifier_contract": "next_tool_only",
     "teacher_role": "none",
-    "max_turns": 10,
+    "max_turns": 12,
     "policy_max_new_tokens": 1024,
     "generator_revision": "2026-04-23-active-contract-v5",
     "generator_fingerprint": "68369fa86849effdf8e64bc89a4497ecc9476738ef90acfec2a0b161cfd7bfd3"
@@ -31,21 +31,21 @@
     "record_counterfactual_trace": true,
     "record_message_history": true
   },
-  "input_data_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
+  "input_data_path": "data_utils/msad_saver_runtime_train.jsonl",
   "num_records": 480,
   "include_splits": [
     "train"
   ],
   "source_runtime": {
-    "path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
+    "path": "data_utils/msad_saver_runtime_train.jsonl",
     "resolved_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/msad_saver_runtime_train.jsonl",
     "include_splits": [
       "train"
     ],
     "file_size": 5940152,
-    "mtime_ns": 1776939914818888422,
+    "mtime_ns": 1777092405182493926,
     "num_records": 480,
-    "sha256": "9fda38eac189d6694a00a7815ef7315da843d276045da7dd92158336b15e9137",
+    "sha256": "064322cabc5d7dd4a465a310789cb68f0d366a7b8c03d7f4231631ec444ad66b",
     "validation_mode": "hybrid"
   }
 }
