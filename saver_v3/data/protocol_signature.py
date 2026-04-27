@@ -15,9 +15,9 @@ from saver_v3.data.config import (
 
 PROTOCOL_SIGNATURE_SCHEMA_VERSION = 1
 ACTIVE_PROTOCOL_VERSION = "seek_v5"
-ACTIVE_MAIN_ROLLOUT_TERMINAL_MODE = "finalize_case_only"
+ACTIVE_MAIN_ROLLOUT_TERMINAL_MODE = "finalize_case_or_auto_exhaustion"
 ACTIVE_VERIFIER_CONTRACT = "next_tool_only"
-ACTIVE_GENERATOR_REVISION = "2026-04-23-active-contract-v5"
+ACTIVE_GENERATOR_REVISION = "2026-04-26-auto-exhaustion-finalize-v1"
 DEFAULT_TEACHER_ROLE = "none"
 TEACHER_ROLE_AUXILIARY = "teacher_rollout_primary_auxiliary"
 

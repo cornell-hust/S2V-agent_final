@@ -347,26 +347,6 @@ def parse_active_rl_args(argv: Optional[List[str]], *, description: str) -> argp
     return args
 
 
-def _normalize_target_existence_label(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in {"anomaly", "normal"} else ""
-
-
-def _record_target_existence_label(record: Any) -> str:
-    if not isinstance(record, dict):
-        return ""
-    for key in ("structured_target", "target", "reference_target"):
-        payload = record.get(key)
-        if isinstance(payload, dict):
-            normalized = _normalize_target_existence_label(payload.get("existence"))
-            if normalized:
-                return normalized
-    label = record.get("label")
-    if isinstance(label, dict) and "is_anomaly" in label:
-        return "anomaly" if bool(label.get("is_anomaly")) else "normal"
-    return ""
-
-
 def _select_cycle_indices(
     indices: Sequence[int],
     *,
@@ -407,44 +387,7 @@ def select_iteration_indices(
         return []
     total_needed = max(0, int(rollout_count))
     absolute_offset = max(0, int(start_index)) + max(0, int(iteration)) * total_needed
-    if records is not None and int(len(records)) == int(dataset_size):
-        anomaly_indices: List[int] = []
-        normal_indices: List[int] = []
-        for index, record in enumerate(records):
-            label = _record_target_existence_label(record)
-            if label == "anomaly":
-                anomaly_indices.append(int(index))
-            elif label == "normal":
-                normal_indices.append(int(index))
-        if anomaly_indices and normal_indices:
-            positions = list(range(int(absolute_offset), int(absolute_offset) + int(total_needed)))
-            anomaly_needed = sum(1 for position in positions if int(position) % 2 == 0)
-            normal_needed = int(total_needed) - int(anomaly_needed)
-            anomaly_offset = (int(absolute_offset) + 1) // 2
-            normal_offset = int(absolute_offset) // 2
-            anomaly_selected = _select_cycle_indices(
-                anomaly_indices,
-                total_needed=int(anomaly_needed),
-                absolute_offset=int(anomaly_offset),
-                seed=int(seed) + 1009,
-            )
-            normal_selected = _select_cycle_indices(
-                normal_indices,
-                total_needed=int(normal_needed),
-                absolute_offset=int(normal_offset),
-                seed=int(seed) + 2003,
-            )
-            selected: List[int] = []
-            anomaly_cursor = 0
-            normal_cursor = 0
-            for position in positions:
-                if int(position) % 2 == 0:
-                    selected.append(int(anomaly_selected[anomaly_cursor]))
-                    anomaly_cursor += 1
-                else:
-                    selected.append(int(normal_selected[normal_cursor]))
-                    normal_cursor += 1
-            return selected
+    del records
     selected: List[int] = []
     selected.extend(
         _select_cycle_indices(
@@ -576,6 +519,7 @@ def build_rollout_eval_config(
         semantic_judge_cache_path=str(getattr(args, "eval_semantic_judge_cache_path", "") or "").strip(),
         semantic_judge_timeout_sec=float(getattr(args, "eval_semantic_judge_timeout_sec", 30.0) or 30.0),
         semantic_bertscore_model_path=str(getattr(args, "eval_bertscore_model_path", "") or "").strip(),
+        current_model_path=str(current_model_path or ""),
         saver_config=config,
     )
 

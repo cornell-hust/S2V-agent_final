@@ -8,7 +8,7 @@ server:
   gpu_memory_utilization: 0.9
 
 client:
-  max_tokens: 1024
+  max_tokens: 2048
   max_total_images: 28
   max_seq_length: 8192
   keep_recent_text_messages: 20

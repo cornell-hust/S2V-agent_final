@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_DIR}/scripts/lib/cache_env.sh"
+setup_agenticvau_cache_env
 RUN_MODE="print"
 EXTRA_ARGS=()
 

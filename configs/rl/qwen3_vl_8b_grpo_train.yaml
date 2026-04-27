@@ -37,7 +37,7 @@ initial_observation:
   error_on_seq_prune: true
 
 optimization:
-  num_iterations: 80
+  iteration_budget_multiplier: 1.5
   learning_rate: 4.0e-7
   per_device_batch_size: 1
   min_weight: 0.01
@@ -74,7 +74,7 @@ distributed:
 
 logging:
   save_steps: 10
-  save_only_model: true
+  save_only_model: false
   inline_rollout_eval: true
   rollout_eval_start_iteration: 10
   rollout_eval_interval_iterations: 10

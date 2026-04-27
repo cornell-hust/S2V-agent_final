@@ -2,9 +2,17 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_DIR}/scripts/lib/cache_env.sh"
+setup_agenticvau_cache_env
 RUN_MODE="print"
 EXTRA_ARGS=()
 
+truthy_env() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|t|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 resolve_cuda_runtime_lib_dirs() {
   local conda_prefix="${CONDA_PREFIX:-}"
@@ -102,9 +110,21 @@ CONFIG="${RL_CONFIG:-${ROOT_DIR}/configs/rl/qwen3_vl_8b_grpo_train.yaml}"
 MODEL_CONFIG="${MODEL_CONFIG:-${ROOT_DIR}/configs/model/qwen3_vl_8b_full.yaml}"
 ATTENTION_CONFIG="${ATTENTION_CONFIG:-${ROOT_DIR}/configs/model/attention_fa3_only.yaml}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
+DEEPSPEED_BIND_CORES_TO_RANK="${DEEPSPEED_BIND_CORES_TO_RANK:-${RL_DEEPSPEED_BIND_CORES_TO_RANK:-0}}"
+DEEPSPEED_BIND_CORE_LIST="${DEEPSPEED_BIND_CORE_LIST:-${RL_DEEPSPEED_BIND_CORE_LIST:-}}"
 
 CMD=(
   deepspeed
+)
+
+if truthy_env "${DEEPSPEED_BIND_CORES_TO_RANK}"; then
+  CMD+=(--bind_cores_to_rank)
+  if [[ -n "${DEEPSPEED_BIND_CORE_LIST}" ]]; then
+    CMD+=(--bind_core_list "${DEEPSPEED_BIND_CORE_LIST}")
+  fi
+fi
+
+CMD+=(
   --num_nodes "${NNODES}"
   --num_gpus "${NPROC_PER_NODE}"
   --node_rank "${NODE_RANK}"

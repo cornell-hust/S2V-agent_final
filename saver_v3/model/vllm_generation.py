@@ -13,7 +13,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
 
@@ -35,6 +35,19 @@ from saver_v3.model.vllm_transport import encode_transport_payload
 
 
 _VLLM_ESTIMATED_MAX_MODEL_LEN_RE = re.compile(r"estimated maximum model length is (\d+)", re.IGNORECASE)
+
+
+def _release_vllm_cuda_cache() -> None:
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+    if callable(ipc_collect):
+        try:
+            ipc_collect()
+        except Exception:
+            pass
 
 
 def _build_rl_completion_mask(
@@ -464,30 +477,68 @@ def _is_peft_model(model: Any) -> bool:
     )
 
 
+def _parameter_needs_deepspeed_zero_gather(param: Any) -> bool:
+    try:
+        if hasattr(param, "ds_id") or hasattr(param, "ds_status"):
+            return True
+        numel = getattr(param, "numel", None)
+        if callable(numel) and int(numel()) == 0:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+@contextmanager
+def _maybe_gather_deepspeed_zero_parameters(params: Iterable[Any]):
+    param_list = [param for param in params if isinstance(param, torch.nn.Parameter)]
+    if not param_list or not any(_parameter_needs_deepspeed_zero_gather(param) for param in param_list):
+        yield
+        return
+    try:
+        import deepspeed
+
+        with deepspeed.zero.GatheredParameters(param_list, modifier_rank=None):
+            yield
+        return
+    except Exception:
+        # If DeepSpeed is not available or the params are not ZeRO-managed, let
+        # the caller fail at load time with the original parameter shape/device.
+        yield
+
+
 def _iter_named_weights_for_vllm(model: Any):
     merged_adapter = False
     peft_prefix = str(getattr(model, "prefix", "") or "")
     if _is_peft_model(model):
-        model.merge_adapter()
-        merged_adapter = True
+        with _maybe_gather_deepspeed_zero_parameters(model.parameters()):
+            model.merge_adapter()
+            merged_adapter = True
+            try:
+                for name, param in model.named_parameters():
+                    resolved_name = str(name)
+                    resolved_name = resolved_name.removeprefix("base_model.model.").replace(".base_layer", "")
+                    if peft_prefix and peft_prefix in resolved_name:
+                        continue
+                    if "original_module" in resolved_name:
+                        continue
+                    resolved_name = resolved_name.replace("modules_to_save.default.", "")
+                    yield resolved_name, param.data
+            finally:
+                if merged_adapter:
+                    model.unmerge_adapter()
+        return
     try:
         for name, param in model.named_parameters():
-            resolved_name = str(name)
-            if merged_adapter:
-                resolved_name = resolved_name.removeprefix("base_model.model.").replace(".base_layer", "")
-                if peft_prefix and peft_prefix in resolved_name:
-                    continue
-                if "original_module" in resolved_name:
-                    continue
-                resolved_name = resolved_name.replace("modules_to_save.default.", "")
-            yield resolved_name, param.data
+            with _maybe_gather_deepspeed_zero_parameters([param]):
+                yield str(name), param.data
     finally:
         if merged_adapter:
             model.unmerge_adapter()
 
 
 def _materialize_named_weights_for_collective_rpc(
-    weights: List[tuple[str, Any]],
+    weights: Iterable[tuple[str, Any]],
 ) -> List[tuple[str, Any]]:
     materialized: List[tuple[str, Any]] = []
     for name, weight in weights:
@@ -768,6 +819,8 @@ class _SAVERVLLMClient:
 
 
 class _VllmColocateRuntime:
+    supports_weight_sync = True
+
     def __init__(
         self,
         *,
@@ -783,6 +836,7 @@ class _VllmColocateRuntime:
         self.llm: Any = None
         self.mode = "colocate"
         self._last_loaded_step: Optional[int] = None
+        self.weights_synced_step: Optional[int] = None
         self.tp_group: Any = None
         self.tp_group_ranks: List[int] = [int(getattr(self.runtime, "rank", 0) or 0)]
         self.local_rank_in_tp_group: int = 0
@@ -898,13 +952,13 @@ class _VllmColocateRuntime:
     def _reload_weights(self, source_model: Any) -> None:
         if self.llm is None:
             raise RuntimeError("vLLM runtime is not initialized.")
-        weights = list(_iter_named_weights_for_vllm(source_model))
         try:
             llm_model = self._driver_model()
         except AttributeError:
             llm_model = None
         if llm_model is not None:
-            llm_model.load_weights(iter(weights))
+            for name, weights in _iter_named_weights_for_vllm(source_model):
+                llm_model.load_weights([(name, weights)])
             return
         collective_rpc = getattr(self.llm, "collective_rpc", None)
         if callable(collective_rpc):
@@ -916,7 +970,9 @@ class _VllmColocateRuntime:
             collective_rpc(
                 "reload_weights",
                 kwargs={
-                    "weights_iterator": _materialize_named_weights_for_collective_rpc(weights),
+                    "weights_iterator": _materialize_named_weights_for_collective_rpc(
+                        _iter_named_weights_for_vllm(source_model)
+                    ),
                     "is_checkpoint_format": True,
                 },
             )
@@ -934,6 +990,7 @@ class _VllmColocateRuntime:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         self._last_loaded_step = step_value
+        self.weights_synced_step = step_value
 
     def build_sampling_params(
         self,
@@ -973,6 +1030,7 @@ class _VllmColocateRuntime:
         llm = self.llm
         self.llm = None
         self._last_loaded_step = None
+        self.weights_synced_step = None
         self.tp_group = None
         self.tp_group_ranks = [int(getattr(self.runtime, "rank", 0) or 0)]
         self.local_rank_in_tp_group = 0
@@ -983,12 +1041,12 @@ class _VllmColocateRuntime:
                     shutdown_fn()
                 except Exception:
                     pass
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _release_vllm_cuda_cache()
 
 
 class _VllmExternalLauncherRuntime:
+    supports_weight_sync = True
+
     def __init__(
         self,
         *,
@@ -1004,6 +1062,8 @@ class _VllmExternalLauncherRuntime:
         self.base_model_path = str(model_path)
         self.llm: Any = None
         self.mode = "external_launcher"
+        self._last_loaded_step: Optional[int] = None
+        self.weights_synced_step: Optional[int] = None
 
         if not self.enabled:
             return
@@ -1088,8 +1148,71 @@ class _VllmExternalLauncherRuntime:
             else:
                 os.environ["VLLM_LOOPBACK_IP"] = previous_loopback_ip
 
+    def _driver_model(self) -> Any:
+        if self.llm is None:
+            raise RuntimeError("vLLM runtime is not initialized.")
+        llm_engine = getattr(self.llm, "llm_engine", None)
+        direct_model_executor = getattr(llm_engine, "model_executor", None)
+        if direct_model_executor is not None:
+            driver_worker = getattr(direct_model_executor, "driver_worker", None)
+            model_runner = getattr(driver_worker, "model_runner", None)
+            model = getattr(model_runner, "model", None)
+            if model is not None:
+                return model
+        engine_core_client = getattr(llm_engine, "engine_core", None)
+        inproc_engine_core = getattr(engine_core_client, "engine_core", None)
+        indirect_model_executor = getattr(inproc_engine_core, "model_executor", None)
+        if indirect_model_executor is not None:
+            driver_worker = getattr(indirect_model_executor, "driver_worker", None)
+            model_runner = getattr(driver_worker, "model_runner", None)
+            model = getattr(model_runner, "model", None)
+            if model is not None:
+                return model
+        raise AttributeError("Unable to resolve a local vLLM driver model for direct weight loading.")
+
+    def _reload_weights(self, source_model: Any) -> None:
+        if self.llm is None:
+            raise RuntimeError("vLLM runtime is not initialized.")
+        try:
+            llm_model = self._driver_model()
+        except AttributeError:
+            llm_model = None
+        if llm_model is not None:
+            for name, weights in _iter_named_weights_for_vllm(source_model):
+                llm_model.load_weights([(name, weights)])
+            return
+        collective_rpc = getattr(self.llm, "collective_rpc", None)
+        if callable(collective_rpc):
+            if not _vllm_worker_reload_supports_weights_iterator():
+                raise RuntimeError(
+                    "This per-rank external-launcher vLLM runtime does not support in-memory "
+                    "weight reload via collective_rpc. Upgrade vLLM or use a runtime with a "
+                    "direct driver model."
+                )
+            collective_rpc(
+                "reload_weights",
+                kwargs={
+                    "weights_iterator": _materialize_named_weights_for_collective_rpc(
+                        _iter_named_weights_for_vllm(source_model)
+                    ),
+                    "is_checkpoint_format": True,
+                },
+            )
+            return
+        raise AttributeError("Unable to resolve a vLLM weight reload path for the current runtime.")
+
     def ensure_weights_synced(self, source_model: Any, *, global_step: int) -> None:
-        del source_model, global_step
+        if not self.enabled or self.llm is None:
+            return
+        step_value = int(global_step)
+        if self._last_loaded_step == step_value:
+            return
+        self._reload_weights(source_model)
+        self.reset_prefix_cache()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        self._last_loaded_step = step_value
+        self.weights_synced_step = step_value
 
     def build_sampling_params(
         self,
@@ -1156,12 +1279,12 @@ class _VllmExternalLauncherRuntime:
                     shutdown_fn()
                 except Exception:
                     pass
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _release_vllm_cuda_cache()
 
 
 class _VllmServerRuntime:
+    supports_weight_sync = True
+
     def __init__(
         self,
         *,
@@ -1177,6 +1300,7 @@ class _VllmServerRuntime:
         self.mode = "server"
         self.client: Any = None
         self._last_loaded_step: Optional[int] = None
+        self.weights_synced_step: Optional[int] = None
         self._managed_server_process: Optional[subprocess.Popen[Any]] = None
         self._managed_server_log_handle: Any = None
         self._managed_server_log_path: Optional[Path] = None
@@ -1296,6 +1420,7 @@ class _VllmServerRuntime:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         self._last_loaded_step = step_value
+        self.weights_synced_step = step_value
 
     def build_sampling_params(
         self,
@@ -1379,6 +1504,7 @@ class _VllmServerRuntime:
         client = self.client
         self.client = None
         self._last_loaded_step = None
+        self.weights_synced_step = None
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             try:
                 torch.distributed.barrier()
@@ -1535,6 +1661,12 @@ class VllmQwenGenerationPolicy(QwenGenerationPolicy):
         base_seed = int(getattr(runtime_args, "seed", 0) or 0)
         runtime_rank = int(getattr(getattr(self.vllm_runtime, "runtime", None), "rank", 0) or 0)
         if self.source_model is not None:
+            if getattr(self.vllm_runtime, "supports_weight_sync", True) is False:
+                raise RuntimeError(
+                    f"{type(self.vllm_runtime).__name__} does not support online weight sync, "
+                    "but this vLLM policy was constructed with a live source_model. "
+                    "Use a sync-capable runtime or construct the policy from a saved checkpoint."
+                )
             self.vllm_runtime.ensure_weights_synced(self.source_model, global_step=current_step)
         if not self.use_generation_cache:
             reset_fn = getattr(self.vllm_runtime, "reset_prefix_cache", None)

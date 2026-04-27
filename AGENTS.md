@@ -73,9 +73,12 @@ Observed from the remote repo on 2026-04-16. Use this section as the fast path-l
   This preserves the GRPO whole-iteration effective batch: `8 GPUs * per_device_batch_size=1 * GA=4 = num_generations=4 * rollout_count=8 = 32`.
 - As of the current RL config, the default throughput-oriented 8-GPU RL shape is `rollout_count=8`, `num_generations=4`, and `dataloader_num_workers=4` with `dataloader_prefetch_factor=2`.
   This keeps one prompt-group per GPU per iteration shard, preserves depth-related budgets, and avoids partial-rank tail imbalance.
+- As of 2026-04-26, active RL derives `num_iterations` dynamically as `ceil(filtered_train_record_count / rollout_count * 1.5)`.
+  With the current 480-record train split and `rollout_count=8`, this resolves to 90 iterations. Do not hand-tune `optimization.num_iterations` for active RL.
 - As of 2026-04-25, inline RL checkpointing and rollout evaluation should start at iteration 10 and repeat every 10 iterations.
 - Optional RL memory-pressure fallback: `configs/deepspeed/zero3_offload_rl.json`.
   Use it only when `zero3_full_model.json` still exceeds memory; expect it to be slower than plain ZeRO-3 because parameters and optimizer state are offloaded to CPU.
+  For CPU-offload runs, `run_full_pipeline.sh` supports `RL_DEEPSPEED_BIND_CORES_TO_RANK=1` plus optional `RL_DEEPSPEED_BIND_CORE_LIST=0-95`; both the full pipeline and standalone RL launcher also accept `DEEPSPEED_BIND_CORES_TO_RANK` / `DEEPSPEED_BIND_CORE_LIST`.
 - As of 2026-04-17, the default RL `keep_recent_tool_image_messages` should be `3`.
   The protected canonical initial scan is retained separately; this budget then prioritizes the latest `scan_timeline` image tool message and uses the remaining slots for the most recent other image-bearing tool messages.
 - As of the active v5 contract, training and inference do not use `severity`, `counterfactual_type`, or any FECV / counterfactual-faithfulness semantics.
@@ -101,7 +104,7 @@ Current official preprocessing outputs under `data_utils/`:
 - `msad_saver_runtime_test.materialized_items_v5.jsonl` — offline `materialized_runtime_items_v5` cache for rollout eval / RL eval.
 - `*.meta.json` and `*.summary.json` sidecars next to the prepared/materialized files — provenance, validation, and summary metadata.
 - Active verify payloads must use `next_tool`; legacy `recommended_action` / `verifier_recommended_action` are rejected.
-- Active data / cache / eval / RL artifacts must share the same v5 `protocol_signature`: `explicit_first_scan`, main-rollout `finalize_case_only`, verifier `next_tool_only`, `max_turns=12`, and `policy_max_new_tokens=1024`.
+- Active data / cache / eval / RL artifacts must share the same v5 `protocol_signature`: `explicit_first_scan`, main-rollout `finalize_case_or_auto_exhaustion`, verifier `next_tool_only`, `max_turns=12`, and `policy_max_new_tokens=2048`.
 
 ### Data Prep Command Ownership
 
@@ -117,6 +120,7 @@ Current official preprocessing outputs under `data_utils/`:
 - `*.frame_cache` and `*.feature_cache` are required runtime inputs for the current SFT/RL/rollout-eval path.
 - These cache files are generated next to the resolved source videos under `DATA_ROOT`, not inside the repo tree.
 - Repo-side summaries and metadata stay in `data_utils/`; the heavyweight frame/feature cache payloads live with the videos.
+- Runtime package caches for vLLM, Torch Inductor, Triton, HuggingFace, pip, and torch extensions are redirected by `scripts/lib/cache_env.sh` to `${SAVER_V3_DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}/cache/agenticvau`; do not let training/eval write large compile caches under `/root/.cache`.
 
 ### Experiment Output Map
 

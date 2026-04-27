@@ -10,7 +10,7 @@ from saver_v3.cli.common import load_yaml_mapping, resolve_path
 # Inline finalize_case now carries compact semantic fields in the same terminal
 # tool call, so the policy default must leave enough headroom for a valid
 # finalize_case instead of truncating terminal JSON.
-DEFAULT_POLICY_MAX_NEW_TOKENS = 1024
+DEFAULT_POLICY_MAX_NEW_TOKENS = 2048
 DEFAULT_ROLLOUT_MAX_TURNS = 12
 DEFAULT_TOTAL_VISUAL_BUDGET = 28
 DEFAULT_RECOMMENDED_MAX_SEQ_LENGTH = 6144

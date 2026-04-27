@@ -104,6 +104,13 @@ class RolloutEvaluationConfig:
     semantic_judge_cache_path: str | Path = ""
     semantic_judge_timeout_sec: float = 30.0
     semantic_bertscore_model_path: str | Path = ""
+    current_model_path: str | Path = ""
+    loadable_authority_checkpoint: str | Path = ""
+    runtime_type: str = ""
+    vllm_runtime_type: str = ""
+    vllm_runtime_base_model_path: str | Path = ""
+    vllm_runtime_supports_weight_sync: Optional[bool] = None
+    weights_synced_step: Optional[int] = None
 
 
 def _semantic_replay_enabled(eval_config: RolloutEvaluationConfig) -> bool:
@@ -453,6 +460,9 @@ def _normalize_eval_include_splits(include_splits: Optional[Sequence[str] | str]
 
 
 def _build_rollout_eval_metadata(eval_config: RolloutEvaluationConfig) -> Dict[str, Any]:
+    weights_synced_step = getattr(eval_config, "weights_synced_step", None)
+    if weights_synced_step not in (None, ""):
+        weights_synced_step = int(weights_synced_step)
     return {
         "data_path": str(eval_config.data_path),
         "data_root": str(eval_config.data_root),
@@ -481,6 +491,13 @@ def _build_rollout_eval_metadata(eval_config: RolloutEvaluationConfig) -> Dict[s
         "semantic_judge_base_url": str(eval_config.semantic_judge_base_url or ""),
         "semantic_judge_model": str(eval_config.semantic_judge_model or ""),
         "semantic_bertscore_model_path": str(eval_config.semantic_bertscore_model_path or ""),
+        "current_model_path": str(getattr(eval_config, "current_model_path", "") or ""),
+        "loadable_authority_checkpoint": str(getattr(eval_config, "loadable_authority_checkpoint", "") or ""),
+        "runtime_type": str(getattr(eval_config, "runtime_type", "") or ""),
+        "vllm_runtime_type": str(getattr(eval_config, "vllm_runtime_type", "") or ""),
+        "vllm_runtime_base_model_path": str(getattr(eval_config, "vllm_runtime_base_model_path", "") or ""),
+        "vllm_runtime_supports_weight_sync": getattr(eval_config, "vllm_runtime_supports_weight_sync", None),
+        "weights_synced_step": weights_synced_step,
     }
 
 

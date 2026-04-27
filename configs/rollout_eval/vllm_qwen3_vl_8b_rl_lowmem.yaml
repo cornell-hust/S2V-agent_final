@@ -11,7 +11,7 @@ server:
   gpu_memory_utilization: 0.15
 
 client:
-  max_tokens: 1024
+  max_tokens: 2048
   max_total_images: 28
   max_seq_length: 8192
   keep_recent_text_messages: 20
@@ -43,7 +43,7 @@ evaluation:
   rollout_batch_size: 4
   progress_every: 10
   enable_semantic_replay: true
-  semantic_replay_max_new_tokens: 1024
+  semantic_replay_max_new_tokens: 2048
 
 proposal:
   model_path: /abs/path/to/proposal_model

@@ -5,13 +5,13 @@
     "signature_schema_version": 1,
     "protocol_version": "seek_v5",
     "initial_observation_mode": "explicit_first_scan",
-    "main_rollout_terminal_mode": "finalize_case_only",
+    "main_rollout_terminal_mode": "finalize_case_or_auto_exhaustion",
     "verifier_contract": "next_tool_only",
     "teacher_role": "none",
     "max_turns": 12,
-    "policy_max_new_tokens": 1024,
-    "generator_revision": "2026-04-23-active-contract-v5",
-    "generator_fingerprint": "68369fa86849effdf8e64bc89a4497ecc9476738ef90acfec2a0b161cfd7bfd3"
+    "policy_max_new_tokens": 2048,
+    "generator_revision": "2026-04-26-auto-exhaustion-finalize-v1",
+    "generator_fingerprint": "10e82ed6c48be173e52d026258be8d51986ead9cdb6c3e6182f2954168a97802"
   },
   "initial_observation": {
     "mode": "explicit_first_scan",
@@ -42,10 +42,10 @@
     "include_splits": [
       "train"
     ],
-    "file_size": 5940152,
-    "mtime_ns": 1777092405182493926,
+    "file_size": 5951192,
+    "mtime_ns": 1777150582912222225,
     "num_records": 480,
-    "sha256": "064322cabc5d7dd4a465a310789cb68f0d366a7b8c03d7f4231631ec444ad66b",
+    "sha256": "90822cd454b5a376b1762a27f1276e2c82988018189cf8072a4e994873f4937b",
     "validation_mode": "hybrid"
   }
 }

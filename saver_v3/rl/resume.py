@@ -19,6 +19,36 @@ class RLTrainingResumeState:
         return asdict(self)
 
 
+def _deepspeed_checkpoint_missing_reasons(checkpoint_path: str | Path) -> list[str]:
+    resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
+    reasons: list[str] = []
+    latest_path = resolved_checkpoint / "latest"
+    if not latest_path.is_file():
+        reasons.append("missing DeepSpeed latest tag file")
+        return reasons
+    try:
+        latest_tag = latest_path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        reasons.append(f"failed to read DeepSpeed latest tag file: {exc}")
+        return reasons
+    if not latest_tag:
+        reasons.append("empty DeepSpeed latest tag file")
+        return reasons
+    tag_dir = resolved_checkpoint / latest_tag
+    if not tag_dir.is_dir():
+        reasons.append(f"missing DeepSpeed checkpoint tag directory: {latest_tag}")
+        return reasons
+    if not any(tag_dir.glob("*model_states.pt")):
+        reasons.append(f"missing DeepSpeed model state shards under {latest_tag}")
+    if not any(tag_dir.glob("*optim_states.pt")):
+        reasons.append(f"missing DeepSpeed optimizer state shards under {latest_tag}")
+    return reasons
+
+
+def is_deepspeed_trainer_checkpoint(checkpoint_path: str | Path) -> bool:
+    return not _deepspeed_checkpoint_missing_reasons(checkpoint_path)
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -37,6 +67,7 @@ def load_trainer_resume_state(
     checkpoint_path: str | Path,
     *,
     source: str = "",
+    require_deepspeed_checkpoint: bool = False,
 ) -> RLTrainingResumeState:
     resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
     trainer_state_path = resolved_checkpoint / "trainer_state.json"
@@ -44,6 +75,13 @@ def load_trainer_resume_state(
         raise FileNotFoundError(
             f"RL resume checkpoint is missing trainer_state.json: checkpoint={resolved_checkpoint}"
         )
+    if require_deepspeed_checkpoint:
+        missing_reasons = _deepspeed_checkpoint_missing_reasons(resolved_checkpoint)
+        if missing_reasons:
+            raise FileNotFoundError(
+                "RL resume checkpoint is not a complete DeepSpeed Trainer checkpoint: "
+                f"checkpoint={resolved_checkpoint}; issues={'; '.join(missing_reasons)}"
+            )
     payload = json.loads(trainer_state_path.read_text(encoding="utf-8"))
     epoch_value = max(0.0, _safe_float(payload.get("epoch"), 0.0))
     global_step = max(0, _safe_int(payload.get("global_step"), 0))
@@ -85,7 +123,11 @@ def _iter_root_checkpoint_candidates(rl_dir: Path) -> Iterable[tuple[str, Path]]
             yield ("root_checkpoint", checkpoint_dir.expanduser().resolve())
 
 
-def resolve_rl_training_resume_state(rl_dir: str | Path) -> Optional[RLTrainingResumeState]:
+def resolve_rl_training_resume_state(
+    rl_dir: str | Path,
+    *,
+    require_deepspeed_checkpoint: bool = True,
+) -> Optional[RLTrainingResumeState]:
     resolved_rl_dir = Path(rl_dir).expanduser().resolve()
     if not resolved_rl_dir.exists():
         return None
@@ -99,7 +141,11 @@ def resolve_rl_training_resume_state(rl_dir: str | Path) -> Optional[RLTrainingR
             continue
         seen.add(checkpoint_key)
         try:
-            candidate = load_trainer_resume_state(checkpoint_dir, source=source)
+            candidate = load_trainer_resume_state(
+                checkpoint_dir,
+                source=source,
+                require_deepspeed_checkpoint=bool(require_deepspeed_checkpoint),
+            )
         except Exception:
             continue
         if best_state is None:

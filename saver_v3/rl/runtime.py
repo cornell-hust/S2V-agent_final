@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 import train_saver_rl_trl as legacy_train_saver_rl_trl
+from split_utils import parse_include_splits
 
 from saver_v3.core.reward import (
     DEFAULT_RL_REWARD_VERSION,
@@ -40,6 +42,91 @@ REMOVED_ACTIVE_RL_CONFIG_FIELDS = {
 }
 
 ACTIVE_RL_USE_LIGER_LOSS = False
+DEFAULT_RL_ITERATION_BUDGET_MULTIPLIER = 1.5
+
+
+def _resolve_iteration_budget_multiplier(optimization: Mapping[str, Any]) -> float:
+    raw_value = optimization.get("iteration_budget_multiplier", DEFAULT_RL_ITERATION_BUDGET_MULTIPLIER)
+    resolved = float(raw_value if raw_value is not None else DEFAULT_RL_ITERATION_BUDGET_MULTIPLIER)
+    if resolved <= 0.0:
+        raise ValueError("optimization.iteration_budget_multiplier must be positive.")
+    return resolved
+
+
+def _resolve_counting_path(path_value: str, *, config_anchor: Path) -> Path:
+    text = str(path_value or "").strip()
+    if not text:
+        raise ValueError("Active RL requires a train manifest or materialized train items path to count iterations.")
+    raw_path = Path(text).expanduser()
+    candidates = [raw_path] if raw_path.is_absolute() else [config_anchor / raw_path, raw_path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(f"Active RL training record count source does not exist: {text}")
+
+
+def _jsonl_row_split(row: Mapping[str, Any]) -> str:
+    split = row.get("split")
+    if split:
+        return str(split).strip()
+    record = row.get("record")
+    if isinstance(record, Mapping):
+        return str(record.get("split") or "").strip()
+    return ""
+
+
+def _count_jsonl_records(path: Path, *, include_splits: str | Sequence[str] | None = None) -> int:
+    include_split_set = set(parse_include_splits(include_splits) or [])
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in active RL train data `{path}` line {line_number}.") from exc
+            if not isinstance(row, Mapping):
+                raise ValueError(f"Active RL train data `{path}` line {line_number} must be a JSON object.")
+            if include_split_set and _jsonl_row_split(row) not in include_split_set:
+                continue
+            count += 1
+    return int(count)
+
+
+def _resolve_active_rl_train_record_count(
+    *,
+    train_manifest: str,
+    materialized_train_items_path: str,
+    include_splits: str,
+    config_anchor: Path,
+) -> tuple[int, str]:
+    source_kind = "materialized_train_items_path" if str(materialized_train_items_path or "").strip() else "train_manifest"
+    source_value = materialized_train_items_path if source_kind == "materialized_train_items_path" else train_manifest
+    source_path = _resolve_counting_path(str(source_value or ""), config_anchor=config_anchor)
+    count = _count_jsonl_records(source_path, include_splits=include_splits)
+    if count <= 0:
+        raise ValueError(
+            "Active RL dynamic iteration budget found zero training records after include_splits filtering: "
+            f"source={source_kind} path={source_path} include_splits={include_splits!r}"
+        )
+    return int(count), f"{source_kind}:{source_path}"
+
+
+def _resolve_dynamic_num_iterations(
+    *,
+    train_record_count: int,
+    rollout_count: int,
+    iteration_budget_multiplier: float,
+) -> int:
+    if int(rollout_count) <= 0:
+        raise ValueError("optimization.rollout_count must be positive.")
+    if int(train_record_count) <= 0:
+        raise ValueError("Active RL train_record_count must be positive.")
+    return max(
+        1,
+        int(math.ceil((float(train_record_count) / float(rollout_count)) * float(iteration_budget_multiplier))),
+    )
 
 
 def _resolve_bool(mapping: Mapping[str, Any], key: str, default: bool) -> bool:
@@ -208,6 +295,10 @@ class RLJobConfig:
     rollout_eval_interval_iterations: int = 1
     final_rollout_eval: bool = False
     num_iterations: int = 1
+    num_iterations_source: str = "dynamic_train_record_count"
+    iteration_budget_multiplier: float = DEFAULT_RL_ITERATION_BUDGET_MULTIPLIER
+    train_record_count: int = 0
+    train_record_count_source: str = ""
     num_train_epochs: float = 1.0
     learning_rate: float = 5e-7
     per_device_train_batch_size: int = 1
@@ -299,6 +390,22 @@ class RLJobConfig:
         proposal_cfg = dict(config.get("proposal") or {})
         semantic_cfg = dict(rollout_config.get("semantic_metrics") or {})
         saver_config = saver_config_from_mapping(config)
+        train_manifest = str((data.get("train_manifest") or "")).strip()
+        materialized_train_items_path = str((data.get("materialized_train_items_path") or "")).strip()
+        include_splits = str((data.get("include_splits") or "")).strip()
+        rollout_count = int(optimization.get("rollout_count", 16) or 16)
+        iteration_budget_multiplier = _resolve_iteration_budget_multiplier(optimization)
+        train_record_count, train_record_count_source = _resolve_active_rl_train_record_count(
+            train_manifest=train_manifest,
+            materialized_train_items_path=materialized_train_items_path,
+            include_splits=include_splits,
+            config_anchor=config_anchor,
+        )
+        num_iterations = _resolve_dynamic_num_iterations(
+            train_record_count=train_record_count,
+            rollout_count=rollout_count,
+            iteration_budget_multiplier=iteration_budget_multiplier,
+        )
         explicit_reference_model = str(config.get("reference_model") or "").strip()
         if explicit_reference_model:
             raise ValueError(
@@ -344,14 +451,14 @@ class RLJobConfig:
         return cls(
             run_name=str(config.get("run_name") or "qwen3_vl_8b_grpo_ds8"),
             output_dir=str(config.get("output_dir") or "artifacts/rl/qwen3_vl_8b_grpo"),
-            train_manifest=str((data.get("train_manifest") or "")).strip(),
+            train_manifest=train_manifest,
             eval_manifest=str((data.get("eval_manifest") or "")).strip() or None,
-            materialized_train_items_path=str((data.get("materialized_train_items_path") or "")).strip(),
+            materialized_train_items_path=materialized_train_items_path,
             materialized_eval_items_path=str((data.get("materialized_eval_items_path") or "")).strip(),
             require_materialized_runtime_cache=bool(data.get("require_materialized_runtime_cache", False)),
             data_root=str((data.get("data_root") or "")).strip(),
             eval_data_root=str((data.get("eval_data_root") or data.get("data_root") or "")).strip(),
-            include_splits=str((data.get("include_splits") or "")).strip(),
+            include_splits=include_splits,
             eval_include_splits=str((data.get("eval_include_splits") or data.get("include_splits") or "")).strip(),
             policy_init_from=str(config.get("policy_init_from") or "").strip(),
             reference_model="",
@@ -373,7 +480,11 @@ class RLJobConfig:
             rollout_eval_start_iteration=int(logging_cfg.get("rollout_eval_start_iteration", 1) or 1),
             rollout_eval_interval_iterations=int(logging_cfg.get("rollout_eval_interval_iterations", 1) or 1),
             final_rollout_eval=_resolve_bool(logging_cfg, "final_rollout_eval", False),
-            num_iterations=int(optimization.get("num_iterations", optimization.get("num_updates", 1)) or 1),
+            num_iterations=num_iterations,
+            num_iterations_source="dynamic_train_record_count",
+            iteration_budget_multiplier=iteration_budget_multiplier,
+            train_record_count=train_record_count,
+            train_record_count_source=train_record_count_source,
             num_train_epochs=_resolve_active_rl_num_train_epochs(optimization),
             learning_rate=float(optimization.get("learning_rate", 5e-7) or 5e-7),
             per_device_train_batch_size=int(optimization.get("per_device_batch_size", optimization.get("per_device_train_batch_size", 1)) or 1),
@@ -403,7 +514,7 @@ class RLJobConfig:
             ),
             rl_steps_per_generation=int(optimization.get("rl_steps_per_generation", optimization.get("steps_per_generation", 4)) or 4),
             rollout_stage_batch_size=int(optimization.get("rollout_stage_batch_size", 16) or 16),
-            rollout_count=int(optimization.get("rollout_count", 16) or 16),
+            rollout_count=rollout_count,
             num_generations=int(optimization.get("num_generations", 8) or 8),
             rollout_max_turns=int(
                 optimization.get("rollout_max_turns", DEFAULT_ROLLOUT_MAX_TURNS) or DEFAULT_ROLLOUT_MAX_TURNS
@@ -444,7 +555,11 @@ class RLJobConfig:
             logging_steps=int(logging_cfg.get("logging_steps", logging_cfg.get("log_every_n_steps", 10)) or 10),
             save_steps=int(logging_cfg.get("save_steps", logging_cfg.get("save_every_n_steps", 100)) or 100),
             save_total_limit=int(logging_cfg.get("save_total_limit", 2) or 2),
-            save_only_model=_resolve_bool(logging_cfg, "save_only_model", False),
+            save_only_model=(
+                False
+                if resolved_deepspeed_config_path is not None
+                else _resolve_bool(logging_cfg, "save_only_model", False)
+            ),
             bf16=_resolve_bool(distributed, "bf16", True),
             fp16=_resolve_bool(distributed, "fp16", False),
             max_seq_length=int(((model_config.get("sequence") or {}).get("max_length", 8192)) or 8192),

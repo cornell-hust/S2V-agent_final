@@ -3612,9 +3612,9 @@ def compute_completion_only_token_log_probs_from_prepared_inputs(
         if parsed_temperature > 0.0:
             temperature_value = parsed_temperature
     shift_logits = shift_logits / float(temperature_value)
-    log_probs = F.log_softmax(shift_logits, dim=-1)
     safe_completion_ids = completion_ids.masked_fill(~response_mask, 0)
-    token_log_probs = torch.gather(log_probs, dim=-1, index=safe_completion_ids.unsqueeze(-1)).squeeze(-1)
+    target_logits = torch.gather(shift_logits, dim=-1, index=safe_completion_ids.unsqueeze(-1)).squeeze(-1)
+    token_log_probs = target_logits - torch.logsumexp(shift_logits, dim=-1)
     token_log_probs = token_log_probs.masked_fill(~response_mask, 0.0)
     return token_log_probs, response_mask
 

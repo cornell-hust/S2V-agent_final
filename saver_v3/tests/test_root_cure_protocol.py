@@ -254,6 +254,23 @@ def test_repeated_invalid_answer_terminates_as_invalid_retry_not_max_turns():
 
     assert result["terminated_reason"] == "max_invalid_retries"
     assert result["terminated_reason"] != "max_turns"
+    assert result["num_invalid_attempts"] == 2
+    assert result["final_answer"] == {"existence": "normal", "category": "normal"}
+    assert result["final_answer_source"] == "auto_finalize_max_invalid_retries"
+    assert result["auto_finalize_applied"] is True
+
+
+def test_max_turns_auto_finalizes_existing_state_claim():
+    runner = SaverRolloutRunner(max_turns=0, config=SaverAgentConfig())
+    initial_state = SaverEnvironmentState(last_claim={"existence": "anomaly", "category": "assault"})
+
+    result = runner.run_episode(_rollout_item(), ReplayPolicy([]), initial_state=initial_state)
+
+    assert result["terminated_reason"] == "max_turns"
+    assert result["final_answer"] == {"existence": "anomaly", "category": "assault"}
+    assert result["final_answer_source"] == "auto_finalize_max_turns"
+    assert result["auto_finalize_applied"] is True
+    assert result["auto_finalize_decision_source"] == "state_last_claim"
 
 
 def test_selected_window_resolution_only_auto_heals_single_candidate():

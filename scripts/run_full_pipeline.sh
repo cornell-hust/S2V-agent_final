@@ -27,6 +27,13 @@ skip()  { printf "${YELLOW}[SKIP]${RESET}  %s\n" "$*"; }
 ok()    { printf "${GREEN}[OK]${RESET}    %s\n" "$*"; }
 err()   { printf "${RED}[ERROR]${RESET} %s\n" "$*" >&2; }
 
+truthy_env() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|t|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 resolve_cuda_runtime_lib_dirs() {
   local conda_prefix="${CONDA_PREFIX:-}"
   local py_ver=""
@@ -441,6 +448,8 @@ cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
+source "${ROOT_DIR}/scripts/lib/cache_env.sh"
+setup_agenticvau_cache_env
 DATA_DIR="${DATA_DIR:-${ROOT_DIR}/data_utils}"
 MODEL_PATH="${MODEL_PATH:-${DATA_ROOT}/Wmh/MLLMs/qwen3-vl-8b-Instruct}"
 PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-${DATA_ROOT}/Wmh/MLLMs/siglip}"
@@ -456,6 +465,8 @@ MODEL_CONFIG="${MODEL_CONFIG:-${ROOT_DIR}/configs/model/qwen3_vl_8b_full.yaml}"
 ATTENTION_CONFIG="${ATTENTION_CONFIG:-${ROOT_DIR}/configs/model/attention_fa3_only.yaml}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
 RL_DEEPSPEED_CONFIG="${RL_DEEPSPEED_CONFIG:-${ROOT_DIR}/configs/deepspeed/zero3_full_model.json}"
+RL_DEEPSPEED_BIND_CORES_TO_RANK="${RL_DEEPSPEED_BIND_CORES_TO_RANK:-${DEEPSPEED_BIND_CORES_TO_RANK:-0}}"
+RL_DEEPSPEED_BIND_CORE_LIST="${RL_DEEPSPEED_BIND_CORE_LIST:-${DEEPSPEED_BIND_CORE_LIST:-}}"
 
 NNODES="${NNODES:-1}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -544,6 +555,8 @@ printf "  RL_CONFIG          = %s\n" "${RL_CONFIG}"
 printf "  ROLLOUT_CONFIG     = %s\n" "${ROLLOUT_CONFIG}"
 printf "  DEEPSPEED_CONFIG   = %s\n" "${DEEPSPEED_CONFIG}"
 printf "  RL_DEEPSPEED_CONFIG= %s\n" "${RL_DEEPSPEED_CONFIG}"
+printf "  RL_DS_BIND_CORES   = %s\n" "${RL_DEEPSPEED_BIND_CORES_TO_RANK}"
+printf "  RL_DS_CORE_LIST    = %s\n" "${RL_DEEPSPEED_BIND_CORE_LIST:-auto}"
 printf "  RL_PROPOSAL_DTYPE  = %s\n" "${RL_PROPOSAL_TORCH_DTYPE}"
 printf "  SFT_PREPARED_FILE      = %s\n" "${SFT_PREPARED_FILE}"
 printf "  TEACHER_PREPARED_FILE  = %s\n" "${TEACHER_PREPARED_FILE}"
@@ -1063,15 +1076,24 @@ else
     info "Resuming RL training from checkpoint ${RL_RESUME_CKPT} (next iteration=${RL_RESUME_ITERATION:-unknown})."
     RL_EXTRA_OVERRIDES+=(--override "resume_from_checkpoint=${RL_RESUME_CKPT}")
   elif [[ -d "${RL_DIR}" && -n "$(ls -A "${RL_DIR}" 2>/dev/null)" ]]; then
-    info "Removing stale/incomplete RL output at ${RL_DIR} before retraining."
-    rm -rf "${RL_DIR}"
-    mkdir -p "${RL_DIR}"
+    err "Existing RL output at ${RL_DIR} has no complete DeepSpeed-resumable checkpoint. Refusing to delete it automatically."
+    err "Move or clean this directory explicitly, or warm-start a new run from a loadable HF checkpoint if strict resume is not required."
+    exit 1
   fi
   info "Launching DeepSpeed RL training ..."
   export_rl_cuda_link_env
   info "Prebuilding DeepSpeed CPUAdam extension ..."
   prebuild_deepspeed_cpu_adam
+  RL_DEEPSPEED_LAUNCH_ARGS=()
+  if truthy_env "${RL_DEEPSPEED_BIND_CORES_TO_RANK}"; then
+    RL_DEEPSPEED_LAUNCH_ARGS+=(--bind_cores_to_rank)
+    if [[ -n "${RL_DEEPSPEED_BIND_CORE_LIST}" ]]; then
+      RL_DEEPSPEED_LAUNCH_ARGS+=(--bind_core_list "${RL_DEEPSPEED_BIND_CORE_LIST}")
+    fi
+    info "DeepSpeed RL CPU core binding enabled: core_list=${RL_DEEPSPEED_BIND_CORE_LIST:-auto}"
+  fi
   deepspeed \
+    "${RL_DEEPSPEED_LAUNCH_ARGS[@]}" \
     --num_nodes  "${NNODES}" \
     --num_gpus   "${NPROC_PER_NODE}" \
     --module saver_v3.cli.train_rl_ds \

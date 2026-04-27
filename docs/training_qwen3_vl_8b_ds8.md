@@ -22,6 +22,8 @@ This layer targets single-node 8 GPU full-model training for
 
 `train_rl_ds` launches the trajectory-level TRL + colocated-vLLM GRPO route. The active RL contract now requires materialized runtime item caches and only accepts message-only rollout supervision with `messages + assistant_supervision + advantage`. During generation, each scored rollout is immediately materialized into a final `episode_spec`; training then consumes only `episode_specs` and prepared batches, without an intermediate feature-layer contract. Episode-level completion-only tensors (`prompt_ids`, `prompt_mask`, `completion_ids`, `completion_mask`, `advantage`, `old_policy_token_log_probs`, multimodal inputs) are derived online from that unified schema. Replay-buffer flags, legacy empty-batch flags, and trace-only active RL payloads are removed and fail fast.
 
+Under ZeRO-3, active RL must preserve the same Qwen3-VL forward branch across all ranks for each prepared-batch position. If one rank has a visual payload at a position and another rank has a missing or text-only local batch, the nonvisual rank is replaced with a zero-loss visual no-op donor batch before compute loss. This keeps DeepSpeed parameter all-gather ordering consistent while preserving real training signal only from valid local visual samples.
+
 The active verification contract is `next_tool` only. Legacy `recommended_action` payloads and retired wrappers such as `training.py`, `rollout.py`, `saver_v3/sft_training.py`, and `saver_v3/common/training.py` are no longer valid entrypoints.
 
 ## Wrapper Commands
@@ -51,7 +53,7 @@ deepspeed \
 ## Template Decisions
 
 - `bf16` is the default dtype.
-- ZeRO-3 is the default optimizer strategy for the SFT full-model path in this layer; the active RL path uses `configs/deepspeed/zero2_rl.json`.
+- ZeRO-3 is the default optimizer strategy for the SFT full-model path and the active RL path; both use `configs/deepspeed/zero3_full_model.json` unless a memory-pressure fallback is explicitly selected.
 - `NPROC_PER_NODE` defaults to 8.
 - Full-model training means language, vision, and projector parameters stay trainable.
 - `flash_attention_3` is hard-required.

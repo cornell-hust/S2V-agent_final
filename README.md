@@ -56,12 +56,14 @@ PROPOSAL_PATH=/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/sigli
 
 `run_full_pipeline.sh` is the official v3 training entrypoint. It validates runtime caches, auto-resolves or rebuilds the base/teacher prepared SFT files, then runs **Stage 1c materialized cache resolution** to build/validate the offline SFT/runtime caches consumed by SFT, per-epoch rollout eval, and RL. It checks metadata against the active config plus source provenance, runs SFT with per-epoch rollout eval, then launches RL and final RL eval.
 
-The current RL path keeps the configured total `num_iterations` unchanged and saves checkpointed interruption points every configured rollout-eval interval. In the default config this is every 40 iterations. Each savepoint now includes:
+The current RL path derives total `num_iterations` from the effective training set as `ceil(filtered_train_record_count / rollout_count * 1.5)`, then saves checkpointed interruption points every configured rollout-eval interval. With the current 480-record train split and `rollout_count=8`, this resolves to 90 iterations. Each savepoint now includes:
 
 - a standard Trainer checkpoint with `trainer_state.json` for true training resume
 - a loadable HF authority checkpoint for rollout eval / inference
 
-Active continuous RL now treats `num_iterations` as the only user-configured update budget. Keep the internal trainer epoch count at `1.0`; do not add a separate RL `num_train_epochs` override in YAML.
+For DeepSpeed RL, `logging.save_only_model` must stay `false`: strict resume requires the Trainer/DeepSpeed checkpoint payload (`latest`, `global_step*`, model-state shards, and optimizer-state shards), not just HF `model-*.safetensors`. The pipeline now ignores HF-only checkpoint directories for automatic resume and refuses to delete an existing incomplete RL directory automatically when no DeepSpeed-resumable checkpoint is present.
+
+Active continuous RL treats `iteration_budget_multiplier` as the user-configured update-budget multiplier. Keep the internal trainer epoch count at `1.0`; do not add a separate RL `num_train_epochs` override in YAML, and do not hand-tune `optimization.num_iterations` for active RL.
 
 If `run_full_pipeline.sh` re-enters an incomplete RL directory and finds one of these valid savepoints, it resumes from the latest saved iteration instead of deleting the directory and restarting RL from scratch.
 
@@ -81,7 +83,17 @@ EXP_NAME=exp8 \
 TEACHER_JUDGE_MODEL_PATH=/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/Qwen3-VL-32B-Instruct \
 PROPOSAL_MODEL_PATH=/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip \
 bash scripts/run_full_pipeline.sh
+
+# RL memory-pressure fallback with DeepSpeed CPU core binding
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+EXP_NAME=exp8 \
+RL_DEEPSPEED_CONFIG=configs/deepspeed/zero3_offload_rl.json \
+RL_DEEPSPEED_BIND_CORES_TO_RANK=1 \
+RL_DEEPSPEED_BIND_CORE_LIST=0-95 \
+bash scripts/run_full_pipeline.sh
 ```
+
+`RL_DEEPSPEED_BIND_CORES_TO_RANK=1` forwards DeepSpeed's `--bind_cores_to_rank` into the RL launcher. `RL_DEEPSPEED_BIND_CORE_LIST` is optional; omit it to let DeepSpeed use its default visible CPU core range. The full pipeline also accepts `DEEPSPEED_BIND_CORES_TO_RANK` / `DEEPSPEED_BIND_CORE_LIST` as aliases for the RL launch, and the standalone RL launcher accepts the same names directly.
 
 `run_full_pipeline.sh` now defaults to the teacher-prepared SFT branch. Unless you explicitly set `USE_TEACHER_PREPARED=0`, the pipeline uses `sft_train.teacher_rollout_primary.compact_trace_v5.jsonl`, pairs it with `sft_train.compact_trace_v5.teacher_materialized_messages_v5.jsonl`, and auto-resolves or auto-regenerates both with the default teacher model path `${DATA_ROOT}/Wmh/MLLMs/Qwen3-VL-32B-Instruct`. It validates both base prepared and teacher prepared files against the active `initial_observation/prompt/rollout_trace` config and their recorded `source_runtime` / `source_prepared` provenance. In `explicit_first_scan` mode, preview-only settings are no longer treated as cache semantics for the SEEK mainline. Any stale or mismatched file is rebuilt before training.
 
@@ -115,6 +127,8 @@ The official v3 file roles are:
 - `msad_saver_runtime_train.materialized_items_v5.jsonl`: offline `materialized_runtime_items_v5` cache used by RL train
 - `msad_saver_runtime_test.materialized_items_v5.jsonl`: offline `materialized_runtime_items_v5` cache used by SFT rollout eval and RL eval
 - `*.frame_cache` / `*.feature_cache`: required caches for SFT, RL, and rollout evaluation whenever `seek_evidence` is present
+
+Runtime package caches are separate from data caches. The official SFT, RL, rollout-eval, and full-pipeline scripts source `scripts/lib/cache_env.sh`, which redirects vLLM, Torch Inductor, Triton, HuggingFace, pip, and torch-extension caches to `${SAVER_V3_DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}/cache/agenticvau` instead of `/root/.cache`.
 
 #### 1a. Convert canonical annotations to runtime train/test JSONL
 

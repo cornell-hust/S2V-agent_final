@@ -188,22 +188,21 @@ def test_completion_only_helper_allows_non_finite_output_logits():
     assert torch.isnan(token_log_probs).any()
 
 
-def test_completion_only_helper_does_not_fail_fast_on_non_finite_log_probs(monkeypatch: pytest.MonkeyPatch):
+def test_completion_only_helper_avoids_full_vocab_log_softmax(monkeypatch: pytest.MonkeyPatch):
     class _FakeModel(torch.nn.Module):
         def forward(self, input_ids=None, attention_mask=None, logits_to_keep=None, **kwargs):
             del attention_mask, logits_to_keep, kwargs
             batch_size, seq_len = input_ids.shape
-            logits = torch.zeros((batch_size, seq_len, 8), dtype=torch.float32)
+            logits = torch.arange(batch_size * seq_len * 8, dtype=torch.float32).view(batch_size, seq_len, 8)
             return SimpleNamespace(logits=logits)
 
     original_log_softmax = training_mod.F.log_softmax
 
-    def _fake_log_softmax(*args, **kwargs):
-        result = original_log_softmax(*args, **kwargs)
-        result[..., 3] = float("nan")
-        return result
+    def _fail_log_softmax(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("completion-only helper should not materialize full-vocab log_softmax")
 
-    monkeypatch.setattr(training_mod.F, "log_softmax", _fake_log_softmax)
+    monkeypatch.setattr(training_mod.F, "log_softmax", _fail_log_softmax)
 
     token_log_probs, response_mask = env_mod.compute_completion_only_token_log_probs_from_ids(
         model=_FakeModel(),
@@ -214,8 +213,16 @@ def test_completion_only_helper_does_not_fail_fast_on_non_finite_log_probs(monke
         multimodal_inputs=None,
     )
 
+    full_logits = torch.arange(1 * 5 * 8, dtype=torch.float32).view(1, 5, 8)
+    expected_shift_logits = full_logits[:, -4:, :][:, :-1, :]
+    expected_log_probs = original_log_softmax(expected_shift_logits, dim=-1)
+    expected = torch.gather(
+        expected_log_probs,
+        dim=-1,
+        index=torch.tensor([[3, 4, 5]], dtype=torch.long).unsqueeze(-1),
+    ).squeeze(-1)
     assert response_mask.dtype == torch.bool
-    assert torch.isnan(token_log_probs[:, 0]).all()
+    torch.testing.assert_close(token_log_probs, expected)
 
 
 def test_grad_probe_logs_only_on_true_rank_zero(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
@@ -746,3 +753,83 @@ def test_pad_prepared_batches_to_distributed_max_uses_symmetric_donor_gather(mon
     assert "ddp_noop_padded_prepared_batches" not in runtime_stats
     assert runtime_stats["distributed_min_prepared_batch_count"] == 1
     assert runtime_stats["distributed_max_prepared_batch_count"] == 2
+
+
+def test_pad_prepared_batches_replaces_nonvisual_local_batch_with_visual_noop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    trainer = object.__new__(env_mod._NativeGRPOTrainerMixin)
+    trainer._native_visual_tensor_dtype = None
+    trainer._nonvisual_prepared_batch_noop_replacements = 0
+    for method_name in (
+        "_reserved_episode_spec_keys",
+        "_is_visual_multimodal_tensor_key",
+        "_move_multimodal_payload_to_device",
+        "_move_episode_spec_to_device",
+        "_prepared_batch_sample_count",
+        "_clone_prepared_batch_as_noop",
+        "_prepared_batch_cpu_copy",
+        "_pad_prepared_batches_to_distributed_max",
+    ):
+        setattr(
+            trainer,
+            method_name,
+            getattr(env_mod._NativeGRPOTrainerMixin, method_name).__get__(trainer, env_mod._NativeGRPOTrainerMixin),
+        )
+
+    local_text_only_batch = {
+        "prompt_ids": torch.tensor([[11, 12]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[21, 22]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+        "sample_weight": torch.ones(1, dtype=torch.float32),
+        "advantage": torch.ones(1, dtype=torch.float32),
+        "sample_loss_multiplier": torch.ones(1, dtype=torch.float32),
+        "multimodal_inputs": {},
+    }
+    donor_visual_batch = {
+        "prompt_ids": torch.tensor([[31, 32, 33]], dtype=torch.long),
+        "prompt_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+        "completion_ids": torch.tensor([[41, 42, 43, 44]], dtype=torch.long),
+        "completion_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.bool),
+        "sample_weight": torch.ones(1, dtype=torch.float32),
+        "advantage": torch.full((1,), 2.0, dtype=torch.float32),
+        "sample_loss_multiplier": torch.ones(1, dtype=torch.float32),
+        "multimodal_inputs": {
+            "pixel_values": torch.ones((4, 8), dtype=torch.bfloat16),
+            "image_grid_thw": torch.ones((1, 3), dtype=torch.int64),
+        },
+    }
+
+    monkeypatch.setattr(env_mod, "_distributed_max_int", lambda local_value, device: 1)
+    monkeypatch.setattr(env_mod, "_distributed_min_int", lambda local_value, device: 1)
+    monkeypatch.setattr(env_mod, "_distributed_bool_consensus", lambda local_value, device: (False, True))
+    monkeypatch.setattr(
+        env_mod,
+        "_distributed_first_available_object",
+        lambda local_object, device=None: donor_visual_batch if local_object is None else local_object,
+    )
+
+    runtime_stats = {}
+    padded = trainer._pad_prepared_batches_to_distributed_max(
+        [local_text_only_batch],
+        device=torch.device("cpu"),
+        runtime_stats=runtime_stats,
+    )
+
+    assert len(padded) == 1
+    assert runtime_stats["ddp_noop_replaced_nonvisual_prepared_batches"] == 1
+    assert trainer._nonvisual_prepared_batch_noop_replacements == 1
+    assert "pixel_values" in padded[0]["multimodal_inputs"]
+    assert torch.equal(
+        padded[0]["sample_loss_multiplier"],
+        torch.zeros_like(donor_visual_batch["sample_loss_multiplier"], dtype=torch.float32),
+    )
+    assert torch.equal(
+        padded[0]["sample_weight"],
+        torch.zeros_like(donor_visual_batch["sample_weight"], dtype=torch.float32),
+    )
+    assert torch.equal(
+        padded[0]["advantage"],
+        torch.zeros_like(donor_visual_batch["advantage"], dtype=torch.float32),
+    )

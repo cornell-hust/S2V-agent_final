@@ -29,6 +29,20 @@ from saver_v3.rl.runtime import RLJobConfig, build_active_rl_trl_argv
 from saver_v3.sft import training as sft_training_mod
 
 
+def _write_train_manifest(tmp_path: Path, *, count: int = 1, split: str = "train") -> Path:
+    path = tmp_path / "train.jsonl"
+    rows = [
+        {
+            "video_id": f"video-{index}",
+            "video_path": f"/data/video-{index}.mp4",
+            "split": split,
+        }
+        for index in range(int(count))
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    return path
+
+
 def test_build_rollout_eval_config_inherits_semantic_settings(tmp_path: Path):
     parser = build_active_rl_arg_parser(description="test parser")
     args = parser.parse_args(
@@ -81,6 +95,7 @@ def test_rl_job_runtime_forwards_rollout_semantic_settings(tmp_path: Path):
         ),
         encoding="utf-8",
     )
+    train_manifest_path = _write_train_manifest(tmp_path)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "\n".join(
@@ -91,7 +106,7 @@ def test_rl_job_runtime_forwards_rollout_semantic_settings(tmp_path: Path):
                 "policy_init_from: /models/checkpoint",
                 "rollout_backend: vllm",
                 "data:",
-                "  train_manifest: /data/train.jsonl",
+                f"  train_manifest: {train_manifest_path}",
                 "  eval_manifest: /data/eval.jsonl",
                 "  data_root: /data",
                 "rewards:",
@@ -139,6 +154,7 @@ def test_rl_job_runtime_forwards_rollout_semantic_settings(tmp_path: Path):
 def test_rl_job_runtime_uses_throughput_oriented_dataloader_defaults(tmp_path: Path):
     rollout_config_path = tmp_path / "rollout.yaml"
     rollout_config_path.write_text("semantic_metrics:\n  enabled: false\n", encoding="utf-8")
+    train_manifest_path = _write_train_manifest(tmp_path)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "\n".join(
@@ -149,7 +165,7 @@ def test_rl_job_runtime_uses_throughput_oriented_dataloader_defaults(tmp_path: P
                 "policy_init_from: /models/checkpoint",
                 "rollout_backend: vllm",
                 "data:",
-                "  train_manifest: /data/train.jsonl",
+                f"  train_manifest: {train_manifest_path}",
                 "  eval_manifest: /data/eval.jsonl",
                 "  data_root: /data",
                 "rewards:",

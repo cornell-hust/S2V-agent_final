@@ -6,6 +6,13 @@ from dataclasses import asdict
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from saver_v3.core.adapter import TimeSearchRolloutAdapter
+from saver_v3.core.categories import (
+    CANONICAL_ANOMALY_CATEGORIES,
+    CANONICAL_POLICY_CATEGORIES,
+    NORMAL_CATEGORY,
+    canonicalize_saver_category,
+    normalize_existence,
+)
 from saver_v3.core.initial_observation import is_initial_global_scan_message
 from saver_v3.data.config import DEFAULT_ROLLOUT_MAX_TURNS, RolloutTraceConfig, SaverAgentConfig
 from saver_v3.core.environment import SaverVideoInteraction, parse_actions_and_contents
@@ -17,6 +24,7 @@ from saver_v3.core.semantic_answer import (
 from saver_v3.core.schema import SaverEnvironmentState
 from saver_v3.core.self_verification import parse_self_verification_payload
 from saver_v3.core.self_verification import coerce_self_verification_claim_payload
+from saver_v3.core.tools import _resolve_finalized_moment_ids_from_state
 
 
 PolicyFn = Callable[[List[Dict[str, Any]], Dict[str, Any], SaverEnvironmentState, int], str]
@@ -382,13 +390,161 @@ class SaverRolloutRunner:
             "semantic_answer_text": None,
             "semantic_answer_source": None,
             "final_answer_source": None,
+            "auto_finalize_applied": False,
+            "auto_finalize_reason": None,
+            "auto_finalize_decision_source": None,
             "terminated_reason": "max_turns",
             "terminated_at_step": self.max_turns,
             "formal_step_index": 0,
             "total_attempts": 0,
-            "max_total_attempts": max(self.max_turns * 4, self.max_turns),
+            "max_total_attempts": max(self.max_turns * 2, self.max_turns),
             "done": False,
         }
+
+    @staticmethod
+    def _latest_verification_payload(state: SaverEnvironmentState) -> Dict[str, Any]:
+        if not state.verification_records:
+            return {}
+        latest = state.verification_records[-1]
+        return dict(latest or {}) if isinstance(latest, dict) else {}
+
+    @staticmethod
+    def _dedupe_nonempty_strings(values: Iterable[Any]) -> List[str]:
+        if isinstance(values, (str, bytes)):
+            values = [values]
+        result: List[str] = []
+        seen = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _infer_auto_finalize_category_from_trace(self, context: Dict[str, Any]) -> str:
+        text_parts: List[str] = []
+        for turn in list(context.get("turns") or [])[-6:]:
+            parsed_tool_call = turn.get("parsed_tool_call")
+            if isinstance(parsed_tool_call, dict):
+                arguments = parsed_tool_call.get("arguments")
+                if isinstance(arguments, dict):
+                    text_parts.extend(
+                        str(arguments.get(key) or "")
+                        for key in ("category", "query", "role")
+                    )
+            text_parts.extend(
+                str(turn.get(key) or "")
+                for key in ("proposal_query_raw", "proposal_query_normalized", "tool_observation_summary")
+            )
+        state = context.get("state")
+        if isinstance(state, SaverEnvironmentState):
+            for entry in list(state.evidence_ledger or [])[-6:]:
+                text_parts.extend(
+                    str(entry.get(key) or "")
+                    for key in ("category", "query", "query_normalized", "role", "search_anchor")
+                )
+        category = canonicalize_saver_category(" ".join(text_parts), existence="anomaly")
+        if category in CANONICAL_ANOMALY_CATEGORIES:
+            return category
+        return ""
+
+    def _build_auto_finalize_decision(self, context: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+        state = context["state"]
+        latest_verification = self._latest_verification_payload(state)
+        decision_source = "default_normal"
+        decision: Dict[str, Any] = {}
+        for source_name, payload in (
+            ("latest_verification_claim", latest_verification.get("claim")),
+            ("state_last_claim", state.last_claim),
+        ):
+            normalized = coerce_self_verification_claim_payload(payload)
+            if normalized.get("existence") or normalized.get("category"):
+                decision = dict(normalized)
+                decision_source = source_name
+                break
+
+        existence = normalize_existence(decision.get("existence"))
+        category = canonicalize_saver_category(decision.get("category"), existence=existence)
+        if category not in CANONICAL_POLICY_CATEGORIES:
+            category = ""
+        if not existence:
+            if category and category != NORMAL_CATEGORY:
+                existence = "anomaly"
+            else:
+                existence = "normal"
+                category = NORMAL_CATEGORY
+        if existence == "normal":
+            category = NORMAL_CATEGORY
+        elif existence == "anomaly" and not category:
+            category = self._infer_auto_finalize_category_from_trace(context)
+            if not category:
+                decision_source = f"{decision_source}:missing_anomaly_category"
+
+        finalized: Dict[str, Any] = {"existence": existence}
+        if category:
+            finalized["category"] = category
+
+        for source_key, output_key in (
+            ("verified_window_ids", "verified_window_ids"),
+            ("best_effort_window_ids", "best_effort_window_ids"),
+            ("selected_window_ids", "selected_window_ids"),
+            ("selected_evidence_ids", "selected_evidence_ids"),
+            ("selected_evidence_moment_ids", "evidence_moment_ids"),
+            ("covered_stages", "covered_stages"),
+            ("missing_required_stages", "missing_required_stages"),
+        ):
+            values = self._dedupe_nonempty_strings(latest_verification.get(source_key) or [])
+            if values:
+                finalized[output_key] = values
+        if isinstance(latest_verification.get("stage_selected_moment_ids"), dict):
+            stage_selected = {
+                str(stage): self._dedupe_nonempty_strings(moment_ids or [])
+                for stage, moment_ids in dict(latest_verification.get("stage_selected_moment_ids") or {}).items()
+            }
+            stage_selected = {stage: moment_ids for stage, moment_ids in stage_selected.items() if moment_ids}
+            if stage_selected:
+                finalized["stage_selected_moment_ids"] = stage_selected
+
+        try:
+            moment_ids, stage_selected = _resolve_finalized_moment_ids_from_state(
+                decision_arguments=finalized,
+                multimodal_cache=context["multimodal_cache"],
+                state=state,
+            )
+        except Exception:
+            moment_ids, stage_selected = [], {}
+        if moment_ids:
+            finalized["evidence_moment_ids"] = list(moment_ids)
+        if stage_selected:
+            finalized["stage_selected_moment_ids"] = {
+                stage: list(moment_ids) for stage, moment_ids in stage_selected.items()
+            }
+            finalized["covered_stages"] = [stage for stage, moment_ids in stage_selected.items() if moment_ids]
+
+        return finalized, decision_source
+
+    def _auto_finalize_exhausted_context(
+        self,
+        context: Dict[str, Any],
+        *,
+        reason: str,
+        terminated_at_step: int,
+    ) -> None:
+        if isinstance(context.get("final_answer"), dict):
+            context["done"] = True
+            return
+        decision, decision_source = self._build_auto_finalize_decision(context)
+        context["final_answer"] = decision
+        context["final_answer_text"] = json.dumps(decision, ensure_ascii=False)
+        context["final_answer_source"] = f"auto_finalize_{reason}"
+        context["auto_finalize_applied"] = True
+        context["auto_finalize_reason"] = reason
+        context["auto_finalize_decision_source"] = decision_source
+        context["terminated_reason"] = reason
+        context["terminated_at_step"] = int(terminated_at_step)
+        context["state"].finalized_case = copy.deepcopy(decision)
+        context["done"] = True
 
     @staticmethod
     def _policy_batch_generate(
@@ -433,6 +589,9 @@ class SaverRolloutRunner:
             "semantic_answer_text": context["semantic_answer_text"],
             "semantic_answer_source": context["semantic_answer_source"],
             "final_answer_source": context["final_answer_source"],
+            "auto_finalize_applied": bool(context.get("auto_finalize_applied")),
+            "auto_finalize_reason": context.get("auto_finalize_reason"),
+            "auto_finalize_decision_source": context.get("auto_finalize_decision_source"),
             "turns": turns,
             "invalid_attempts": context["invalid_attempts"],
             "state": asdict(context["state"]),
@@ -444,6 +603,9 @@ class SaverRolloutRunner:
                 "terminated_at_step": context["terminated_at_step"] if turns else 0,
                 "final_answer_present": context["final_answer"] is not None,
                 "final_answer_source": context["final_answer_source"],
+                "auto_finalize_applied": bool(context.get("auto_finalize_applied")),
+                "auto_finalize_reason": context.get("auto_finalize_reason"),
+                "auto_finalize_decision_source": context.get("auto_finalize_decision_source"),
                 "semantic_answer_present": context["semantic_answer"] is not None,
                 "latest_verifier_status": self._latest_verifier_status(turns),
                 "verification_turn_count": self._verification_turn_count(turns),
@@ -518,14 +680,23 @@ class SaverRolloutRunner:
             ready_contexts: List[Dict[str, Any]] = []
             has_pending_work = False
             for context in episode_contexts:
-                if context["done"] or int(context["formal_step_index"]) >= self.max_turns:
+                if context["done"]:
+                    continue
+                if int(context["formal_step_index"]) >= self.max_turns:
+                    self._auto_finalize_exhausted_context(
+                        context,
+                        reason="max_turns",
+                        terminated_at_step=int(context["formal_step_index"]),
+                    )
                     continue
                 has_pending_work = True
                 context["total_attempts"] += 1
                 if int(context["total_attempts"]) > int(context["max_total_attempts"]):
-                    context["terminated_reason"] = "max_invalid_retries"
-                    context["terminated_at_step"] = int(context["formal_step_index"])
-                    context["done"] = True
+                    self._auto_finalize_exhausted_context(
+                        context,
+                        reason="max_invalid_retries",
+                        terminated_at_step=int(context["formal_step_index"]),
+                    )
                     continue
                 context["_step_index"] = int(context["formal_step_index"]) + 1
                 context["_prompt_messages_before_action"] = (

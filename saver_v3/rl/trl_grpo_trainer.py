@@ -69,8 +69,7 @@ def _save_loadable_hf_authority_checkpoint(
     runtime: Any,
 ) -> Path:
     checkpoint_root = Path(checkpoint_root)
-    loadable_dir = checkpoint_root / "authority_hf" / f"epoch_{int(epoch_index):03d}"
-    loadable_dir.mkdir(parents=True, exist_ok=True)
+    loadable_dir = checkpoint_root
     accelerator = getattr(trainer, "accelerator", None)
     wrapped_model = getattr(trainer, "model_wrapped", None) or getattr(trainer, "model", None)
     if accelerator is None or wrapped_model is None:
@@ -94,6 +93,7 @@ def _save_loadable_hf_authority_checkpoint(
         main_process_only=False,
     )
     if runtime.is_main_process:
+        loadable_dir.mkdir(parents=True, exist_ok=True)
         model_to_save.save_pretrained(str(loadable_dir), state_dict=state_dict)
         if hasattr(processor, "save_pretrained"):
             processor.save_pretrained(str(loadable_dir))
@@ -103,6 +103,7 @@ def _save_loadable_hf_authority_checkpoint(
                 "epoch_index": int(epoch_index),
                 "checkpoint_kind": "rl_loadable_authority_hf",
                 "checkpoint_root": str(checkpoint_root),
+                "authority_checkpoint": str(loadable_dir),
             },
         )
     del state_dict
@@ -132,8 +133,10 @@ class _VllmServerRuntime(shared_vllm_generation._VllmServerRuntime):
         self.settings = build_vllm_runtime_settings(args)
         self.enabled = bool(self.settings["use_vllm"])
         self.base_model_path = _resolve_vllm_base_model_path(model_path)
+        self.mode = "server"
         self.client: Any = None
         self._last_loaded_step: Optional[int] = None
+        self.weights_synced_step: Optional[int] = None
         if not self.enabled:
             return
         if self.settings["vllm_mode"] != "server":
@@ -154,12 +157,15 @@ def create_vllm_runtime(
     args: Any,
     runtime: Any,
     model_path: str | Path,
+    require_weight_sync: bool = False,
 ) -> Any:
     settings = build_vllm_runtime_settings(args)
     if not bool(settings["use_vllm"]):
         return None
     if settings["vllm_mode"] == "server":
-        return _VllmServerRuntime(args=args, runtime=runtime, model_path=model_path)
+        runtime_impl = _VllmServerRuntime(args=args, runtime=runtime, model_path=model_path)
+        _validate_vllm_runtime_supports_weight_sync(runtime_impl, require_weight_sync=bool(require_weight_sync))
+        return runtime_impl
     if settings["vllm_mode"] == "colocate":
         preferred_max_num_seqs = max(1, int(getattr(args, "vllm_max_num_seqs", 4) or 4))
         fallback_max_num_seqs = max(1, int(getattr(args, "vllm_fallback_max_num_seqs", 2) or 2))
@@ -176,12 +182,17 @@ def create_vllm_runtime(
                     runtime=runtime,
                     main_process_only=False,
                 )
-                return shared_vllm_generation.create_vllm_runtime(
+                runtime_impl = shared_vllm_generation.create_vllm_runtime(
                     args=candidate_args,
                     runtime=runtime,
                     model_path=model_path,
                     prefer_direct_local_rank_runtime=True,
                 )
+                _validate_vllm_runtime_supports_weight_sync(
+                    runtime_impl,
+                    require_weight_sync=bool(require_weight_sync),
+                )
+                return runtime_impl
             except Exception as exc:
                 last_exc = exc
                 if candidate == preferred_max_num_seqs and candidate != fallback_max_num_seqs and _is_vllm_init_oom_error(exc):
@@ -196,6 +207,17 @@ def create_vllm_runtime(
             raise last_exc
         raise RuntimeError("Unable to initialize RL vLLM runtime")
     raise ValueError(f"Unsupported vLLM mode: {settings['vllm_mode']}")
+
+
+def _validate_vllm_runtime_supports_weight_sync(runtime_impl: Any, *, require_weight_sync: bool) -> None:
+    if not bool(require_weight_sync) or runtime_impl is None:
+        return
+    if getattr(runtime_impl, "supports_weight_sync", True) is False:
+        raise RuntimeError(
+            f"RL vLLM runtime {type(runtime_impl).__name__} does not support online weight sync. "
+            "Set vllm_mode/server with weight update support or use colocate runtime without the "
+            "direct external-launcher shortcut."
+        )
 
 
 class VllmQwenGenerationPolicy(shared_vllm_generation.VllmQwenGenerationPolicy):
@@ -291,8 +313,9 @@ def _build_vllm_trainer_class_transform(
                     judge.attach_local_vllm(engine)
 
             def _build_policy(self, model: Any, *, use_generation_cache: bool) -> QwenGenerationPolicy:
+                runtime_impl = getattr(self, "_vllm_runtime", vllm_runtime)
                 policy = VllmQwenGenerationPolicy(
-                    runtime=vllm_runtime,
+                    runtime=runtime_impl,
                     source_model=_unwrap_model(model),
                     step_resolver=lambda: int(getattr(getattr(self, "state", None), "global_step", 0) or 0),
                     guided_decoding_regex=str(getattr(args, "vllm_guided_decoding_regex", "") or ""),
@@ -410,8 +433,154 @@ def _rollout_eval_iteration_dir_name(iteration_index: int) -> str:
     return f"rl_iter_{int(iteration_index) + 1:03d}"
 
 
+def _runtime_synced_step(runtime_impl: Any) -> Optional[int]:
+    if runtime_impl is None:
+        return None
+    for attr_name in ("weights_synced_step", "_last_loaded_step"):
+        value = getattr(runtime_impl, attr_name, None)
+        if value not in (None, ""):
+            return int(value)
+    return None
+
+
+def _sync_inline_vllm_policy_for_eval(policy: Any, *, state: Any) -> Optional[int]:
+    runtime_impl = getattr(policy, "vllm_runtime", None)
+    source_model = getattr(policy, "source_model", None)
+    if runtime_impl is None:
+        return None
+    if source_model is None:
+        return _runtime_synced_step(runtime_impl)
+    if getattr(runtime_impl, "supports_weight_sync", True) is False:
+        raise RuntimeError(
+            f"Inline RL eval policy uses {type(runtime_impl).__name__}, which cannot sync online weights."
+        )
+    step_value = int(getattr(state, "global_step", 0) or 0)
+    runtime_impl.ensure_weights_synced(source_model, global_step=step_value)
+    return _runtime_synced_step(runtime_impl)
+
+
+def _annotate_rollout_eval_vllm_provenance(
+    rollout_eval_config: Any,
+    *,
+    current_model_path: str | Path,
+    loadable_authority_checkpoint: str | Path = "",
+    policy: Any = None,
+    vllm_runtime: Any = None,
+    weights_synced_step: Optional[int] = None,
+) -> None:
+    runtime_impl = vllm_runtime or getattr(policy, "vllm_runtime", None)
+    setattr(rollout_eval_config, "current_model_path", str(current_model_path or ""))
+    setattr(rollout_eval_config, "loadable_authority_checkpoint", str(loadable_authority_checkpoint or ""))
+    if runtime_impl is None:
+        setattr(rollout_eval_config, "runtime_type", type(policy).__name__ if policy is not None else "")
+        return
+    runtime_type = type(runtime_impl).__name__
+    setattr(rollout_eval_config, "runtime_type", runtime_type)
+    setattr(rollout_eval_config, "vllm_runtime_type", runtime_type)
+    setattr(rollout_eval_config, "vllm_runtime_base_model_path", str(getattr(runtime_impl, "base_model_path", "") or ""))
+    setattr(
+        rollout_eval_config,
+        "vllm_runtime_supports_weight_sync",
+        bool(getattr(runtime_impl, "supports_weight_sync", False)),
+    )
+    synced_step = weights_synced_step
+    if synced_step is None:
+        synced_step = _runtime_synced_step(runtime_impl)
+    setattr(rollout_eval_config, "weights_synced_step", synced_step)
+
+
+def _release_inline_eval_cuda_cache() -> None:
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+    if callable(ipc_collect):
+        try:
+            ipc_collect()
+        except Exception:
+            pass
+
+
+def _detach_trainer_reward_judge_vllm(trainer: Any) -> None:
+    if trainer is None:
+        return
+    judge = getattr(trainer, "reward_judge", None)
+    if judge is None:
+        return
+    attach_fn = getattr(judge, "attach_local_vllm", None)
+    if callable(attach_fn):
+        attach_fn(None)
+        return
+    if hasattr(judge, "_local_vllm_engine"):
+        setattr(judge, "_local_vllm_engine", None)
+
+
+def _cleanup_inline_rollout_eval_policy(policy: Any) -> None:
+    if policy is None:
+        _release_inline_eval_cuda_cache()
+        return
+    for attr_name, value in (
+        ("_prepared_messages_cache", []),
+        ("_prepared_messages_cache_signatures", []),
+        ("_prepared_messages_cache_source_id", None),
+        ("_prepared_messages_cache_len", 0),
+        ("_last_rl_token_traces", None),
+        ("vllm_runtime", None),
+        ("source_model", None),
+        ("model", None),
+    ):
+        if hasattr(policy, attr_name):
+            try:
+                setattr(policy, attr_name, value)
+            except Exception:
+                pass
+    _release_inline_eval_cuda_cache()
+
+
 def _resolve_standard_trainer_checkpoint_path(output_dir: str | Path, global_step: int) -> Path:
     return Path(output_dir) / f"checkpoint-{int(global_step)}"
+
+
+def _has_loadable_hf_checkpoint_files(model_dir: str | Path) -> bool:
+    path = Path(model_dir)
+    if not path.is_dir():
+        return False
+    if not (path / "config.json").is_file():
+        return False
+    tokenizer_sentinels = (
+        "tokenizer.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+    )
+    return any((path / sentinel).is_file() for sentinel in tokenizer_sentinels)
+
+
+def _resolve_resume_loadable_model_path(resume_state: RLTrainingResumeState) -> Path:
+    checkpoint_root = Path(resume_state.checkpoint_path).expanduser().resolve()
+    if _has_loadable_hf_checkpoint_files(checkpoint_root):
+        return checkpoint_root
+
+    authority_metadata_path = checkpoint_root / "checkpoint_authority.json"
+    if authority_metadata_path.is_file():
+        try:
+            payload = json.loads(authority_metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            raw_authority_checkpoint = str(payload.get("authority_checkpoint") or "").strip()
+            if raw_authority_checkpoint:
+                candidate = Path(raw_authority_checkpoint).expanduser().resolve()
+                if _has_loadable_hf_checkpoint_files(candidate):
+                    return candidate
+
+    candidate = checkpoint_root / "authority_hf" / f"epoch_{int(resume_state.resume_iteration):03d}"
+    if _has_loadable_hf_checkpoint_files(candidate):
+        return candidate
+    return checkpoint_root
 
 
 def _sample_iteration_items(
@@ -462,7 +631,6 @@ def _build_continuous_iteration_callback(
 ) -> Any:
     try:
         from transformers import TrainerCallback
-        from transformers.trainer_utils import get_last_checkpoint
     except Exception as exc:
         raise ImportError("Continuous RL iteration callback requires transformers.") from exc
 
@@ -555,14 +723,9 @@ def _build_continuous_iteration_callback(
             iteration_index = self._iteration_from_epoch_end(state)
             if not self._should_trigger_checkpoint(int(iteration_index)):
                 return
-            checkpoint = get_last_checkpoint(args.output_dir)
-            checkpoint_path = (
-                Path(checkpoint)
-                if checkpoint
-                else _resolve_standard_trainer_checkpoint_path(
-                    args.output_dir,
-                    int(getattr(state, "global_step", 0) or 0),
-                )
+            checkpoint_path = _resolve_standard_trainer_checkpoint_path(
+                args.output_dir,
+                int(getattr(state, "global_step", 0) or 0),
             )
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
@@ -634,42 +797,61 @@ def _build_continuous_iteration_callback(
                 config=self.owner.config_builder(self.owner.args),
             )
             if bool(getattr(rollout_eval_config, "inline_rollout_eval", False)):
-                eval_model = _unwrap_model(model)
-                if callable(self.owner.inline_policy_factory):
-                    policy = self.owner.inline_policy_factory(
-                        eval_model=eval_model,
-                        processor=self.processor,
+                if self.owner.persistent_vllm_runtime is not None:
+                    self.owner._attach_persistent_vllm_runtime(
+                        model_path=loadable_authority_checkpoint,
+                        trainer=self.trainer,
+                        reason=f"inline eval iteration {int(iteration_index) + 1}",
+                    )
+                policy = None
+                try:
+                    eval_model = _unwrap_model(model)
+                    if callable(self.owner.inline_policy_factory):
+                        policy = self.owner.inline_policy_factory(
+                            eval_model=eval_model,
+                            processor=self.processor,
+                            rollout_eval_config=rollout_eval_config,
+                            state=state,
+                            runtime=self.owner.runtime,
+                        )
+                    else:
+                        policy = QwenGenerationPolicy.from_components(
+                            model=eval_model,
+                            processor=self.processor,
+                            max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
+                            max_total_images=int(rollout_eval_config.max_total_images),
+                            max_tool_message_frames=int(getattr(rollout_eval_config, "max_tool_message_frames", 0)),
+                            max_total_video_frames=int(getattr(rollout_eval_config, "max_total_video_frames", 0)),
+                            max_seq_length=int(rollout_eval_config.max_seq_length),
+                            keep_recent_tool_image_messages=int(getattr(rollout_eval_config, "keep_recent_tool_image_messages", 0)),
+                            keep_recent_text_messages=int(rollout_eval_config.keep_recent_text_messages),
+                            max_image_side=int(rollout_eval_config.max_image_side),
+                            max_image_pixels=int(rollout_eval_config.max_image_pixels),
+                            do_sample=False,
+                            use_generation_cache=bool(rollout_eval_config.use_generation_cache),
+                        )
+                    weights_synced_step = _sync_inline_vllm_policy_for_eval(policy, state=state)
+                    _annotate_rollout_eval_vllm_provenance(
+                        rollout_eval_config,
+                        current_model_path=str(loadable_authority_checkpoint),
+                        loadable_authority_checkpoint=str(loadable_authority_checkpoint),
+                        policy=policy,
+                        vllm_runtime=self.owner.persistent_vllm_runtime,
+                        weights_synced_step=weights_synced_step,
+                    )
+                    run_rollout_eval_with_policy(
+                        policy,
                         rollout_eval_config=rollout_eval_config,
-                        state=state,
+                        output_dir=args.output_dir,
+                        rollout_eval_output_dir=str(
+                            self.owner.rollout_eval_output_root / _rollout_eval_iteration_dir_name(int(iteration_index))
+                        ),
+                        epoch_index=int(iteration_index) + 1,
+                        epoch_value=float(getattr(state, "epoch", float(iteration_index + 1)) or float(iteration_index + 1)),
                         runtime=self.owner.runtime,
                     )
-                else:
-                    policy = QwenGenerationPolicy.from_components(
-                        model=eval_model,
-                        processor=self.processor,
-                        max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
-                        max_total_images=int(rollout_eval_config.max_total_images),
-                        max_tool_message_frames=int(getattr(rollout_eval_config, "max_tool_message_frames", 0)),
-                        max_total_video_frames=int(getattr(rollout_eval_config, "max_total_video_frames", 0)),
-                        max_seq_length=int(rollout_eval_config.max_seq_length),
-                        keep_recent_tool_image_messages=int(getattr(rollout_eval_config, "keep_recent_tool_image_messages", 0)),
-                        keep_recent_text_messages=int(rollout_eval_config.keep_recent_text_messages),
-                        max_image_side=int(rollout_eval_config.max_image_side),
-                        max_image_pixels=int(rollout_eval_config.max_image_pixels),
-                        do_sample=False,
-                        use_generation_cache=bool(rollout_eval_config.use_generation_cache),
-                    )
-                run_rollout_eval_with_policy(
-                    policy,
-                    rollout_eval_config=rollout_eval_config,
-                    output_dir=args.output_dir,
-                    rollout_eval_output_dir=str(
-                        self.owner.rollout_eval_output_root / _rollout_eval_iteration_dir_name(int(iteration_index))
-                    ),
-                    epoch_index=int(iteration_index) + 1,
-                    epoch_value=float(getattr(state, "epoch", float(iteration_index + 1)) or float(iteration_index + 1)),
-                    runtime=self.owner.runtime,
-                )
+                finally:
+                    _cleanup_inline_rollout_eval_policy(policy)
             else:
                 runtime_log(
                     f"continuous RL rollout eval deferred: checkpoint={checkpoint_path}",
@@ -722,40 +904,59 @@ def _build_continuous_iteration_callback(
                 reference_model_path=str(loadable_authority_checkpoint),
                 config=self.owner.config_builder(self.owner.args),
             )
-            eval_model = _unwrap_model(model)
-            if callable(self.owner.inline_policy_factory):
-                policy = self.owner.inline_policy_factory(
-                    eval_model=eval_model,
-                    processor=self.processor,
+            if self.owner.persistent_vllm_runtime is not None:
+                self.owner._attach_persistent_vllm_runtime(
+                    model_path=loadable_authority_checkpoint,
+                    trainer=self.trainer,
+                    reason="final inline eval",
+                )
+            policy = None
+            try:
+                eval_model = _unwrap_model(model)
+                if callable(self.owner.inline_policy_factory):
+                    policy = self.owner.inline_policy_factory(
+                        eval_model=eval_model,
+                        processor=self.processor,
+                        rollout_eval_config=rollout_eval_config,
+                        state=state,
+                        runtime=self.owner.runtime,
+                    )
+                else:
+                    policy = QwenGenerationPolicy.from_components(
+                        model=eval_model,
+                        processor=self.processor,
+                        max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
+                        max_total_images=int(rollout_eval_config.max_total_images),
+                        max_tool_message_frames=int(getattr(rollout_eval_config, "max_tool_message_frames", 0)),
+                        max_total_video_frames=int(getattr(rollout_eval_config, "max_total_video_frames", 0)),
+                        max_seq_length=int(rollout_eval_config.max_seq_length),
+                        keep_recent_tool_image_messages=int(getattr(rollout_eval_config, "keep_recent_tool_image_messages", 0)),
+                        keep_recent_text_messages=int(rollout_eval_config.keep_recent_text_messages),
+                        max_image_side=int(rollout_eval_config.max_image_side),
+                        max_image_pixels=int(rollout_eval_config.max_image_pixels),
+                        do_sample=False,
+                        use_generation_cache=bool(rollout_eval_config.use_generation_cache),
+                    )
+                weights_synced_step = _sync_inline_vllm_policy_for_eval(policy, state=state)
+                _annotate_rollout_eval_vllm_provenance(
+                    rollout_eval_config,
+                    current_model_path=str(loadable_authority_checkpoint),
+                    loadable_authority_checkpoint=str(loadable_authority_checkpoint),
+                    policy=policy,
+                    vllm_runtime=self.owner.persistent_vllm_runtime,
+                    weights_synced_step=weights_synced_step,
+                )
+                run_rollout_eval_with_policy(
+                    policy,
                     rollout_eval_config=rollout_eval_config,
-                    state=state,
+                    output_dir=args.output_dir,
+                    rollout_eval_output_dir=str(self.owner.rollout_eval_output_root / "final"),
+                    epoch_index=int(iteration_index) + 1,
+                    epoch_value=float(getattr(state, "epoch", float(iteration_index + 1)) or float(iteration_index + 1)),
                     runtime=self.owner.runtime,
                 )
-            else:
-                policy = QwenGenerationPolicy.from_components(
-                    model=eval_model,
-                    processor=self.processor,
-                    max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
-                    max_total_images=int(rollout_eval_config.max_total_images),
-                    max_tool_message_frames=int(getattr(rollout_eval_config, "max_tool_message_frames", 0)),
-                    max_total_video_frames=int(getattr(rollout_eval_config, "max_total_video_frames", 0)),
-                    max_seq_length=int(rollout_eval_config.max_seq_length),
-                    keep_recent_tool_image_messages=int(getattr(rollout_eval_config, "keep_recent_tool_image_messages", 0)),
-                    keep_recent_text_messages=int(rollout_eval_config.keep_recent_text_messages),
-                    max_image_side=int(rollout_eval_config.max_image_side),
-                    max_image_pixels=int(rollout_eval_config.max_image_pixels),
-                    do_sample=False,
-                    use_generation_cache=bool(rollout_eval_config.use_generation_cache),
-                )
-            run_rollout_eval_with_policy(
-                policy,
-                rollout_eval_config=rollout_eval_config,
-                output_dir=args.output_dir,
-                rollout_eval_output_dir=str(self.owner.rollout_eval_output_root / "final"),
-                epoch_index=int(iteration_index) + 1,
-                epoch_value=float(getattr(state, "epoch", float(iteration_index + 1)) or float(iteration_index + 1)),
-                runtime=self.owner.runtime,
-            )
+            finally:
+                _cleanup_inline_rollout_eval_policy(policy)
             self._final_eval_completed = True
             runtime_log(
                 f"continuous RL final eval complete: checkpoint={checkpoint_path}",
@@ -939,9 +1140,10 @@ class TrlVllmGrpoRunner:
             self.resume_state = load_trainer_resume_state(
                 resume_from_checkpoint,
                 source="args.resume_from_checkpoint",
+                require_deepspeed_checkpoint=bool(str(getattr(self.args, "deepspeed", "") or "").strip()),
             )
         self.current_model_path = (
-            str(self.resume_state.checkpoint_path)
+            str(_resolve_resume_loadable_model_path(self.resume_state))
             if self.resume_state is not None
             else str(self.args.model_path)
         )
@@ -1110,6 +1312,67 @@ class TrlVllmGrpoRunner:
             "rl_log_empty_batch_rank_summary": bool(self.args.rl_log_empty_batch_rank_summary),
         }
 
+    def _attach_trainer_to_persistent_vllm_runtime(self, trainer: Any = None) -> None:
+        if trainer is None or self.persistent_vllm_runtime is None:
+            return
+        setattr(trainer, "_vllm_runtime", self.persistent_vllm_runtime)
+        judge = getattr(trainer, "reward_judge", None)
+        if judge is None or not hasattr(judge, "attach_local_vllm"):
+            return
+        engine = getattr(self.persistent_vllm_runtime, "llm", None)
+        if engine is None:
+            raise RuntimeError(
+                "Active RL semantic reward requires an attachable local vLLM engine after runtime reload."
+            )
+        judge.attach_local_vllm(engine)
+
+    def _close_persistent_vllm_runtime(self, *, trainer: Any = None) -> None:
+        if trainer is not None:
+            setattr(trainer, "_vllm_runtime", None)
+            _detach_trainer_reward_judge_vllm(trainer)
+        runtime_impl = self.persistent_vllm_runtime
+        self.persistent_vllm_runtime = None
+        self.inline_policy_factory = None
+        if runtime_impl is not None:
+            close_fn = getattr(runtime_impl, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    def _attach_persistent_vllm_runtime(
+        self,
+        *,
+        model_path: str | Path,
+        trainer: Any = None,
+        reason: str = "",
+    ) -> Any:
+        self._close_persistent_vllm_runtime(trainer=trainer)
+        self.persistent_vllm_runtime = create_vllm_runtime(
+            args=self.args,
+            runtime=self.runtime,
+            model_path=model_path,
+            require_weight_sync=True,
+        )
+        self.inline_policy_factory = _build_inline_vllm_policy_factory(
+            args=self.args,
+            vllm_runtime=self.persistent_vllm_runtime,
+        )
+        self._attach_trainer_to_persistent_vllm_runtime(trainer)
+        runtime_log(
+            (
+                "trl-vllm RL attached persistent vLLM runtime"
+                + (f" for {reason}" if reason else "")
+                + f": base_model_path={getattr(self.persistent_vllm_runtime, 'base_model_path', '')} "
+                f"runtime_type={type(self.persistent_vllm_runtime).__name__} "
+                f"supports_weight_sync={bool(getattr(self.persistent_vllm_runtime, 'supports_weight_sync', False))} "
+                f"mode={str(getattr(self.args, 'vllm_mode', 'colocate'))} "
+                f"gpu_memory_utilization={float(getattr(self.args, 'vllm_gpu_memory_utilization', 0.35) or 0.35):.3f} "
+                f"guided_decoding={'on' if bool(getattr(self.args, 'vllm_guided_decoding_regex', '')) else 'off'}"
+            ),
+            runtime=self.runtime,
+            main_process_only=True,
+        )
+        return self.persistent_vllm_runtime
+
     def _build_initial_iteration_items(self) -> List[Dict[str, Any]]:
         return _sample_iteration_items(
             base_dataset=self.dataset,
@@ -1239,6 +1502,7 @@ class TrlVllmGrpoRunner:
         finally:
             if self.persistent_vllm_runtime is not None:
                 setattr(trainer, "_vllm_runtime", None)
+                _detach_trainer_reward_judge_vllm(trainer)
             _teardown_trainer_iteration_runtime(trainer)
             del trainer
             gc.collect()
@@ -1402,6 +1666,7 @@ class TrlVllmGrpoRunner:
         finally:
             if self.persistent_vllm_runtime is not None:
                 setattr(trainer, "_vllm_runtime", None)
+                _detach_trainer_reward_judge_vllm(trainer)
             _teardown_trainer_iteration_runtime(trainer)
             del trainer
             gc.collect()
@@ -1432,32 +1697,15 @@ class TrlVllmGrpoRunner:
             main_process_only=True,
         )
         if bool(getattr(self.args, "use_vllm", True)):
-            self.persistent_vllm_runtime = create_vllm_runtime(
-                args=self.args,
-                runtime=self.runtime,
+            self._attach_persistent_vllm_runtime(
                 model_path=self.current_model_path,
-            )
-            self.inline_policy_factory = _build_inline_vllm_policy_factory(
-                args=self.args,
-                vllm_runtime=self.persistent_vllm_runtime,
-            )
-            runtime_log(
-                (
-                    "trl-vllm RL attached persistent vLLM runtime: "
-                    f"base_model_path={self.persistent_vllm_runtime.base_model_path} "
-                    f"mode={str(getattr(self.args, 'vllm_mode', 'colocate'))} "
-                    f"gpu_memory_utilization={float(getattr(self.args, 'vllm_gpu_memory_utilization', 0.35) or 0.35):.3f} "
-                    f"guided_decoding={'on' if bool(getattr(self.args, 'vllm_guided_decoding_regex', '')) else 'off'}"
-                ),
-                runtime=self.runtime,
-                main_process_only=True,
+                reason="startup",
             )
 
         try:
             return self._run_continuous_training()
         finally:
-            if self.persistent_vllm_runtime is not None:
-                self.persistent_vllm_runtime.close()
+            self._close_persistent_vllm_runtime()
 
 
 def _run_vllm_grpo_iterations(

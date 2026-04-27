@@ -1685,6 +1685,7 @@ class _NativeGRPOTrainerMixin:
         self._budgeting_stats = BudgetingStats()
         self._zero_response_dropped = 0
         self._materialize_fallback_batches = 0
+        self._nonvisual_prepared_batch_noop_replacements = 0
         self._completion_only_grad_fallback_batches = 0
         self._ddp_global_empty_batch_skips = 0
         self._all_empty_batch_skips = 0
@@ -2959,6 +2960,31 @@ class _NativeGRPOTrainerMixin:
             "image_sizes",
         }
 
+    def _multimodal_payload_has_visual_tensor(self, value: Any, *, key_path: str = "") -> bool:
+        if isinstance(value, torch.Tensor):
+            key_name = str(key_path or "").split(".")[-1]
+            return key_name in {"pixel_values", "pixel_values_videos"} and int(value.numel()) > 0
+        if isinstance(value, dict):
+            return any(
+                self._multimodal_payload_has_visual_tensor(
+                    item,
+                    key_path=f"{key_path}.{key}" if key_path else str(key),
+                )
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(
+                self._multimodal_payload_has_visual_tensor(
+                    item,
+                    key_path=f"{key_path}.{index}" if key_path else str(index),
+                )
+                for index, item in enumerate(value)
+            )
+        return False
+
+    def _prepared_batch_has_visual_forward_payload(self, prepared_batch: Dict[str, Any]) -> bool:
+        return self._multimodal_payload_has_visual_tensor(self._episode_spec_multimodal_inputs(prepared_batch))
+
     def _move_multimodal_payload_to_device(
         self,
         value: Any,
@@ -3105,33 +3131,63 @@ class _NativeGRPOTrainerMixin:
             runtime=distributed_runtime_from_env(),
             main_process_only=False,
         )
-        if int(max_prepared_batch_count) <= 0 or int(min_prepared_batch_count) == int(max_prepared_batch_count):
+        if int(max_prepared_batch_count) <= 0:
             return padded_batches
         padded_count = 0
+        visual_replacement_count = 0
         for batch_position in range(int(max_prepared_batch_count)):
+            has_local_batch = batch_position < int(local_prepared_batch_count)
+            local_batch = padded_batches[batch_position] if has_local_batch else None
+            local_has_visual_payload = bool(
+                self._prepared_batch_has_visual_forward_payload(local_batch)
+                if isinstance(local_batch, dict)
+                else False
+            )
+            _, any_rank_has_visual_payload = _distributed_bool_consensus(
+                local_has_visual_payload,
+                device=device,
+            )
+            donor_source = None
+            if isinstance(local_batch, dict) and (local_has_visual_payload or not any_rank_has_visual_payload):
+                donor_source = self._prepared_batch_cpu_copy(local_batch)
             donor_prepared_batch = _distributed_first_available_object(
-                (
-                    self._prepared_batch_cpu_copy(padded_batches[batch_position])
-                    if batch_position < int(local_prepared_batch_count)
-                    else None
-                ),
+                donor_source,
                 device=device,
             )
             if donor_prepared_batch is None:
                 raise RuntimeError(
                     "Active native RL could not find a donor prepared batch for DDP noop padding: "
                     f"batch_position={int(batch_position)} local_prepared_batch_count={int(local_prepared_batch_count)} "
-                    f"max_prepared_batch_count={int(max_prepared_batch_count)}"
+                    f"max_prepared_batch_count={int(max_prepared_batch_count)} "
+                    f"any_rank_has_visual_payload={bool(any_rank_has_visual_payload)}"
                 )
-            if batch_position < int(local_prepared_batch_count):
+            if has_local_batch and (local_has_visual_payload or not any_rank_has_visual_payload):
                 continue
             donor_prepared_batch = self._move_episode_spec_to_device(donor_prepared_batch, device=device)
-            padded_batches.append(self._clone_prepared_batch_as_noop(donor_prepared_batch))
-            padded_count += 1
+            noop_batch = self._clone_prepared_batch_as_noop(donor_prepared_batch)
+            if has_local_batch:
+                padded_batches[batch_position] = noop_batch
+                visual_replacement_count += 1
+            else:
+                padded_batches.append(noop_batch)
+                padded_count += 1
         if padded_count > 0:
             runtime_stats["ddp_noop_padded_prepared_batches"] = int(
                 runtime_stats.get("ddp_noop_padded_prepared_batches", 0)
             ) + int(padded_count)
+        if visual_replacement_count > 0:
+            runtime_stats["ddp_noop_replaced_nonvisual_prepared_batches"] = int(
+                runtime_stats.get("ddp_noop_replaced_nonvisual_prepared_batches", 0)
+            ) + int(visual_replacement_count)
+            self._nonvisual_prepared_batch_noop_replacements += int(visual_replacement_count)
+            runtime_log(
+                "rl debug prepared batch visual branch padding: "
+                f"replaced_nonvisual_prepared_batches={int(visual_replacement_count)} "
+                f"raw_local_prepared_batch_count={int(local_prepared_batch_count)} "
+                f"distributed_max_prepared_batch_count={int(max_prepared_batch_count)}",
+                runtime=distributed_runtime_from_env(),
+                main_process_only=False,
+            )
         return padded_batches
 
     def _prepared_batch_cpu_copy(self, prepared_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -3999,6 +4055,7 @@ class _NativeGRPOTrainerMixin:
             {
                 "rl_zero_response_dropped": int(self._zero_response_dropped),
                 "rl_materialize_fallback_batches": int(self._materialize_fallback_batches),
+                "rl_nonvisual_prepared_batch_noop_replacements": int(self._nonvisual_prepared_batch_noop_replacements),
                 "rl_completion_only_grad_fallback_batches": int(self._completion_only_grad_fallback_batches),
                 "rl_ddp_global_empty_batch_skips": int(self._ddp_global_empty_batch_skips),
                 "rl_all_empty_batch_skips": int(self._all_empty_batch_skips),
@@ -4404,6 +4461,14 @@ def create_native_grpo_trainer(
         main_process_only=True,
     )
     os.environ["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(int(gradient_accumulation_steps))
+    effective_save_only_model = bool(save_only_model)
+    if str(deepspeed or "").strip() and effective_save_only_model:
+        runtime_log(
+            "DeepSpeed RL resume requires full Trainer checkpoints; overriding save_only_model=false.",
+            runtime=distributed_runtime_from_env(),
+            main_process_only=True,
+        )
+        effective_save_only_model = False
     training_args_kwargs = {
         "output_dir": str(output_dir),
         "learning_rate": float(learning_rate),
@@ -4413,7 +4478,7 @@ def create_native_grpo_trainer(
         "logging_steps": int(logging_steps),
         "save_steps": int(save_steps),
         "save_total_limit": int(save_total_limit),
-        "save_only_model": bool(save_only_model),
+        "save_only_model": bool(effective_save_only_model),
         "warmup_ratio": float(warmup_ratio),
         "weight_decay": float(weight_decay),
         "max_grad_norm": float(max_grad_norm),

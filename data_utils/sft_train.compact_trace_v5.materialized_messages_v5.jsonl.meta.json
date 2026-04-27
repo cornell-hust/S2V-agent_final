@@ -55,15 +55,15 @@
   },
   "num_records": 480,
   "proposal_device": "",
-  "proposal_model_path": "",
+  "proposal_model_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip",
   "proposal_torch_dtype": "auto",
   "protocol_signature": {
-    "generator_fingerprint": "68369fa86849effdf8e64bc89a4497ecc9476738ef90acfec2a0b161cfd7bfd3",
-    "generator_revision": "2026-04-23-active-contract-v5",
+    "generator_fingerprint": "10e82ed6c48be173e52d026258be8d51986ead9cdb6c3e6182f2954168a97802",
+    "generator_revision": "2026-04-26-auto-exhaustion-finalize-v1",
     "initial_observation_mode": "explicit_first_scan",
-    "main_rollout_terminal_mode": "finalize_case_only",
+    "main_rollout_terminal_mode": "finalize_case_or_auto_exhaustion",
     "max_turns": 12,
-    "policy_max_new_tokens": 1024,
+    "policy_max_new_tokens": 2048,
     "protocol_version": "seek_v5",
     "signature_schema_version": 1,
     "teacher_role": "none",
@@ -71,15 +71,15 @@
   },
   "schema_version": 6,
   "source_jsonl": {
-    "file_size": 5528099,
+    "file_size": 5539139,
     "include_splits": [
       "train"
     ],
-    "mtime_ns": 1777092432094072781,
+    "mtime_ns": 1777150589524779164,
     "num_records": 480,
     "path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",
     "resolved_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v3/data_utils/sft_train.compact_trace_v5.jsonl",
-    "sha256": "c7c3885a31fdf6ec1a32f6543a1b1b70d0d717367badc8fa3fd2866e55432961",
+    "sha256": "bf213b6535da50077040ebad23a974efc1de143e22561cc9fac87ff2e98ae921",
     "validation_mode": "canonical_jsonl"
   }
 }

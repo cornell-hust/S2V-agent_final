@@ -2,13 +2,44 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from saver_v3.rl.resume import load_trainer_resume_state, resolve_rl_training_resume_state
+from saver_v3.rl.resume import (
+    is_deepspeed_trainer_checkpoint,
+    load_trainer_resume_state,
+    resolve_rl_training_resume_state,
+)
 from saver_v3.rl.runtime import (
     RLJobConfig,
     _resolve_liger_compatible_deepspeed_config,
     build_active_rl_trl_argv,
 )
-from saver_v3.rl.trl_grpo_trainer import TrlVllmGrpoRunner, _rollout_eval_iteration_dir_name
+from saver_v3.rl.trl_grpo_trainer import (
+    TrlVllmGrpoRunner,
+    _resolve_resume_loadable_model_path,
+    _rollout_eval_iteration_dir_name,
+)
+
+
+def _write_train_manifest(tmp_path: Path, *, count: int = 1, split: str = "train") -> Path:
+    path = tmp_path / "train.jsonl"
+    rows = [
+        {
+            "video_id": f"video-{index}",
+            "video_path": f"/data/video-{index}.mp4",
+            "split": split,
+        }
+        for index in range(int(count))
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_deepspeed_resume_marker(checkpoint_dir: Path, *, tag: str = "global_step1") -> None:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "latest").write_text(f"{tag}\n", encoding="utf-8")
+    tag_dir = checkpoint_dir / tag
+    tag_dir.mkdir()
+    (tag_dir / "zero_pp_rank_0_mp_rank_00_model_states.pt").write_bytes(b"model")
+    (tag_dir / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").write_bytes(b"optim")
 
 
 def test_load_trainer_resume_state_reads_epoch_as_next_iteration(tmp_path: Path):
@@ -28,6 +59,30 @@ def test_load_trainer_resume_state_reads_epoch_as_next_iteration(tmp_path: Path)
     assert state.source == "unit-test"
 
 
+def test_load_trainer_resume_state_rejects_hf_only_checkpoint_when_deepspeed_required(tmp_path: Path):
+    checkpoint_dir = tmp_path / "checkpoint-20"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "trainer_state.json").write_text(
+        json.dumps({"epoch": 20.0, "global_step": 20}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint_dir / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
+
+    try:
+        load_trainer_resume_state(
+            checkpoint_dir,
+            source="unit-test",
+            require_deepspeed_checkpoint=True,
+        )
+    except FileNotFoundError as exc:
+        assert "not a complete DeepSpeed Trainer checkpoint" in str(exc)
+    else:
+        raise AssertionError("HF-only checkpoint must not be accepted for strict DeepSpeed resume")
+
+    assert not is_deepspeed_trainer_checkpoint(checkpoint_dir)
+
+
 def test_resolve_rl_training_resume_state_prefers_highest_iteration(tmp_path: Path):
     rl_dir = tmp_path / "rl"
     rl_dir.mkdir()
@@ -39,10 +94,12 @@ def test_resolve_rl_training_resume_state_prefers_highest_iteration(tmp_path: Pa
         json.dumps({"epoch": 40.0, "global_step": 400}),
         encoding="utf-8",
     )
+    _write_deepspeed_resume_marker(checkpoint_40, tag="global_step400")
     (checkpoint_80 / "trainer_state.json").write_text(
         json.dumps({"epoch": 80.0, "global_step": 800}),
         encoding="utf-8",
     )
+    _write_deepspeed_resume_marker(checkpoint_80, tag="global_step800")
     iter_039 = rl_dir / "iter_039"
     iter_079 = rl_dir / "iter_079"
     iter_039.mkdir()
@@ -62,6 +119,64 @@ def test_resolve_rl_training_resume_state_prefers_highest_iteration(tmp_path: Pa
     assert state.resume_iteration == 80
     assert state.completed_iteration == 79
     assert state.checkpoint_path == str(checkpoint_80.resolve())
+
+
+def test_resolve_rl_training_resume_state_skips_hf_only_checkpoints(tmp_path: Path):
+    rl_dir = tmp_path / "rl"
+    rl_dir.mkdir()
+    hf_only_checkpoint = rl_dir / "checkpoint-20"
+    hf_only_checkpoint.mkdir()
+    (hf_only_checkpoint / "trainer_state.json").write_text(
+        json.dumps({"epoch": 20.0, "global_step": 20}),
+        encoding="utf-8",
+    )
+    (hf_only_checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    full_checkpoint = rl_dir / "checkpoint-10"
+    full_checkpoint.mkdir()
+    (full_checkpoint / "trainer_state.json").write_text(
+        json.dumps({"epoch": 10.0, "global_step": 10}),
+        encoding="utf-8",
+    )
+    _write_deepspeed_resume_marker(full_checkpoint, tag="global_step10")
+
+    state = resolve_rl_training_resume_state(rl_dir)
+
+    assert state is not None
+    assert state.resume_iteration == 10
+    assert state.checkpoint_path == str(full_checkpoint.resolve())
+
+
+def test_resume_model_path_prefers_checkpoint_root_when_loadable(tmp_path: Path):
+    checkpoint_dir = tmp_path / "checkpoint-10"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "trainer_state.json").write_text(
+        json.dumps({"epoch": 10.0, "global_step": 10}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    state = load_trainer_resume_state(checkpoint_dir, source="unit-test")
+
+    assert _resolve_resume_loadable_model_path(state) == checkpoint_dir.resolve()
+
+
+def test_resume_model_path_falls_back_to_legacy_authority_subdir(tmp_path: Path):
+    checkpoint_dir = tmp_path / "checkpoint-10"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "trainer_state.json").write_text(
+        json.dumps({"epoch": 10.0, "global_step": 10}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text("{}", encoding="utf-8")
+    loadable_dir = checkpoint_dir / "authority_hf" / "epoch_010"
+    loadable_dir.mkdir(parents=True)
+    (loadable_dir / "config.json").write_text("{}", encoding="utf-8")
+    (loadable_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    state = load_trainer_resume_state(checkpoint_dir, source="unit-test")
+
+    assert _resolve_resume_loadable_model_path(state) == loadable_dir.resolve()
 
 
 def test_build_active_rl_trl_argv_includes_resume_checkpoint():
@@ -129,6 +244,7 @@ def test_resolve_liger_compatible_deepspeed_config_preserves_offload_when_liger_
 def test_rl_job_from_files_keeps_offload_config_when_active_rl_disables_liger(tmp_path: Path):
     rollout_config_path = tmp_path / "rollout.yaml"
     rollout_config_path.write_text("semantic_metrics:\n  enabled: false\n", encoding="utf-8")
+    train_manifest_path = _write_train_manifest(tmp_path)
     offload_config_path = tmp_path / "zero3_offload_rl.json"
     offload_config_path.write_text(
         json.dumps(
@@ -153,9 +269,11 @@ def test_rl_job_from_files_keeps_offload_config_when_active_rl_disables_liger(tm
                 "policy_init_from: /models/checkpoint",
                 "rollout_backend: vllm",
                 "data:",
-                "  train_manifest: /data/train.jsonl",
+                f"  train_manifest: {train_manifest_path}",
                 "  eval_manifest: /data/eval.jsonl",
                 "  data_root: /data",
+                "logging:",
+                "  save_only_model: true",
                 "rewards:",
                 "  reward_version: timesearch_v4",
             ]
@@ -193,6 +311,7 @@ def test_rl_job_from_files_keeps_offload_config_when_active_rl_disables_liger(tm
     assert job.deepspeed_config_path == str(offload_config_path.resolve())
     assert job.liger_deepspeed_auto_switched is False
     assert job.liger_deepspeed_switch_reason == ""
+    assert job.save_only_model is False
 
 
 def test_resolve_liger_compatible_deepspeed_config_prefers_zero3_full_model_for_liger(tmp_path: Path):
@@ -234,6 +353,8 @@ def test_rl_shell_entrypoints_default_to_zero3_full_model():
     assert "deepspeed_config: configs/deepspeed/zero3_full_model.json" in rl_yaml
     assert "  rollout_count: 8" in rl_yaml
     assert "  gradient_accumulation_steps: 4" in rl_yaml
+    assert "  iteration_budget_multiplier: 1.5" in rl_yaml
+    assert "  num_iterations:" not in rl_yaml
     assert "  nproc_per_node: 8" in rl_yaml
     assert "num_train_epochs:" not in rl_yaml
 
@@ -249,6 +370,7 @@ def test_grpo_trainer_env_no_longer_emits_prepared_batch_start_debug_log():
 def test_rl_job_from_files_rejects_non_default_num_train_epochs(tmp_path: Path):
     rollout_config_path = tmp_path / "rollout.yaml"
     rollout_config_path.write_text("semantic_metrics:\n  enabled: false\n", encoding="utf-8")
+    train_manifest_path = _write_train_manifest(tmp_path)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "\n".join(
@@ -262,7 +384,7 @@ def test_rl_job_from_files_rejects_non_default_num_train_epochs(tmp_path: Path):
                 "  num_iterations: 12",
                 "  num_train_epochs: 2.0",
                 "data:",
-                "  train_manifest: /data/train.jsonl",
+                f"  train_manifest: {train_manifest_path}",
                 "  eval_manifest: /data/eval.jsonl",
                 "  data_root: /data",
                 "rewards:",
